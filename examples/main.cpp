@@ -1,12 +1,24 @@
 #include <iostream>
 
-#include "simplelib/simplelib.hpp"
+#include "ecs/ecs.hpp"
+
+namespace {
+
+struct Position {
+    float x;
+    float y;
+};
+
+}  // namespace
 
 int main() {
-    simplelib::Greeter greeter("Welcome");
+    ecs::Registry registry;
 
-    std::cout << greeter.greet("cross-platform C++") << '\n';
-    std::cout << "2 + 3 = " << simplelib::add(2, 3) << '\n';
+    const ecs::Entity player = registry.create();
+    registry.emplace<Position>(player, Position{10.0f, 20.0f});
+
+    const Position& position = registry.get<Position>(player);
+    std::cout << "entity " << player << " -> (" << position.x << ", " << position.y << ")\n";
 
     return 0;
 }
