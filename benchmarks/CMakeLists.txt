@@ -10,7 +10,11 @@ add_executable(ecs_benchmark_extended
     extended_benchmark.cpp
 )
 
-foreach(target IN ITEMS ecs_benchmark_entities ecs_benchmark_basic ecs_benchmark_extended)
+add_executable(ecs_benchmark_stress
+    stress_benchmark.cpp
+)
+
+foreach(target IN ITEMS ecs_benchmark_entities ecs_benchmark_basic ecs_benchmark_extended ecs_benchmark_stress)
     set_target_properties(${target} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     )

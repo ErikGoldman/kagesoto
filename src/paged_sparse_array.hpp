@@ -311,8 +311,11 @@ protected:
             return false;
         }
 
-        append_ref(pending.dense_index, RevisionRef{tsn, isolated->value_index, false, isolated->tombstone, false});
+        const RevisionRef isolated_copy = *isolated;
         isolated->voided = true;
+        append_ref(
+            pending.dense_index,
+            RevisionRef{tsn, isolated_copy.value_index, false, isolated_copy.tombstone, false});
         recompute_dense_head(entity, pending.dense_index);
         return true;
     }
@@ -405,11 +408,24 @@ private:
 
     std::uint32_t append_value(const void* value) {
         const std::size_t offset = revision_values_.size();
+        const unsigned char* source = static_cast<const unsigned char*>(value);
+        std::vector<unsigned char> stable_copy;
+
+        if (source != nullptr) {
+            const unsigned char* begin = revision_values_.data();
+            const unsigned char* end = begin + revision_values_.size();
+            if (source >= begin && source < end) {
+                stable_copy.resize(component_size_);
+                std::memcpy(stable_copy.data(), source, component_size_);
+                source = stable_copy.data();
+            }
+        }
+
         revision_values_.resize(offset + component_size_);
-        if (value == nullptr) {
+        if (source == nullptr) {
             std::memset(revision_values_.data() + offset, 0, component_size_);
         } else {
-            std::memcpy(revision_values_.data() + offset, value, component_size_);
+            std::memcpy(revision_values_.data() + offset, source, component_size_);
         }
         return static_cast<std::uint32_t>(offset / component_size_);
     }

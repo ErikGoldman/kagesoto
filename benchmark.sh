@@ -10,4 +10,4 @@ echo "Configuring in ${build_dir}..."
  cmake -S . -B build/bench -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DECS_BUILD_BENCHMARKS=ON
 
 echo "Building..."
-cmake --build build/bench --target ecs_benchmark_entities ecs_benchmark_basic ecs_benchmark_extended
+cmake --build build/bench --target ecs_benchmark_entities ecs_benchmark_basic ecs_benchmark_extended ecs_benchmark_stress

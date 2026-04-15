@@ -121,6 +121,32 @@ TEST_CASE("transactions discard changed staged data on rollback and preserve the
     REQUIRE(read_tx.get<Position>(entity).y == 3);
 }
 
+TEST_CASE("transactions can stage a committed value even when revision value storage reallocates") {
+    ecs::Registry registry(4);
+    const ecs::Entity entity = registry.create();
+
+    {
+        auto tx = registry.transaction();
+        tx.write<Position>(entity, Position{1, 2});
+        tx.commit();
+    }
+
+    for (int i = 0; i < 64; ++i) {
+        auto tx = registry.transaction();
+        Position* staged = tx.write<Position>(entity);
+        REQUIRE(staged != nullptr);
+        staged->x += 1;
+        staged->y += 2;
+        tx.commit();
+    }
+
+    auto read_tx = registry.transaction();
+    const Position* committed = read_tx.try_get<Position>(entity);
+    REQUIRE(committed != nullptr);
+    REQUIRE(committed->x == 65);
+    REQUIRE(committed->y == 130);
+}
+
 TEST_CASE("transactions reuse the same staged object for multiple writes to one entity component pair") {
     ecs::Registry registry(4);
     const ecs::Entity entity = registry.create();
@@ -181,6 +207,32 @@ TEST_CASE("concurrent transactions are isolated from each others uncommitted wri
 
     REQUIRE(first.get<Position>(entity).x == 10);
     REQUIRE(second.get<Position>(entity).x == 30);
+}
+
+TEST_CASE("transactions can commit repeated updates after revision overflow storage reallocates") {
+    ecs::Registry registry(4);
+    const ecs::Entity entity = registry.create();
+
+    {
+        auto tx = registry.transaction();
+        tx.write<Position>(entity, Position{0, 0});
+        tx.commit();
+    }
+
+    for (int i = 1; i <= 64; ++i) {
+        auto tx = registry.transaction();
+        Position* staged = tx.write<Position>(entity);
+        REQUIRE(staged != nullptr);
+        staged->x = i;
+        staged->y = i * 10;
+        tx.commit();
+    }
+
+    auto read_tx = registry.transaction();
+    const Position* committed = read_tx.try_get<Position>(entity);
+    REQUIRE(committed != nullptr);
+    REQUIRE(committed->x == 64);
+    REQUIRE(committed->y == 640);
 }
 
 TEST_CASE("later transactions only observe committed state from earlier transactions") {
