@@ -169,8 +169,15 @@ struct ComponentsCounter {
 };
 
 template <typename Component>
-ecs::PagedSparseArrayView<Component> try_storage(ecs::Registry& registry) {
-    return registry.storage<Component>();
+ecs::TransactionStorageView<Component> try_storage(ecs::Transaction& transaction) {
+    return transaction.storage<Component>();
+}
+
+template <typename Component, typename... Args>
+void write_component(ecs::Registry& registry, ecs::Entity entity, Args&&... args) {
+    auto tx = registry.transaction();
+    tx.write<Component>(entity, std::forward<Args>(args)...);
+    tx.commit();
 }
 
 class EntityFactory {
@@ -193,7 +200,7 @@ public:
 
     static Entity create_single(Registry& registry) {
         const Entity entity = registry.create();
-        registry.emplace<PositionComponent>(entity);
+        write_component<PositionComponent>(registry, entity);
         return entity;
     }
 
@@ -208,9 +215,11 @@ public:
 
     static Entity create(Registry& registry) {
         const Entity entity = registry.create();
-        registry.emplace<PositionComponent>(entity);
-        registry.emplace<VelocityComponent>(entity);
-        registry.emplace<DataComponent>(entity);
+        auto tx = registry.transaction();
+        tx.write<PositionComponent>(entity);
+        tx.write<VelocityComponent>(entity);
+        tx.write<DataComponent>(entity);
+        tx.commit();
         return entity;
     }
 
@@ -225,8 +234,10 @@ public:
 
     static Entity create_minimal(Registry& registry) {
         const Entity entity = registry.create();
-        registry.emplace<PositionComponent>(entity);
-        registry.emplace<VelocityComponent>(entity);
+        auto tx = registry.transaction();
+        tx.write<PositionComponent>(entity);
+        tx.write<VelocityComponent>(entity);
+        tx.commit();
         return entity;
     }
 
@@ -249,28 +260,40 @@ public:
         }
     }
 
-    static const PositionComponent& get_component_one_const(Registry& registry, Entity entity) {
-        return registry.get<PositionComponent>(entity);
+    static PositionComponent get_component_one_const(Registry& registry, Entity entity) {
+        auto tx = registry.transaction();
+        return tx.get<PositionComponent>(entity);
     }
 
-    static const VelocityComponent& get_component_two_const(Registry& registry, Entity entity) {
-        return registry.get<VelocityComponent>(entity);
+    static VelocityComponent get_component_two_const(Registry& registry, Entity entity) {
+        auto tx = registry.transaction();
+        return tx.get<VelocityComponent>(entity);
     }
 
-    static PositionComponent& get_component_one(Registry& registry, Entity entity) {
-        return registry.get<PositionComponent>(entity);
+    static PositionComponent get_component_one(Registry& registry, Entity entity) {
+        auto tx = registry.transaction();
+        return tx.get<PositionComponent>(entity);
     }
 
-    static VelocityComponent& get_component_two(Registry& registry, Entity entity) {
-        return registry.get<VelocityComponent>(entity);
+    static VelocityComponent get_component_two(Registry& registry, Entity entity) {
+        auto tx = registry.transaction();
+        return tx.get<VelocityComponent>(entity);
     }
 
-    static DataComponent* get_optional_component_three(Registry& registry, Entity entity) {
-        return registry.try_get<DataComponent>(entity);
+    static std::optional<DataComponent> get_optional_component_three(Registry& registry, Entity entity) {
+        auto tx = registry.transaction();
+        if (const DataComponent* component = tx.try_get<DataComponent>(entity)) {
+            return *component;
+        }
+        return std::nullopt;
     }
 
-    static const DataComponent* get_optional_component_three_const(Registry& registry, Entity entity) {
-        return registry.try_get<DataComponent>(entity);
+    static std::optional<DataComponent> get_optional_component_three_const(Registry& registry, Entity entity) {
+        auto tx = registry.transaction();
+        if (const DataComponent* component = tx.try_get<DataComponent>(entity)) {
+            return *component;
+        }
+        return std::nullopt;
     }
 
     static void remove_component_one(Registry& registry, Entity entity) {
@@ -286,15 +309,15 @@ public:
     }
 
     static void add_component_one(Registry& registry, Entity entity) {
-        registry.emplace<PositionComponent>(entity);
+        write_component<PositionComponent>(registry, entity);
     }
 
     static void add_component_two(Registry& registry, Entity entity) {
-        registry.emplace<VelocityComponent>(entity);
+        write_component<VelocityComponent>(registry, entity);
     }
 
     static void add_component_three(Registry& registry, Entity entity) {
-        registry.emplace<DataComponent>(entity);
+        write_component<DataComponent>(registry, entity);
     }
 };
 
@@ -308,21 +331,26 @@ public:
     static constexpr std::uint32_t kSpawnAreaMargin = 100;
 
     static void add_components(Registry& registry, Entity entity) {
-        registry.emplace<PlayerComponent>(entity);
-        registry.emplace<HealthComponent>(entity);
-        registry.emplace<DamageComponent>(entity);
-        registry.emplace<PositionComponent>(entity);
-        registry.emplace<SpriteComponent>(entity);
+        auto tx = registry.transaction();
+        tx.write<PlayerComponent>(entity);
+        tx.write<HealthComponent>(entity);
+        tx.write<DamageComponent>(entity);
+        tx.write<PositionComponent>(entity);
+        tx.write<SpriteComponent>(entity);
+        tx.commit();
     }
 
     static PlayerType init_components(Registry& registry, Entity entity, std::optional<PlayerType> forced_type = std::nullopt) {
-        PositionComponent& position = registry.get<PositionComponent>(entity);
-        PlayerComponent& player = registry.get<PlayerComponent>(entity);
-        HealthComponent& health = registry.get<HealthComponent>(entity);
-        DamageComponent& damage = registry.get<DamageComponent>(entity);
-        SpriteComponent& sprite = registry.get<SpriteComponent>(entity);
+        auto tx = registry.transaction();
+        PositionComponent* position = tx.write<PositionComponent>(entity);
+        PlayerComponent* player = tx.write<PlayerComponent>(entity);
+        HealthComponent* health = tx.write<HealthComponent>(entity);
+        DamageComponent* damage = tx.write<DamageComponent>(entity);
+        SpriteComponent* sprite = tx.write<SpriteComponent>(entity);
 
-        return set_components(position, player, health, damage, sprite, forced_type);
+        const PlayerType type = set_components(*position, *player, *health, *damage, *sprite, forced_type);
+        tx.commit();
+        return type;
     }
 
     static PlayerType set_components(PositionComponent& position,
@@ -384,13 +412,16 @@ public:
     }
 
     void update(ecs::Registry& registry, float dt) override {
-        auto positions = try_storage<PositionComponent>(registry);
-        positions.each([&registry, dt](ecs::Entity entity, PositionComponent& position) {
-            const VelocityComponent* velocity = registry.try_get<VelocityComponent>(entity);
+        auto tx = registry.transaction();
+        auto positions = try_storage<PositionComponent>(tx);
+        positions.each([&tx, dt](ecs::Entity entity, const PositionComponent&) {
+            const VelocityComponent* velocity = tx.try_get<VelocityComponent>(entity);
             if (velocity != nullptr) {
-                update_position(position, *velocity, dt);
+                PositionComponent* position = tx.write<PositionComponent>(entity);
+                update_position(*position, *velocity, dt);
             }
         });
+        tx.commit();
     }
 };
 
@@ -404,10 +435,13 @@ public:
     }
 
     void update(ecs::Registry& registry, float dt) override {
-        auto data = try_storage<DataComponent>(registry);
-        data.each([dt](ecs::Entity, DataComponent& value) {
-            update_data(value, dt);
+        auto tx = registry.transaction();
+        auto data = try_storage<DataComponent>(tx);
+        data.each([&tx, dt](ecs::Entity entity, const DataComponent&) {
+            DataComponent* value = tx.write<DataComponent>(entity);
+            update_data(*value, dt);
         });
+        tx.commit();
     }
 };
 
@@ -428,14 +462,17 @@ public:
     }
 
     void update(ecs::Registry& registry, float) override {
-        auto data = try_storage<DataComponent>(registry);
-        data.each([&registry](ecs::Entity entity, DataComponent& value) {
-            PositionComponent* position = registry.try_get<PositionComponent>(entity);
-            VelocityComponent* velocity = registry.try_get<VelocityComponent>(entity);
-            if (position != nullptr && velocity != nullptr) {
-                update_components(*position, *velocity, value);
+        auto tx = registry.transaction();
+        auto data = try_storage<DataComponent>(tx);
+        data.each([&tx](ecs::Entity entity, const DataComponent&) {
+            const PositionComponent* position = tx.try_get<PositionComponent>(entity);
+            if (position != nullptr && tx.try_get<VelocityComponent>(entity) != nullptr) {
+                DataComponent* writable_data = tx.write<DataComponent>(entity);
+                VelocityComponent* writable_velocity = tx.write<VelocityComponent>(entity);
+                update_components(*position, *writable_velocity, *writable_data);
             }
         });
+        tx.commit();
     }
 };
 
@@ -457,10 +494,13 @@ public:
     }
 
     void update(ecs::Registry& registry, float) override {
-        auto health = try_storage<HealthComponent>(registry);
-        health.each([](ecs::Entity, HealthComponent& value) {
-            update_health(value);
+        auto tx = registry.transaction();
+        auto health = try_storage<HealthComponent>(tx);
+        health.each([&tx](ecs::Entity entity, const HealthComponent&) {
+            HealthComponent* value = tx.write<HealthComponent>(entity);
+            update_health(*value);
         });
+        tx.commit();
     }
 };
 
@@ -474,13 +514,16 @@ public:
     }
 
     void update(ecs::Registry& registry, float) override {
-        auto health = try_storage<HealthComponent>(registry);
-        health.each([&registry](ecs::Entity entity, HealthComponent& value) {
-            const DamageComponent* damage = registry.try_get<DamageComponent>(entity);
+        auto tx = registry.transaction();
+        auto health = try_storage<HealthComponent>(tx);
+        health.each([&tx](ecs::Entity entity, const HealthComponent&) {
+            const DamageComponent* damage = tx.try_get<DamageComponent>(entity);
             if (damage != nullptr) {
-                update_damage(value, *damage);
+                HealthComponent* value = tx.write<HealthComponent>(entity);
+                update_damage(*value, *damage);
             }
         });
+        tx.commit();
     }
 };
 
@@ -521,14 +564,17 @@ public:
     }
 
     void update(ecs::Registry& registry, float) override {
-        auto sprites = try_storage<SpriteComponent>(registry);
-        sprites.each([&registry](ecs::Entity entity, SpriteComponent& sprite) {
-            const PlayerComponent* player = registry.try_get<PlayerComponent>(entity);
-            const HealthComponent* health = registry.try_get<HealthComponent>(entity);
+        auto tx = registry.transaction();
+        auto sprites = try_storage<SpriteComponent>(tx);
+        sprites.each([&tx](ecs::Entity entity, const SpriteComponent&) {
+            const PlayerComponent* player = tx.try_get<PlayerComponent>(entity);
+            const HealthComponent* health = tx.try_get<HealthComponent>(entity);
             if (player != nullptr && health != nullptr) {
-                update_sprite(sprite, *player, *health);
+                SpriteComponent* sprite = tx.write<SpriteComponent>(entity);
+                update_sprite(*sprite, *player, *health);
             }
         });
+        tx.commit();
     }
 };
 
@@ -542,9 +588,10 @@ public:
     }
 
     void update(ecs::Registry& registry, float) override {
-        auto positions = try_storage<PositionComponent>(registry);
-        positions.each([this, &registry](ecs::Entity entity, PositionComponent& position) {
-            const SpriteComponent* sprite = registry.try_get<SpriteComponent>(entity);
+        auto tx = registry.transaction();
+        auto positions = try_storage<PositionComponent>(tx);
+        positions.each([this, &tx](ecs::Entity entity, const PositionComponent& position) {
+            const SpriteComponent* sprite = tx.try_get<SpriteComponent>(entity);
             if (sprite != nullptr) {
                 render_sprite(frame_buffer_, position, *sprite);
             }
@@ -989,10 +1036,11 @@ public:
         Registry registry;
         std::vector<Entity> entities;
         const ComponentsCounter counts = create_entities_with_single_component(registry, entity_count, entities);
-        auto positions = try_storage<PositionComponent>(registry);
 
         for (auto _ : state) {
-            positions.each([](Entity, PositionComponent& component) {
+            auto tx = registry.transaction();
+            auto positions = try_storage<PositionComponent>(tx);
+            positions.each([](Entity, const PositionComponent& component) {
                 benchmark::DoNotOptimize(component);
             });
         }
@@ -1005,11 +1053,12 @@ public:
         Registry registry;
         std::vector<Entity> entities;
         const ComponentsCounter counts = create_entities_with_minimal_components(registry, entity_count, entities);
-        auto positions = try_storage<PositionComponent>(registry);
 
         for (auto _ : state) {
-            positions.each([&registry](Entity entity, PositionComponent& position) {
-                VelocityComponent* velocity = registry.try_get<VelocityComponent>(entity);
+            auto tx = registry.transaction();
+            auto positions = try_storage<PositionComponent>(tx);
+            positions.each([&tx](Entity entity, const PositionComponent& position) {
+                const VelocityComponent* velocity = tx.try_get<VelocityComponent>(entity);
                 if (velocity != nullptr) {
                     benchmark::DoNotOptimize(position);
                     benchmark::DoNotOptimize(*velocity);
@@ -1025,12 +1074,13 @@ public:
         Registry registry;
         std::vector<Entity> entities;
         const ComponentsCounter counts = create_entities_with_mixed_components(registry, entity_count, entities);
-        auto data = try_storage<DataComponent>(registry);
 
         for (auto _ : state) {
-            data.each([&registry](Entity entity, DataComponent& value) {
-                PositionComponent* position = registry.try_get<PositionComponent>(entity);
-                VelocityComponent* velocity = registry.try_get<VelocityComponent>(entity);
+            auto tx = registry.transaction();
+            auto data = try_storage<DataComponent>(tx);
+            data.each([&tx](Entity entity, const DataComponent& value) {
+                const PositionComponent* position = tx.try_get<PositionComponent>(entity);
+                const VelocityComponent* velocity = tx.try_get<VelocityComponent>(entity);
                 if (position != nullptr && velocity != nullptr) {
                     benchmark::DoNotOptimize(*position);
                     benchmark::DoNotOptimize(*velocity);

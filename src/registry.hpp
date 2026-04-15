@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -35,6 +36,10 @@ ComponentId component_id() {
     return ComponentIdTraits<T>::value();
 }
 
+class Registry;
+class Snapshot;
+class Transaction;
+
 class ECS_API Registry {
 public:
     explicit Registry(std::size_t page_size = 1024);
@@ -54,77 +59,53 @@ public:
     std::size_t page_size() const;
     std::size_t entity_count() const;
     const std::vector<Entity>& entities() const;
-
-    bool has(Entity entity, ComponentId component) const;
-    void* try_get(Entity entity, ComponentId component);
-    const void* try_get(Entity entity, ComponentId component) const;
     bool remove(Entity entity, ComponentId component);
-    RawPagedSparseArray* storage(ComponentId component);
-    const RawPagedSparseArray* storage(ComponentId component) const;
-
-    template <typename T, typename... Args>
-    T& emplace(Entity entity, Args&&... args) {
-        static_assert(std::is_trivially_copyable_v<T>, "Registry components must be trivially copyable");
-
-        require_alive(entity);
-        T value{std::forward<Args>(args)...};
-        return *static_cast<T*>(assure_storage(component_id<T>(), sizeof(T), alignof(T)).emplace_copy(entity, &value));
-    }
-
-    template <typename T>
-    bool has(Entity entity) const {
-        return has(entity, component_id<T>());
-    }
-
-    template <typename T>
-    T* try_get(Entity entity) {
-        return static_cast<T*>(try_get(entity, component_id<T>()));
-    }
-
-    template <typename T>
-    const T* try_get(Entity entity) const {
-        return static_cast<const T*>(try_get(entity, component_id<T>()));
-    }
-
-    template <typename T>
-    T& get(Entity entity) {
-        T* component = try_get<T>(entity);
-        if (component == nullptr) {
-            throw std::out_of_range("entity does not have this component");
-        }
-        return *component;
-    }
-
-    template <typename T>
-    const T& get(Entity entity) const {
-        const T* component = try_get<T>(entity);
-        if (component == nullptr) {
-            throw std::out_of_range("entity does not have this component");
-        }
-        return *component;
-    }
 
     template <typename T>
     bool remove(Entity entity) {
         return remove(entity, component_id<T>());
     }
 
-    template <typename T>
-    PagedSparseArrayView<T> storage() {
-        return PagedSparseArrayView<T>(storage(component_id<T>()));
-    }
-
-    template <typename T>
-    ConstPagedSparseArrayView<T> storage() const {
-        return ConstPagedSparseArrayView<T>(storage(component_id<T>()));
-    }
+    Snapshot snapshot();
+    Transaction transaction();
 
 private:
     static constexpr std::size_t npos = std::numeric_limits<std::size_t>::max() - 1;
 
+    bool has(Entity entity, ComponentId component) const;
+    const void* try_get(Entity entity, ComponentId component) const;
+    RawPagedSparseArray* storage(ComponentId component);
+    const RawPagedSparseArray* storage(ComponentId component) const;
+    void require_no_readers() const;
     void require_alive(Entity entity) const;
     void ensure_entity_slot(Entity index);
     RawPagedSparseArray& assure_storage(ComponentId componentId, std::size_t component_size, std::size_t component_alignment);
+
+    std::uint64_t acquire_tsn();
+    std::vector<std::uint64_t> active_transactions_snapshot() const;
+    void register_transaction(std::uint64_t tsn);
+    void unregister_transaction(std::uint64_t tsn);
+    void register_reader();
+    void unregister_reader();
+
+    template <typename T>
+    ComponentStorage<T>& assure_storage() {
+        const ComponentId id = component_id<T>();
+        if (id >= components_.size()) {
+            components_.resize(static_cast<std::size_t>(id) + 1);
+        }
+
+        RawPagedSparseArray* component = components_[id];
+        if (component == nullptr) {
+            component = new ComponentStorage<T>(page_size_);
+            components_[id] = component;
+        }
+
+        return *static_cast<ComponentStorage<T>*>(component);
+    }
+
+    friend class Snapshot;
+    friend class Transaction;
 
     std::size_t page_size_;
     Entity next_entity_index_ = 0;
@@ -133,6 +114,23 @@ private:
     std::vector<Entity> alive_entities_;
     std::vector<Entity> free_entities_;
     std::vector<RawPagedSparseArray*> components_;
+    std::uint64_t next_tsn_ = 1;
+    std::vector<std::uint64_t> active_transactions_;
+    std::size_t active_readers_ = 0;
 };
+
+}  // namespace ecs
+
+#include "transaction.hpp"
+
+namespace ecs {
+
+inline Snapshot Registry::snapshot() {
+    return Snapshot(*this);
+}
+
+inline Transaction Registry::transaction() {
+    return Transaction(*this);
+}
 
 }  // namespace ecs

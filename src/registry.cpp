@@ -1,5 +1,7 @@
 #include "registry.hpp"
 
+#include <algorithm>
+
 namespace ecs {
 
 namespace detail {
@@ -30,8 +32,9 @@ Registry::Registry(Registry&& other) noexcept = default;
 Registry& Registry::operator=(Registry&& other) noexcept = default;
 
 Entity Registry::create() {
-    Entity entity = null_entity;
+    require_no_readers();
 
+    Entity entity = null_entity;
     if (!free_entities_.empty()) {
         entity = free_entities_.back();
         free_entities_.pop_back();
@@ -53,6 +56,8 @@ Entity Registry::create() {
 }
 
 bool Registry::destroy(Entity entity) {
+    require_no_readers();
+
     if (!alive(entity)) {
         return false;
     }
@@ -82,6 +87,8 @@ bool Registry::destroy(Entity entity) {
 }
 
 void Registry::clear() {
+    require_no_readers();
+
     for (auto& slot : components_) {
         delete slot;
         slot = nullptr;
@@ -92,7 +99,10 @@ void Registry::clear() {
     entity_dense_indices_.clear();
     alive_entities_.clear();
     free_entities_.clear();
+    active_transactions_.clear();
+    active_readers_ = 0;
     next_entity_index_ = 0;
+    next_tsn_ = 1;
 }
 
 bool Registry::alive(Entity entity) const {
@@ -115,38 +125,26 @@ const std::vector<Entity>& Registry::entities() const {
 }
 
 bool Registry::has(Entity entity, ComponentId component) const {
-    if (!alive(entity) || component >= components_.size()) {
-        return false;
-    }
-
-    const RawPagedSparseArray *slot = components_[component];
-    return slot != nullptr && slot->contains(entity);
-}
-
-void* Registry::try_get(Entity entity, ComponentId component) {
-    if (component >= components_.size()) {
-        return nullptr;
-    }
-
-    RawPagedSparseArray *slot = components_[component];
-    return slot != nullptr ? slot->try_get_raw(entity) : nullptr;
+    return try_get(entity, component) != nullptr;
 }
 
 const void* Registry::try_get(Entity entity, ComponentId component) const {
-    if (component >= components_.size()) {
+    if (!alive(entity) || component >= components_.size()) {
         return nullptr;
     }
 
-    const RawPagedSparseArray *slot = components_[component];
+    const RawPagedSparseArray* slot = components_[component];
     return slot != nullptr ? slot->try_get_raw(entity) : nullptr;
 }
 
 bool Registry::remove(Entity entity, ComponentId component) {
+    require_no_readers();
+
     if (component >= components_.size()) {
         return false;
     }
 
-    RawPagedSparseArray *slot = components_[component];
+    RawPagedSparseArray* slot = components_[component];
     return slot != nullptr && slot->erase(entity);
 }
 
@@ -154,7 +152,6 @@ RawPagedSparseArray* Registry::storage(ComponentId component) {
     if (component >= components_.size()) {
         return nullptr;
     }
-
     return components_[component];
 }
 
@@ -162,7 +159,6 @@ const RawPagedSparseArray* Registry::storage(ComponentId component) const {
     if (component >= components_.size()) {
         return nullptr;
     }
-
     return components_[component];
 }
 
@@ -175,12 +171,18 @@ RawPagedSparseArray& Registry::assure_storage(
         components_.resize(static_cast<std::size_t>(componentId) + 1);
     }
 
-    RawPagedSparseArray *component = components_[componentId];
+    RawPagedSparseArray* component = components_[componentId];
     if (component == nullptr) {
         component = new RawPagedSparseArray(component_size, component_alignment, page_size_);
         components_[componentId] = component;
     }
     return *component;
+}
+
+void Registry::require_no_readers() const {
+    if (active_readers_ != 0) {
+        throw std::logic_error("cannot mutate registry structure while snapshots or transactions are open");
+    }
 }
 
 void Registry::require_alive(Entity entity) const {
@@ -194,6 +196,35 @@ void Registry::ensure_entity_slot(Entity index) {
     if (required > current_versions_.size()) {
         current_versions_.resize(required, 0);
         entity_dense_indices_.resize(required, npos);
+    }
+}
+
+std::uint64_t Registry::acquire_tsn() {
+    return next_tsn_++;
+}
+
+std::vector<std::uint64_t> Registry::active_transactions_snapshot() const {
+    return active_transactions_;
+}
+
+void Registry::register_transaction(std::uint64_t tsn) {
+    active_transactions_.push_back(tsn);
+}
+
+void Registry::unregister_transaction(std::uint64_t tsn) {
+    const auto it = std::find(active_transactions_.begin(), active_transactions_.end(), tsn);
+    if (it != active_transactions_.end()) {
+        active_transactions_.erase(it);
+    }
+}
+
+void Registry::register_reader() {
+    ++active_readers_;
+}
+
+void Registry::unregister_reader() {
+    if (active_readers_ != 0) {
+        --active_readers_;
     }
 }
 

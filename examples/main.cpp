@@ -15,9 +15,12 @@ int main() {
     ecs::Registry registry;
 
     const ecs::Entity player = registry.create();
-    registry.emplace<Position>(player, Position{10.0f, 20.0f});
+    auto tx = registry.transaction();
+    tx.write<Position>(player, Position{10.0f, 20.0f});
+    tx.commit();
 
-    const Position& position = registry.get<Position>(player);
+    auto read_tx = registry.transaction();
+    const Position& position = read_tx.get<Position>(player);
     std::cout << "entity " << player << " -> (" << position.x << ", " << position.y << ")\n";
 
     return 0;
