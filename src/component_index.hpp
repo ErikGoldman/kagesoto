@@ -9,6 +9,15 @@
 
 namespace ecs {
 
+enum class PredicateOperator {
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+};
+
 template <typename Component>
 struct ComponentIndices {
     using type = std::tuple<>;
@@ -36,6 +45,8 @@ struct ComponentIndexSpec<Unique, Member> {
     using key_type = typename pointer_traits::member_type;
 
     static constexpr bool unique = Unique;
+    static constexpr bool is_single_member = true;
+    static constexpr auto member = Member;
 
     static key_type key(const component_type& component) {
         return component.*Member;
@@ -51,6 +62,7 @@ struct ComponentIndexSpec<Unique, FirstMember, RestMembers...> {
                                 typename member_pointer_traits<decltype(RestMembers)>::member_type...>;
 
     static constexpr bool unique = Unique;
+    static constexpr bool is_single_member = false;
 
     static_assert((std::is_same_v<component_type, typename member_pointer_traits<decltype(RestMembers)>::component_type> && ...),
                   "all indexed members must belong to the same component type");
@@ -109,6 +121,25 @@ public:
         return tree_.find(key);
     }
 
+    std::vector<Entity> find_compare(PredicateOperator op, const key_type& key) const {
+        switch (op) {
+            case PredicateOperator::eq:
+                return tree_.find(key);
+            case PredicateOperator::ne:
+                return tree_.find_not_equal(key);
+            case PredicateOperator::gt:
+                return tree_.find_greater_than(key, false);
+            case PredicateOperator::gte:
+                return tree_.find_greater_than(key, true);
+            case PredicateOperator::lt:
+                return tree_.find_less_than(key, false);
+            case PredicateOperator::lte:
+                return tree_.find_less_than(key, true);
+        }
+
+        return {};
+    }
+
     Entity find_one(const key_type& key) const {
         return tree_.find_one(key);
     }
@@ -119,6 +150,37 @@ private:
 
 template <typename Query, typename... Declared>
 inline constexpr bool tuple_contains_v = (std::is_same_v<Query, Declared> || ...);
+
+template <auto Member, typename... Declared>
+struct member_index_spec;
+
+template <auto Member, typename Tuple>
+struct tuple_member_index_spec;
+
+template <auto Member, typename IndexSpec, bool = IndexSpec::is_single_member>
+struct member_index_matches : std::false_type {};
+
+template <auto Member, typename IndexSpec>
+struct member_index_matches<Member, IndexSpec, true>
+    : std::bool_constant<(IndexSpec::member == Member)> {};
+
+template <auto Member>
+struct member_index_spec<Member> {
+    using type = void;
+};
+
+template <auto Member, typename First, typename... Rest>
+struct member_index_spec<Member, First, Rest...> {
+    using type = std::conditional_t<
+        member_index_matches<Member, First>::value,
+        First,
+        typename member_index_spec<Member, Rest...>::type>;
+};
+
+template <auto Member, typename... Declared>
+struct tuple_member_index_spec<Member, std::tuple<Declared...>> {
+    using type = typename member_index_spec<Member, Declared...>::type;
+};
 
 template <typename Component, typename Tuple>
 class IndexSet;
@@ -149,6 +211,12 @@ public:
     }
 
     template <typename IndexSpec>
+    std::vector<Entity> find_compare(PredicateOperator op, const typename IndexSpec::key_type& key) const {
+        static_assert(tuple_contains_v<IndexSpec, IndexSpecs...>, "component does not declare this index");
+        return std::get<IndexRuntime<IndexSpec>>(indexes_).find_compare(op, key);
+    }
+
+    template <typename IndexSpec>
     Entity find_one(const typename IndexSpec::key_type& key) const {
         static_assert(tuple_contains_v<IndexSpec, IndexSpecs...>, "component does not declare this index");
         static_assert(IndexSpec::unique, "find_one requires a unique index");
@@ -169,6 +237,12 @@ public:
 
     template <typename IndexSpec>
     std::vector<Entity> find(const typename IndexSpec::key_type&) const {
+        static_assert(!std::is_same_v<IndexSpec, IndexSpec>, "component does not declare this index");
+        return {};
+    }
+
+    template <typename IndexSpec>
+    std::vector<Entity> find_compare(PredicateOperator, const typename IndexSpec::key_type&) const {
         static_assert(!std::is_same_v<IndexSpec, IndexSpec>, "component does not declare this index");
         return {};
     }

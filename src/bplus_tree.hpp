@@ -94,6 +94,37 @@ public:
         return matches;
     }
 
+    std::vector<Entity> find_less_than(const Key& key, bool inclusive) const {
+        const auto end = inclusive
+            ? std::upper_bound(entries_.begin(), entries_.end(), key,
+                               [&](const Key& value, const Entry& entry) { return compare_(value, entry.key); })
+            : std::lower_bound(entries_.begin(), entries_.end(), key,
+                               [&](const Entry& entry, const Key& value) { return compare_(entry.key, value); });
+        return collect(entries_.begin(), end);
+    }
+
+    std::vector<Entity> find_greater_than(const Key& key, bool inclusive) const {
+        const auto begin = inclusive
+            ? std::lower_bound(entries_.begin(), entries_.end(), key,
+                               [&](const Entry& entry, const Key& value) { return compare_(entry.key, value); })
+            : std::upper_bound(entries_.begin(), entries_.end(), key,
+                               [&](const Key& value, const Entry& entry) { return compare_(value, entry.key); });
+        return collect(begin, entries_.end());
+    }
+
+    std::vector<Entity> find_not_equal(const Key& key) const {
+        const auto lower = std::lower_bound(entries_.begin(), entries_.end(), key,
+                                            [&](const Entry& entry, const Key& value) { return compare_(entry.key, value); });
+        const auto upper = std::upper_bound(entries_.begin(), entries_.end(), key,
+                                            [&](const Key& value, const Entry& entry) { return compare_(value, entry.key); });
+
+        std::vector<Entity> matches;
+        matches.reserve(entries_.size() - static_cast<std::size_t>(upper - lower));
+        append_entities(matches, entries_.begin(), lower);
+        append_entities(matches, upper, entries_.end());
+        return matches;
+    }
+
     Entity find_one(const Key& key) const {
         const std::vector<Entity> matches = find(key);
         return matches.empty() ? null_entity : matches.front();
@@ -136,6 +167,21 @@ private:
     };
 
     static inline EntryLess entry_less{Compare{}};
+
+    template <typename Iter>
+    static void append_entities(std::vector<Entity>& matches, Iter begin, Iter end) {
+        for (auto it = begin; it != end; ++it) {
+            matches.push_back(it->entity);
+        }
+    }
+
+    template <typename Iter>
+    static std::vector<Entity> collect(Iter begin, Iter end) {
+        std::vector<Entity> matches;
+        matches.reserve(static_cast<std::size_t>(end - begin));
+        append_entities(matches, begin, end);
+        return matches;
+    }
 
     bool keys_equal(const Key& lhs, const Key& rhs) const {
         return !compare_(lhs, rhs) && !compare_(rhs, lhs);

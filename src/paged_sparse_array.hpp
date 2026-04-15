@@ -682,6 +682,11 @@ public:
     }
 
     template <typename IndexSpec>
+    std::vector<Entity> find_compare(PredicateOperator op, const typename IndexSpec::key_type& key) const {
+        return indexes_.template find_compare<IndexSpec>(op, key);
+    }
+
+    template <typename IndexSpec>
     Entity find_one(const typename IndexSpec::key_type& key) const {
         return indexes_.template find_one<IndexSpec>(key);
     }
@@ -725,6 +730,17 @@ public:
         }
 
         return typed_raw()->template find<IndexSpec>(
+            detail::make_index_key<IndexSpec>(std::forward<KeyParts>(key_parts)...));
+    }
+
+    template <typename IndexSpec, typename... KeyParts>
+    std::vector<Entity> find_compare(PredicateOperator op, KeyParts&&... key_parts) const {
+        if (raw_ == nullptr) {
+            return {};
+        }
+
+        return typed_raw()->template find_compare<IndexSpec>(
+            op,
             detail::make_index_key<IndexSpec>(std::forward<KeyParts>(key_parts)...));
     }
 
@@ -796,6 +812,17 @@ public:
         }
 
         return typed_raw()->template find<IndexSpec>(
+            detail::make_index_key<IndexSpec>(std::forward<KeyParts>(key_parts)...));
+    }
+
+    template <typename IndexSpec, typename... KeyParts>
+    std::vector<Entity> find_compare(PredicateOperator op, KeyParts&&... key_parts) const {
+        if (raw_ == nullptr) {
+            return {};
+        }
+
+        return typed_raw()->template find_compare<IndexSpec>(
+            op,
             detail::make_index_key<IndexSpec>(std::forward<KeyParts>(key_parts)...));
     }
 
