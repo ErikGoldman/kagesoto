@@ -8,6 +8,7 @@
 
 TEST_CASE("paged sparse set stores 64 bit entities across pages") {
     static_assert(std::is_same_v<ecs::Entity, std::uint64_t>);
+    static_assert(std::is_same_v<ecs::Timestamp, std::uint64_t>);
     static_assert(ecs::entity_index_bits == 59);
     static_assert(ecs::entity_version_bits == 5);
 

@@ -26,7 +26,7 @@ ECS_API ComponentId next_component_id();
 
 template <typename T>
 struct ComponentStorageModeTraits {
-    static constexpr ComponentStorageMode value = ComponentStorageMode::classic;
+    static constexpr ComponentStorageMode value = ComponentStorageMode::mvcc;
 };
 
 template <typename T>
@@ -182,10 +182,10 @@ private:
     void compact_trace_history();
     RawPagedSparseArray& assure_storage(ComponentId componentId, std::size_t component_size, std::size_t component_alignment);
 
-    std::uint64_t acquire_tsn();
-    std::vector<std::uint64_t> active_transactions_snapshot() const;
-    void register_transaction(std::uint64_t tsn);
-    void unregister_transaction(std::uint64_t tsn);
+    Timestamp acquire_tsn();
+    std::vector<Timestamp> active_transactions_snapshot() const;
+    void register_transaction(Timestamp tsn);
+    void unregister_transaction(Timestamp tsn);
     void register_reader();
     void unregister_reader();
     void register_snapshot_classic_access();
@@ -272,8 +272,8 @@ private:
     std::vector<Entity> alive_entities_;
     std::vector<Entity> free_entities_;
     std::vector<ComponentSlot> components_;
-    std::uint64_t next_tsn_ = 1;
-    std::vector<std::uint64_t> active_transactions_;
+    Timestamp next_tsn_ = 1;
+    std::vector<Timestamp> active_transactions_;
     std::size_t active_readers_ = 0;
     bool has_classic_storage_mode_ = false;
     std::vector<ClassicAccessState> classic_access_;

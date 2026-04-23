@@ -45,15 +45,15 @@ TEST_CASE("component ids are stable and distinct per component type") {
     REQUIRE(position_id != velocity_id);
 }
 
-TEST_CASE("component storage modes default to classic and can be configured per component") {
+TEST_CASE("component storage modes default to MVCC and can be configured per component") {
     ecs::Registry registry(4);
 
-    REQUIRE(registry.storage_mode<Position>() == ecs::ComponentStorageMode::classic);
+    REQUIRE(registry.storage_mode<Position>() == ecs::ComponentStorageMode::mvcc);
     REQUIRE(registry.storage_mode<ClassicByTrait>() == ecs::ComponentStorageMode::classic);
 
     registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::trace);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::mvcc);
-    REQUIRE(registry.storage_mode<Position>() == ecs::ComponentStorageMode::mvcc);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::classic);
+    REQUIRE(registry.storage_mode<Position>() == ecs::ComponentStorageMode::classic);
     REQUIRE(registry.storage_mode<Velocity>() == ecs::ComponentStorageMode::trace);
 
     const ecs::Entity entity = registry.create();
@@ -61,7 +61,7 @@ TEST_CASE("component storage modes default to classic and can be configured per 
     tx.write<Position>(entity, Position{1, 2});
     tx.commit();
 
-    REQUIRE_THROWS_AS(registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace), std::logic_error);
+    REQUIRE_THROWS_AS(registry.set_storage_mode<Position>(ecs::ComponentStorageMode::mvcc), std::logic_error);
 }
 
 TEST_CASE("registry creates recycles and removes entities and components") {

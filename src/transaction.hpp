@@ -251,8 +251,8 @@ protected:
     }
 
     Registry* registry_ = nullptr;
-    std::uint64_t max_visible_tsn_ = 0;
-    std::vector<std::uint64_t> active_at_open_;
+    Timestamp max_visible_tsn_ = 0;
+    std::vector<Timestamp> active_at_open_;
     bool holds_snapshot_classic_access_ = false;
 };
 
@@ -428,8 +428,8 @@ private:
               component(pending_component) {}
 
         virtual ~PendingWriteBase() = default;
-        virtual void commit(std::uint64_t tsn, TraceCommitContext trace_context) = 0;
-        virtual void rollback(std::uint64_t tsn) = 0;
+        virtual void commit(Timestamp tsn, TraceCommitContext trace_context) = 0;
+        virtual void rollback(Timestamp tsn) = 0;
         virtual bool rollback_supported() const = 0;
 
         Entity entity;
@@ -445,11 +445,11 @@ private:
               storage(pending_storage),
               pending(pending_write) {}
 
-        void commit(std::uint64_t tsn, TraceCommitContext trace_context) override {
+        void commit(Timestamp tsn, TraceCommitContext trace_context) override {
             storage->commit_staged(this->entity, pending, tsn, trace_context);
         }
 
-        void rollback(std::uint64_t tsn) override {
+        void rollback(Timestamp tsn) override {
             storage->rollback_staged(this->entity, pending, tsn);
         }
 
@@ -525,7 +525,7 @@ public:
         }
     }
 
-    std::uint64_t tsn_ = 0;
+    Timestamp tsn_ = 0;
     std::vector<std::unique_ptr<PendingWriteBase>> writes_;
     std::vector<typename Registry::ClassicAccessRegistration> classic_accesses_;
 };

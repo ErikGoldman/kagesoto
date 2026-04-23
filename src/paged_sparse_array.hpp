@@ -16,10 +16,6 @@
 
 namespace ecs {
 
-class Registry;
-template <typename T, typename TransactionType>
-class TransactionStorageView;
-
 enum class ComponentStorageMode : std::uint8_t {
     mvcc,
     classic,
@@ -49,7 +45,7 @@ public:
     static constexpr std::uint16_t max_trace_writer_id = static_cast<std::uint16_t>((1u << trace_writer_id_bits) - 1u);
 
     struct RevisionRef {
-        std::uint64_t tsn = 0;
+        Timestamp tsn = 0;
         std::uint32_t value_index = npos32;
         std::uint32_t trace_tag = 0;
         bool isolated = false;
@@ -185,9 +181,9 @@ public:
 
     const void* try_get_visible_raw(
         Entity entity,
-        std::uint64_t max_visible_tsn,
-        const std::vector<std::uint64_t>& active_at_open,
-        std::uint64_t own_tsn) const {
+        Timestamp max_visible_tsn,
+        const std::vector<Timestamp>& active_at_open,
+        Timestamp own_tsn) const {
 
         const std::size_t dense_index = dense_index_of(entity);
         if (dense_index == npos) {
@@ -273,7 +269,7 @@ public:
     }
 
     PendingWrite stage_write(Entity entity,
-                             std::uint64_t tsn,
+                             Timestamp tsn,
                              const void* initial_value,
                              bool has_initial_value,
                              bool preserve_previous_value = false) {
@@ -306,7 +302,7 @@ public:
         return PendingWrite{dense_index, npos32, false};
     }
 
-    const void* staged_ptr(const PendingWrite& pending, std::uint64_t tsn) const {
+    const void* staged_ptr(const PendingWrite& pending, Timestamp tsn) const {
         if (mode_ == ComponentStorageMode::classic) {
             return pending.dense_index == npos ? nullptr : element_ptr(pending.dense_index);
         }
@@ -315,7 +311,7 @@ public:
         return isolated == nullptr || isolated->tombstone ? nullptr : revision_value_ptr(isolated->value_index);
     }
 
-    void rollback_staged(Entity entity, const PendingWrite& pending, std::uint64_t tsn) {
+    void rollback_staged(Entity entity, const PendingWrite& pending, Timestamp tsn) {
         if (mode_ == ComponentStorageMode::classic) {
             (void)entity;
             (void)pending;
@@ -334,9 +330,9 @@ public:
 
     VisibleRef visible_ref(
         std::size_t dense_index,
-        std::uint64_t max_visible_tsn,
-        const std::vector<std::uint64_t>& active_at_open,
-        std::uint64_t own_tsn) const {
+        Timestamp max_visible_tsn,
+        const std::vector<Timestamp>& active_at_open,
+        Timestamp own_tsn) const {
 
         VisibleRef result{};
         for_each_ref(dense_index, [&](const RevisionRef& ref) {
@@ -383,7 +379,7 @@ protected:
         return result;
     }
 
-    const RevisionRef* find_isolated_ref(std::size_t dense_index, std::uint64_t tsn) const {
+    const RevisionRef* find_isolated_ref(std::size_t dense_index, Timestamp tsn) const {
         const RevisionRef* result = nullptr;
         for_each_ref(dense_index, [&](const RevisionRef& ref) {
             if (!ref.voided && ref.isolated && ref.tsn == tsn) {
@@ -395,7 +391,7 @@ protected:
         return result;
     }
 
-    RevisionRef* find_isolated_ref(std::size_t dense_index, std::uint64_t tsn) {
+    RevisionRef* find_isolated_ref(std::size_t dense_index, Timestamp tsn) {
         RevisionRef* result = nullptr;
         for_each_ref_mut(dense_index, [&](RevisionRef& ref) {
             if (!ref.voided && ref.isolated && ref.tsn == tsn) {
@@ -410,7 +406,7 @@ protected:
     bool commit_staged_ref(
         Entity entity,
         const PendingWrite& pending,
-        std::uint64_t tsn,
+        Timestamp tsn,
         TraceCommitContext trace_context = {}) {
 
         if (mode_ == ComponentStorageMode::classic) {
@@ -625,8 +621,8 @@ protected:
 private:
     friend class Registry;
 
-    static bool contains_tsn(const std::vector<std::uint64_t>& tsns, std::uint64_t tsn) {
-        for (const std::uint64_t candidate : tsns) {
+    static bool contains_tsn(const std::vector<Timestamp>& tsns, Timestamp tsn) {
+        for (const Timestamp candidate : tsns) {
             if (candidate == tsn) {
                 return true;
             }
@@ -917,18 +913,18 @@ public:
 
     const T* try_get_visible(
         Entity entity,
-        std::uint64_t max_visible_tsn,
-        const std::vector<std::uint64_t>& active_at_open,
-        std::uint64_t own_tsn) const {
+        Timestamp max_visible_tsn,
+        const std::vector<Timestamp>& active_at_open,
+        Timestamp own_tsn) const {
 
         return static_cast<const T*>(this->try_get_visible_raw(entity, max_visible_tsn, active_at_open, own_tsn));
     }
 
     PendingWrite stage_write(
         Entity entity,
-        std::uint64_t tsn,
-        const std::vector<std::uint64_t>& active_at_open,
-        std::uint64_t max_visible_tsn) {
+        Timestamp tsn,
+        const std::vector<Timestamp>& active_at_open,
+        Timestamp max_visible_tsn) {
 
         constexpr bool preserve_previous_value = std::tuple_size_v<typename ComponentIndices<T>::type> != 0;
         if (const T* existing = static_cast<const T*>(this->try_get_visible_raw(entity, max_visible_tsn, active_at_open, tsn))) {
@@ -937,23 +933,23 @@ public:
         return RawPagedSparseArray::stage_write(entity, tsn, nullptr, false, preserve_previous_value);
     }
 
-    PendingWrite stage_value(Entity entity, std::uint64_t tsn, const T& value) {
+    PendingWrite stage_value(Entity entity, Timestamp tsn, const T& value) {
         constexpr bool preserve_previous_value = std::tuple_size_v<typename ComponentIndices<T>::type> != 0;
         return RawPagedSparseArray::stage_write(entity, tsn, &value, true, preserve_previous_value);
     }
 
-    T* staged_ptr(const PendingWrite& pending, std::uint64_t tsn) {
+    T* staged_ptr(const PendingWrite& pending, Timestamp tsn) {
         return static_cast<T*>(const_cast<void*>(RawPagedSparseArray::staged_ptr(pending, tsn)));
     }
 
-    const T* staged_ptr(const PendingWrite& pending, std::uint64_t tsn) const {
+    const T* staged_ptr(const PendingWrite& pending, Timestamp tsn) const {
         return static_cast<const T*>(RawPagedSparseArray::staged_ptr(pending, tsn));
     }
 
     bool commit_staged(
         Entity entity,
         const PendingWrite& pending,
-        std::uint64_t tsn,
+        Timestamp tsn,
         TraceCommitContext trace_context = {}) {
 
         if (this->storage_mode() == ComponentStorageMode::classic) {
@@ -993,7 +989,7 @@ public:
         return !had_committed;
     }
 
-    void rollback_staged(Entity entity, const PendingWrite& pending, std::uint64_t tsn) {
+    void rollback_staged(Entity entity, const PendingWrite& pending, Timestamp tsn) {
         RawPagedSparseArray::rollback_staged(entity, pending, tsn);
     }
 

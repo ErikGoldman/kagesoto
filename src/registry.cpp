@@ -238,19 +238,22 @@ void Registry::compact_trace_history() {
     }
 }
 
-std::uint64_t Registry::acquire_tsn() {
+Timestamp Registry::acquire_tsn() {
+    if (next_tsn_ == std::numeric_limits<Timestamp>::max()) {
+        throw std::overflow_error("transaction timestamp space exhausted");
+    }
     return next_tsn_++;
 }
 
-std::vector<std::uint64_t> Registry::active_transactions_snapshot() const {
+std::vector<Timestamp> Registry::active_transactions_snapshot() const {
     return active_transactions_;
 }
 
-void Registry::register_transaction(std::uint64_t tsn) {
+void Registry::register_transaction(Timestamp tsn) {
     active_transactions_.push_back(tsn);
 }
 
-void Registry::unregister_transaction(std::uint64_t tsn) {
+void Registry::unregister_transaction(Timestamp tsn) {
     const auto it = std::find(active_transactions_.begin(), active_transactions_.end(), tsn);
     if (it != active_transactions_.end()) {
         active_transactions_.erase(it);

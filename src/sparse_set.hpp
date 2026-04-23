@@ -13,6 +13,7 @@ namespace ecs {
 
 using Entity = std::uint64_t;
 using EntityVersion = std::uint8_t;
+using Timestamp = std::uint64_t;
 
 inline constexpr Entity null_entity = std::numeric_limits<Entity>::max();
 inline constexpr std::size_t entity_index_bits = 59;
