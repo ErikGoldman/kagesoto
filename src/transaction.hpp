@@ -612,7 +612,7 @@ public:
         });
 
         if constexpr (!std::is_void_v<typename detail::tuple_member_index_spec<Member, typename ComponentIndices<T>::type>::type>) {
-            if (op != PredicateOperator::ne && matches.size() < size()) {
+            if (matches.size() < size()) {
                 plan.uses_component_indexes = true;
                 plan.steps[0].access = QueryAccessKind::index_seek;
                 plan.steps[0].uses_component_index = true;
@@ -696,16 +696,14 @@ public:
 
         using index_spec = typename detail::tuple_member_index_spec<Member, typename ComponentIndices<T>::type>::type;
         if constexpr (!std::is_void_v<index_spec>) {
-            if (op != PredicateOperator::ne) {
-                used_index = true;
-                if (const auto* storage = transaction_->template typed_raw_storage<T>()) {
-                    const auto indexed = storage->template find_compare_index<index_spec>(op, value);
-                    matches.reserve(indexed.size());
-                    for (const Entity entity : indexed) {
-                        if (const T* component = transaction_->template try_get<T>(entity);
-                            component != nullptr && compare_values(component->*Member, op, value)) {
-                            matches.push_back(entity);
-                        }
+            used_index = true;
+            if (const auto* storage = transaction_->template typed_raw_storage<T>()) {
+                const auto indexed = storage->template find_compare_index<index_spec>(op, value);
+                matches.reserve(indexed.size());
+                for (const Entity entity : indexed) {
+                    if (const T* component = transaction_->template try_get<T>(entity);
+                        component != nullptr && compare_values(component->*Member, op, value)) {
+                        matches.push_back(entity);
                     }
                 }
             }

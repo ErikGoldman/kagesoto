@@ -197,7 +197,7 @@ std::vector<ecs::Entity> by_x = positions.find_all<&IndexedPosition::x>(10);
 ecs::Entity exact = positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(10, 2);
 ```
 
-Predicate views can use component indexes for selective equality and range filters:
+Predicate views can use component indexes for selective equality, inequality, and range filters:
 
 ```cpp
 auto tx = registry.transaction<IndexedPosition, Velocity>();
@@ -212,7 +212,7 @@ tx.view<const IndexedPosition, const Velocity>()
     });
 ```
 
-Available predicate operators are `eq`, `ne`, `gt`, `gte`, `lt`, and `lte`, exposed through helpers such as `where_eq`, `where_gt`, and `where_lte`. Not-equal predicates scan because they are usually not selective.
+Available predicate operators are `eq`, `ne`, `gt`, `gte`, `lt`, and `lte`, exposed through helpers such as `where_eq`, `where_ne`, `where_gt`, and `where_lte`. Predicates use the query planner, so an indexed predicate can seed execution when it reduces the candidate set and otherwise falls back to a scan.
 
 ## Trace History
 

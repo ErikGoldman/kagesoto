@@ -489,7 +489,7 @@ TEST_CASE("predicate view explain keeps a scan for unselective equality") {
     REQUIRE_FALSE(explain.steps[0].uses_component_index);
 }
 
-TEST_CASE("predicate view explain uses an index for selective ranges and scans for not-equal") {
+TEST_CASE("predicate view explain uses an index for selective ranges and not-equal") {
     ecs::Registry registry(4);
 
     const ecs::Entity first = registry.create();
@@ -514,8 +514,10 @@ TEST_CASE("predicate view explain uses an index for selective ranges and scans f
 
     const ecs::QueryExplain ne_explain = tx.view<const IndexedPosition>().where_ne<&IndexedPosition::x>(2).explain();
     REQUIRE_FALSE(ne_explain.empty);
-    REQUIRE_FALSE(ne_explain.uses_component_indexes);
-    REQUIRE(ne_explain.steps[0].access == ecs::QueryAccessKind::anchor_scan);
+    REQUIRE(ne_explain.uses_component_indexes);
+    REQUIRE(ne_explain.candidate_rows == 3);
+    REQUIRE(ne_explain.steps[0].access == ecs::QueryAccessKind::index_seek);
+    REQUIRE(ne_explain.steps[0].uses_component_index);
 }
 
 TEST_CASE("predicate views filter correctly and include staged rows") {
@@ -654,7 +656,7 @@ TEST_CASE("predicate view explain uses indexes for selective lt lte and gte rang
     REQUIRE(gte_explain.steps[0].access == ecs::QueryAccessKind::index_seek);
 }
 
-TEST_CASE("predicate view explain keeps scans for non indexed members and not equal") {
+TEST_CASE("predicate view explain keeps scans for non indexed members and unselective not-equal") {
     ecs::Registry registry(8);
 
     const ecs::Entity first = registry.create();
@@ -683,7 +685,7 @@ TEST_CASE("predicate view explain keeps scans for non indexed members and not eq
     REQUIRE(y_gt_explain.candidate_rows == 3);
     REQUIRE(y_gt_explain.steps[0].access == ecs::QueryAccessKind::anchor_scan);
 
-    const ecs::QueryExplain ne_explain = tx.view<const IndexedPosition>().where_ne<&IndexedPosition::x>(10).explain();
+    const ecs::QueryExplain ne_explain = tx.view<const IndexedPosition>().where_ne<&IndexedPosition::x>(999).explain();
     REQUIRE_FALSE(ne_explain.empty);
     REQUIRE_FALSE(ne_explain.uses_component_indexes);
     REQUIRE(ne_explain.candidate_rows == 3);
