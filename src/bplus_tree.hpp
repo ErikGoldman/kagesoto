@@ -41,18 +41,19 @@ public:
         entries_.clear();
         root_.reset();
         leftmost_leaf_ = nullptr;
+        tree_dirty_ = false;
     }
 
     void insert(const Key& key, Entity entity) {
         const Entry entry{key, entity};
-        if (unique_ && find_one(key) != null_entity) {
+        if (unique_ && find_one_in_entries(key) != null_entity) {
             throw std::invalid_argument("unique index constraint violated");
         }
 
         const auto it = std::lower_bound(entries_.begin(), entries_.end(), entry, entry_less);
 
         entries_.insert(it, entry);
-        rebuild();
+        tree_dirty_ = true;
     }
 
     void erase(const Key& key, Entity entity) {
@@ -60,11 +61,12 @@ public:
         const auto it = std::lower_bound(entries_.begin(), entries_.end(), target, entry_less);
         if (it != entries_.end() && it->entity == entity && keys_equal(it->key, key)) {
             entries_.erase(it);
-            rebuild();
+            tree_dirty_ = true;
         }
     }
 
     std::vector<Entity> find(const Key& key) const {
+        ensure_built();
         std::vector<Entity> matches;
         const LeafNode* leaf = find_leaf(key);
         while (leaf != nullptr) {
@@ -90,7 +92,6 @@ public:
 
             leaf = leaf->next;
         }
-
         return matches;
     }
 
@@ -187,11 +188,28 @@ private:
         return !compare_(lhs, rhs) && !compare_(rhs, lhs);
     }
 
-    void rebuild() {
+    void ensure_built() const {
+        if (!tree_dirty_) {
+            return;
+        }
+        rebuild();
+    }
+
+    Entity find_one_in_entries(const Key& key) const {
+        const auto it = std::lower_bound(entries_.begin(), entries_.end(), key,
+                                         [&](const Entry& entry, const Key& value) { return compare_(entry.key, value); });
+        if (it == entries_.end() || compare_(key, it->key)) {
+            return null_entity;
+        }
+        return it->entity;
+    }
+
+    void rebuild() const {
         root_.reset();
         leftmost_leaf_ = nullptr;
 
         if (entries_.empty()) {
+            tree_dirty_ = false;
             return;
         }
 
@@ -241,6 +259,7 @@ private:
         }
 
         root_ = std::move(level.front());
+        tree_dirty_ = false;
     }
 
     const LeafNode* find_leaf(const Key& key) const {
@@ -311,8 +330,9 @@ private:
     bool unique_;
     Compare compare_;
     std::vector<Entry> entries_;
-    std::unique_ptr<Node> root_;
-    LeafNode* leftmost_leaf_ = nullptr;
+    mutable std::unique_ptr<Node> root_;
+    mutable LeafNode* leftmost_leaf_ = nullptr;
+    mutable bool tree_dirty_ = false;
 };
 
 template <typename Key, typename Compare = std::less<Key>>

@@ -214,6 +214,49 @@ TEST_CASE("component row reuse after remove does not leak stale index state") {
     REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(56, 78) == second);
 }
 
+TEST_CASE("component indexes stay consistent across many replacements beyond one leaf worth of rows") {
+    ecs::Registry registry(64);
+
+    std::vector<ecs::Entity> entities;
+    entities.reserve(40);
+    for (std::int32_t i = 0; i < 40; ++i) {
+        entities.push_back(registry.create());
+    }
+
+    {
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
+        for (std::int32_t i = 0; i < 40; ++i) {
+            tx.write<IndexedPosition>(entities[static_cast<std::size_t>(i)], IndexedPosition{i, i});
+        }
+        tx.commit();
+    }
+
+    {
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
+        for (std::int32_t i = 8; i < 32; ++i) {
+            tx.write<IndexedPosition>(entities[static_cast<std::size_t>(i)], IndexedPosition{i + 100, i + 100});
+        }
+        tx.commit();
+    }
+
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
+    auto positions = tx.storage<IndexedPosition>();
+
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(4, 4) == entities[4]);
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(12, 12) == ecs::null_entity);
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(112, 112) == entities[12]);
+
+    std::vector<ecs::Entity> ranged;
+    tx.view<const IndexedPosition>()
+        .where_gte<&IndexedPosition::x>(108)
+        .where_lte<&IndexedPosition::x>(111)
+        .forEach([&](ecs::Entity entity, const IndexedPosition&) {
+            ranged.push_back(entity);
+        });
+
+    REQUIRE(ranged == std::vector<ecs::Entity>{entities[8], entities[9], entities[10], entities[11]});
+}
+
 TEST_CASE("concurrent transactions enforce unique indexes against newly committed rows") {
     auto registry = make_index_mvcc_registry();
 

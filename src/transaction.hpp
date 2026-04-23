@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -10,9 +12,11 @@
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "profiler.hpp"
 #include "view_traits.hpp"
 
 namespace ecs {
@@ -47,8 +51,15 @@ class Transaction;
 enum class QueryAccessKind {
     anchor_scan,
     index_seek,
+    grouped_fetch,
     sparse_lookup,
     singleton_read,
+};
+
+enum class QuerySourceKind {
+    standalone_storage,
+    owning_group,
+    component_index,
 };
 
 struct QueryAccessStep {
@@ -57,6 +68,16 @@ struct QueryAccessStep {
     std::size_t visible_rows = 0;
     QueryAccessKind access = QueryAccessKind::sparse_lookup;
     bool uses_component_index = false;
+    std::string_view component_name{};
+};
+
+struct QuerySourceCandidate {
+    QuerySourceKind source = QuerySourceKind::standalone_storage;
+    ComponentId component = null_component;
+    std::size_t component_index = 0;
+    std::size_t candidate_rows = 0;
+    std::size_t grouped_component_count = 0;
+    bool chosen = false;
     std::string_view component_name{};
 };
 
@@ -69,6 +90,7 @@ struct QueryExplain {
     std::size_t estimated_entity_lookups = 0;
     bool uses_component_indexes = false;
     std::vector<QueryAccessStep> steps;
+    std::vector<QuerySourceCandidate> candidates;
 };
 
 template <typename T>
@@ -193,12 +215,13 @@ public:
     }
 
     const void* try_get(Entity entity, ComponentId component) const {
+        ECS_PROFILE_ZONE("Transaction::try_get");
         require_open();
         if (!registry_->alive(entity)) {
             return nullptr;
         }
 
-        const RawPagedSparseArray* raw = registry_->storage(component);
+        const RawPagedSparseArray* raw = registry_->storage_for_entity(entity, component);
         return raw == nullptr ? nullptr : raw->try_get_visible_raw(entity, max_visible_tsn_, active_at_open_, 0);
     }
 
@@ -241,6 +264,15 @@ public:
     const std::vector<Entity>& entities() const {
         require_open();
         return registry_->entities();
+    }
+
+    bool has_stable_visibility() const {
+        require_open();
+        return active_at_open_.empty();
+    }
+
+    bool has_pending_writes() const {
+        return false;
     }
 
 protected:
@@ -328,9 +360,13 @@ public:
     Transaction(Transaction&& other) noexcept
         : Snapshot(std::move(other)),
           tsn_(other.tsn_),
-          writes_(std::move(other.writes_)),
-          classic_accesses_(std::move(other.classic_accesses_)) {
+          pending_write_stores_(std::move(other.pending_write_stores_)),
+          classic_accesses_(std::move(other.classic_accesses_)),
+          pending_write_count_(other.pending_write_count_),
+          pending_write_reserve_hint_(other.pending_write_reserve_hint_) {
         other.tsn_ = 0;
+        other.pending_write_count_ = 0;
+        other.pending_write_reserve_hint_ = 0;
     }
 
     Transaction& operator=(Transaction&& other) noexcept {
@@ -344,9 +380,13 @@ public:
             }
             Snapshot::operator=(std::move(other));
             tsn_ = other.tsn_;
-            writes_ = std::move(other.writes_);
+            pending_write_stores_ = std::move(other.pending_write_stores_);
             classic_accesses_ = std::move(other.classic_accesses_);
+            pending_write_count_ = other.pending_write_count_;
+            pending_write_reserve_hint_ = other.pending_write_reserve_hint_;
             other.tsn_ = 0;
+            other.pending_write_count_ = 0;
+            other.pending_write_reserve_hint_ = 0;
         }
         return *this;
     }
@@ -376,7 +416,7 @@ public:
             return nullptr;
         }
 
-        const RawPagedSparseArray* raw = registry_->storage(component);
+        const RawPagedSparseArray* raw = registry_->storage_for_entity(entity, component);
         return raw == nullptr ? nullptr : raw->try_get_visible_raw(entity, max_visible_tsn_, active_at_open_, tsn_);
     }
 
@@ -422,6 +462,54 @@ public:
         return TransactionView<Transaction<DeclaredComponents...>, Components...>(*this);
     }
 
+    template <typename T>
+    std::size_t visible_component_size() const {
+        using Base = detail::component_base_t<T>;
+        require_open();
+
+        if constexpr (detail::is_singleton_component_v<Base>) {
+            return try_get<Base>() == nullptr ? 0 : 1;
+        } else {
+            if (has_stable_visibility() && !has_pending_writes()) {
+                std::size_t count = 0;
+                if (const RawPagedSparseArray* storage = raw_storage(component_id<Base>()); storage != nullptr) {
+                    count += storage->size();
+                }
+                if (const OwningGroupBase* owner = owning_group(component_id<Base>()); owner != nullptr) {
+                    count += owner->entities().size();
+                }
+                return count;
+            }
+
+            std::size_t count = 0;
+            for (const Entity entity : entities()) {
+                if (try_get<Base>(entity) != nullptr) {
+                    ++count;
+                }
+            }
+            return count;
+        }
+    }
+
+    void reserve_pending_writes(std::size_t expected_writes) {
+        require_open();
+        if (expected_writes == 0) {
+            return;
+        }
+
+        pending_write_reserve_hint_ = std::max(pending_write_reserve_hint_, expected_writes);
+    }
+
+    const void* try_get_visible_dense(const RawPagedSparseArray& storage, std::size_t dense_index) const {
+        ECS_PROFILE_ZONE("Transaction::try_get_visible_dense");
+        return storage.try_get_visible_dense_raw(dense_index, max_visible_tsn_, active_at_open_, tsn_);
+    }
+
+    const void* try_get_visible_from_storage(const RawPagedSparseArray& storage, Entity entity) const {
+        ECS_PROFILE_ZONE("Transaction::try_get_from_storage");
+        return storage.try_get_visible_raw(entity, max_visible_tsn_, active_at_open_, tsn_);
+    }
+
     template <typename T, typename = std::enable_if_t<detail::writable_component_v<T, DeclaredComponents...> &&
                                                       !detail::is_singleton_component_v<T>>>
     T* write(Entity entity) {
@@ -433,10 +521,10 @@ public:
             return pending->storage->staged_ptr(pending->pending, tsn_);
         }
 
-        auto& storage = registry_->template assure_storage<T>();
+        auto& storage = registry_->template assure_storage_for_entity<T>(entity);
         auto pending = storage.stage_write(entity, tsn_, active_at_open_, max_visible_tsn_);
         T* staged = storage.staged_ptr(pending, tsn_);
-        writes_.push_back(std::make_unique<PendingWrite<T>>(entity, &storage, pending));
+        add_pending_write(entity, &storage, pending);
         return staged;
     }
 
@@ -456,10 +544,10 @@ public:
             return staged;
         }
 
-        auto& storage = registry_->template assure_storage<T>();
+        auto& storage = registry_->template assure_storage_for_entity<T>(entity);
         auto pending = storage.stage_value(entity, tsn_, value);
         T* staged = storage.staged_ptr(pending, tsn_);
-        writes_.push_back(std::make_unique<PendingWrite<T>>(entity, &storage, pending));
+        add_pending_write(entity, &storage, pending);
         return staged;
     }
 
@@ -476,7 +564,7 @@ public:
         auto& storage = registry_->template assure_singleton_storage<T>();
         auto pending = storage.stage_write(detail::singleton_entity, tsn_, active_at_open_, max_visible_tsn_);
         T* staged = storage.staged_ptr(pending, tsn_);
-        writes_.push_back(std::make_unique<PendingWrite<T>>(detail::singleton_entity, &storage, pending, false));
+        add_pending_write(detail::singleton_entity, &storage, pending, false);
         return staged;
     }
 
@@ -501,7 +589,7 @@ public:
         auto& storage = registry_->template assure_singleton_storage<T>();
         auto pending = storage.stage_value(detail::singleton_entity, tsn_, value);
         T* staged = storage.staged_ptr(pending, tsn_);
-        writes_.push_back(std::make_unique<PendingWrite<T>>(detail::singleton_entity, &storage, pending, false));
+        add_pending_write(detail::singleton_entity, &storage, pending, false);
         return staged;
     }
 
@@ -523,97 +611,142 @@ public:
     }
 
 private:
-    struct PendingWriteBase {
-        PendingWriteBase(Entity pending_entity, ComponentId pending_component, bool pending_requires_alive)
-            : entity(pending_entity),
-              component(pending_component),
-              requires_alive(pending_requires_alive) {}
-
-        virtual ~PendingWriteBase() = default;
-        virtual void commit(Timestamp tsn, TraceCommitContext trace_context) = 0;
-        virtual void rollback(Timestamp tsn) = 0;
-        virtual bool rollback_supported() const = 0;
-
-        Entity entity;
-        ComponentId component;
-        bool requires_alive;
-    };
-
     template <typename T>
-    struct PendingWrite final : PendingWriteBase {
-        PendingWrite(Entity entity,
-                     ComponentStorage<T>* pending_storage,
-                     typename ComponentStorage<T>::PendingWrite pending_write,
-                     bool pending_requires_alive = true)
-            : PendingWriteBase(entity, component_id<T>(), pending_requires_alive),
-              storage(pending_storage),
-              pending(pending_write) {}
-
-        void commit(Timestamp tsn, TraceCommitContext trace_context) override {
-            storage->commit_staged(this->entity, pending, tsn, trace_context);
-        }
-
-        void rollback(Timestamp tsn) override {
-            storage->rollback_staged(this->entity, pending, tsn);
-        }
-
-        bool rollback_supported() const override {
-            return !is_direct_write_storage_mode(storage->storage_mode());
-        }
-
+    struct PendingWriteEntry {
+        Entity entity = null_entity;
         ComponentStorage<T>* storage;
         typename ComponentStorage<T>::PendingWrite pending;
+        bool requires_alive = true;
     };
 
     template <typename T>
-    PendingWrite<T>* find_pending(Entity entity) {
-        const ComponentId component = component_id<T>();
-        for (const auto& write : writes_) {
-            if (write->entity == entity && write->component == component) {
-                return static_cast<PendingWrite<T>*>(write.get());
-            }
+    struct PendingWriteStore {
+        using component_type = T;
+
+        std::vector<PendingWriteEntry<T>> writes;
+        std::unordered_map<Entity, std::size_t> index_by_entity;
+
+        void reserve(std::size_t expected_writes) {
+            writes.reserve(expected_writes);
+            index_by_entity.reserve(expected_writes);
         }
-        return nullptr;
+
+        void clear() {
+            writes.clear();
+            index_by_entity.clear();
+        }
+    };
+
+    template <typename T>
+    PendingWriteStore<T>& pending_store() {
+        return std::get<PendingWriteStore<T>>(pending_write_stores_);
     }
 
     template <typename T>
-    PendingWrite<T>* find_pending_singleton() {
-        const ComponentId component = component_id<T>();
-        for (const auto& write : writes_) {
-            if (!write->requires_alive && write->component == component) {
-                return static_cast<PendingWrite<T>*>(write.get());
-            }
+    const PendingWriteStore<T>& pending_store() const {
+        return std::get<PendingWriteStore<T>>(pending_write_stores_);
+    }
+
+    template <typename T>
+    void ensure_pending_store_capacity() {
+        auto& store = pending_store<T>();
+        if (pending_write_reserve_hint_ != 0 && store.writes.empty() && store.index_by_entity.empty()) {
+            store.reserve(pending_write_reserve_hint_);
         }
-        return nullptr;
+    }
+
+    template <typename T>
+    PendingWriteEntry<T>* find_pending(Entity entity) {
+        ensure_pending_store_capacity<T>();
+        auto& store = pending_store<T>();
+        const auto it = store.index_by_entity.find(entity);
+        return it == store.index_by_entity.end() ? nullptr : &store.writes[it->second];
+    }
+
+    template <typename T>
+    void add_pending_write(Entity entity,
+                           ComponentStorage<T>* storage,
+                           typename ComponentStorage<T>::PendingWrite pending,
+                           bool requires_alive = true) {
+        ensure_pending_store_capacity<T>();
+        auto& store = pending_store<T>();
+        store.index_by_entity.emplace(entity, store.writes.size());
+        store.writes.push_back(PendingWriteEntry<T>{entity, storage, pending, requires_alive});
+        ++pending_write_count_;
+    }
+
+    template <typename Store, typename Func>
+    static void for_each_store_entry(Store& store, Func& func) {
+        for (auto& entry : store.writes) {
+            func(entry);
+        }
+    }
+
+    template <typename Func>
+    void for_each_pending_entry(Func&& func) {
+        auto&& callback = func;
+        std::apply([&](auto&... stores) { (for_each_store_entry(stores, callback), ...); }, pending_write_stores_);
+    }
+
+    template <typename Store, typename Func>
+    static void for_each_store_entry_const(const Store& store, Func& func) {
+        for (const auto& entry : store.writes) {
+            func(entry);
+        }
+    }
+
+    template <typename Func>
+    void for_each_pending_entry(Func&& func) const {
+        auto&& callback = func;
+        std::apply([&](const auto&... stores) { (for_each_store_entry_const(stores, callback), ...); }, pending_write_stores_);
+    }
+
+    template <typename T>
+    PendingWriteEntry<T>* find_pending_singleton() {
+        return find_pending<T>(detail::singleton_entity);
     }
 
     bool rollback_supported() const {
-        for (const auto& write : writes_) {
-            if (!write->rollback_supported()) {
-                return false;
+        bool supported = true;
+        for_each_pending_entry([&](const auto& entry) {
+            if (is_direct_write_storage_mode(entry.storage->storage_mode())) {
+                supported = false;
             }
-        }
-        return true;
+        });
+        return supported;
     }
 
     void finalize_writes(bool commit_writes) {
         require_open();
 
-        for (const auto& write : writes_) {
-            if (write->requires_alive) {
-                registry_->require_alive(write->entity);
-            }
-        }
+        std::vector<Entity> touched_entities;
+        touched_entities.reserve(pending_write_count_);
 
-        for (auto& write : writes_) {
+        for_each_pending_entry([&](auto& entry) {
+            if (entry.requires_alive) {
+                registry_->require_alive(entry.entity);
+            }
+        });
+
+        for_each_pending_entry([&](auto& entry) {
             if (commit_writes) {
-                write->commit(tsn_, registry_->trace_commit_context_);
+                entry.storage->commit_staged(entry.entity, entry.pending, tsn_, registry_->trace_commit_context_);
+                if (entry.requires_alive) {
+                    touched_entities.push_back(entry.entity);
+                }
             } else {
-                write->rollback(tsn_);
+                entry.storage->rollback_staged(entry.entity, entry.pending, tsn_);
             }
+        });
+
+        if (commit_writes && !touched_entities.empty()) {
+            std::sort(touched_entities.begin(), touched_entities.end());
+            touched_entities.erase(std::unique(touched_entities.begin(), touched_entities.end()), touched_entities.end());
+            registry_->refresh_groups_for_entities(touched_entities);
         }
 
-        writes_.clear();
+        std::apply([](auto&... stores) { (stores.clear(), ...); }, pending_write_stores_);
+        pending_write_count_ = 0;
         registry_->unregister_classic_access(classic_accesses_);
         classic_accesses_.clear();
         if (tsn_ != 0) {
@@ -629,22 +762,49 @@ public:
         return static_cast<const ComponentStorage<T>*>(raw_storage(component_id<T>()));
     }
 
+    bool component_belongs_to_group(ComponentId component) const {
+        return registry_ != nullptr && registry_->component_belongs_to_group(component);
+    }
+
+    const OwningGroupBase* owning_group(ComponentId component) const {
+        if (registry_ == nullptr || component >= registry_->components_.size()) {
+            return nullptr;
+        }
+        return registry_->components_[component].owner;
+    }
+
+    bool has_pending_for_group(const OwningGroupBase* group) const {
+        if (group == nullptr || registry_ == nullptr) {
+            return false;
+        }
+
+        bool found = false;
+        std::apply([&](const auto&... stores) {
+            ((found = found || (!stores.writes.empty() &&
+                                owning_group(component_id<typename std::decay_t<decltype(stores)>::component_type>()) == group)),
+             ...);
+        }, pending_write_stores_);
+        return found;
+    }
+
+    bool has_pending_writes() const {
+        return pending_write_count_ != 0;
+    }
+
     template <typename T, typename Func>
     void each_pending_write(Func&& func) const {
-        for (const auto& write : writes_) {
-            if (write->component != component_id<T>()) {
-                continue;
-            }
-
-            const auto* pending = static_cast<const PendingWrite<T>*>(write.get());
-            const T* staged = pending->storage->staged_ptr(pending->pending, tsn_);
-            func(write->entity, staged);
+        const auto& store = pending_store<T>();
+        for (const auto& pending : store.writes) {
+            const T* staged = pending.storage->staged_ptr(pending.pending, tsn_);
+            func(pending.entity, staged);
         }
     }
 
     Timestamp tsn_ = 0;
-    std::vector<std::unique_ptr<PendingWriteBase>> writes_;
+    std::tuple<PendingWriteStore<detail::component_base_t<DeclaredComponents>>...> pending_write_stores_;
     std::vector<typename Registry::ClassicAccessRegistration> classic_accesses_;
+    std::size_t pending_write_count_ = 0;
+    std::size_t pending_write_reserve_hint_ = 0;
 };
 
 template <typename T, typename TransactionType>
@@ -666,17 +826,18 @@ public:
     }
 
     QueryExplain explain() const {
+        const std::size_t visible = size();
         QueryExplain plan{};
-        plan.empty = size() == 0;
+        plan.empty = visible == 0;
         plan.anchor_component = component_id<T>();
         plan.anchor_component_name = detail::type_name<T>();
         plan.anchor_component_index = 0;
-        plan.candidate_rows = size();
+        plan.candidate_rows = visible;
         plan.estimated_entity_lookups = 0;
         plan.steps.push_back(QueryAccessStep{
             component_id<T>(),
             0,
-            size(),
+            visible,
             QueryAccessKind::anchor_scan,
             false,
             detail::type_name<T>(),
@@ -689,7 +850,10 @@ public:
         using index_spec = typename detail::tuple_member_pack_index_spec<typename ComponentIndices<T>::type, Members...>::type;
         const std::size_t matches = find_all<Members...>(std::forward<KeyParts>(key_parts)...).size();
         const std::size_t visible = size();
-        const bool use_index = !std::is_void_v<index_spec> && matches < visible;
+        const bool use_index =
+            !transaction_->component_belongs_to_group(component_id<T>()) &&
+            !std::is_void_v<index_spec> &&
+            matches < visible;
         QueryExplain plan{};
         plan.empty = matches == 0;
         plan.anchor_component = component_id<T>();
@@ -729,6 +893,9 @@ public:
         });
 
         if constexpr (!std::is_void_v<typename detail::tuple_member_index_spec<Member, typename ComponentIndices<T>::type>::type>) {
+            if (transaction_->component_belongs_to_group(component_id<T>())) {
+                return plan;
+            }
             if (matches.size() < size()) {
                 plan.uses_component_indexes = true;
                 plan.steps[0].access = QueryAccessKind::index_seek;
@@ -740,11 +907,7 @@ public:
     }
 
     std::size_t size() const {
-        std::size_t count = 0;
-        each([&count](Entity, const T&) {
-            ++count;
-        });
-        return count;
+        return transaction_->template visible_component_size<T>();
     }
 
     template <auto... Members, typename... KeyParts>
@@ -757,6 +920,14 @@ public:
         std::vector<Entity> matches;
 
         if constexpr (!std::is_void_v<index_spec>) {
+            if (transaction_->component_belongs_to_group(component_id<T>())) {
+                each([&](Entity entity, const T& component) {
+                    if (query_spec::key(component) == key) {
+                        matches.push_back(entity);
+                    }
+                });
+                return matches;
+            }
             if (const auto* storage = transaction_->template typed_raw_storage<T>()) {
                 const auto indexed = storage->template find_index<index_spec>(key);
                 matches.reserve(indexed.size());
@@ -813,6 +984,14 @@ public:
 
         using index_spec = typename detail::tuple_member_index_spec<Member, typename ComponentIndices<T>::type>::type;
         if constexpr (!std::is_void_v<index_spec>) {
+            if (transaction_->component_belongs_to_group(component_id<T>())) {
+                each([&](Entity entity, const T& component) {
+                    if (compare_values(component.*Member, op, value)) {
+                        matches.push_back(entity);
+                    }
+                });
+                return matches;
+            }
             used_index = true;
             if (const auto* storage = transaction_->template typed_raw_storage<T>()) {
                 const auto indexed = storage->template find_compare_index<index_spec>(op, value);
@@ -943,22 +1122,71 @@ public:
             return;
         }
 
-        if (planned.anchor_storage == nullptr) {
+        if (planned.anchor_entities == nullptr) {
             auto components = std::tuple<detail::component_pointer_t<TransactionType, Components>...>{
                 fetch<Components>(null_entity)...};
             invoke(callback, null_entity, components, std::index_sequence_for<Components...>{});
             return;
         }
 
-        iterate_scan(callback, planned.anchor_storage);
+        if (planned.group != nullptr) {
+            iterate_group(callback, planned);
+            return;
+        }
+
+        iterate_scan(callback, planned);
     }
 
 private:
+    struct ComponentDescriptor {
+        ComponentId component = null_component;
+        std::size_t component_index = 0;
+        std::string_view component_name{};
+        bool singleton = false;
+        std::size_t (*visible_rows)(const TransactionView&) = nullptr;
+    };
+
     struct PlannedView {
-        const RawPagedSparseArray* anchor_storage = nullptr;
+        const std::vector<Entity>* anchor_entities = nullptr;
+        std::vector<Entity> materialized_anchor_entities;
         std::size_t anchor_index = 0;
+        std::size_t grouped_component_count = 0;
+        const OwningGroupBase* group = nullptr;
+        std::vector<std::size_t> covered_component_indices;
+        std::array<const RawPagedSparseArray*, sizeof...(Components)> grouped_storages{};
+        const RawPagedSparseArray* anchor_storage = nullptr;
+        bool anchor_uses_dense_iteration = false;
         QueryExplain explain;
     };
+
+    struct SourceCandidate {
+        const std::vector<Entity>* entities = nullptr;
+        std::vector<Entity> materialized_entities;
+        std::size_t row_count = 0;
+        std::size_t anchor_index = 0;
+        ComponentId anchor_component = null_component;
+        std::string_view anchor_name{};
+        const OwningGroupBase* group = nullptr;
+        std::vector<std::size_t> covered_component_indices;
+        std::array<const RawPagedSparseArray*, sizeof...(Components)> grouped_storages{};
+        const RawPagedSparseArray* anchor_storage = nullptr;
+        bool anchor_uses_dense_iteration = false;
+    };
+
+    static const std::array<ComponentDescriptor, sizeof...(Components)>& component_descriptors() {
+        static const std::array<ComponentDescriptor, sizeof...(Components)> descriptors{{
+            ComponentDescriptor{
+                component_id<detail::component_base_t<Components>>(),
+                detail::component_index_of<detail::component_base_t<Components>, detail::component_base_t<Components>...>::value,
+                detail::type_name<detail::component_base_t<Components>>(),
+                detail::is_singleton_component_v<detail::component_base_t<Components>>,
+                [](const TransactionView& self) -> std::size_t {
+                    return self.template visible_size<Components>();
+                },
+            }...
+        }};
+        return descriptors;
+    }
 
     template <typename Component>
     detail::component_pointer_t<TransactionType, Component> fetch(Entity entity) const {
@@ -969,6 +1197,31 @@ private:
         } else {
             return transaction_->template try_get<Base>(entity);
         }
+    }
+
+    template <typename Component>
+    detail::component_pointer_t<TransactionType, Component> fetch_known_alive(Entity entity, std::size_t component_index) const {
+        using Base = detail::component_base_t<Component>;
+        if constexpr (detail::is_singleton_component_v<Base>) {
+            (void)entity;
+            (void)component_index;
+            return transaction_->template try_get<Base>();
+        }
+
+        const ComponentId component = component_descriptors()[component_index].component;
+        if (const OwningGroupBase* owner = transaction_->owning_group(component); owner != nullptr && owner->contains(entity)) {
+            if (const RawPagedSparseArray* raw = owner->storage(component); raw != nullptr) {
+                return static_cast<detail::component_pointer_t<TransactionType, Component>>(
+                    transaction_->try_get_visible_from_storage(*raw, entity));
+            }
+            return nullptr;
+        }
+
+        if (const RawPagedSparseArray* raw = transaction_->raw_storage(component); raw != nullptr) {
+            return static_cast<detail::component_pointer_t<TransactionType, Component>>(
+                transaction_->try_get_visible_from_storage(*raw, entity));
+        }
+        return nullptr;
     }
 
     template <typename Tuple, std::size_t... Indices>
@@ -982,20 +1235,118 @@ private:
     }
 
     template <typename Func>
-    void iterate_scan(Func& func, const RawPagedSparseArray* anchor_storage) const {
-        const auto& dense_entities = anchor_storage->entities();
-        for (const Entity entity : dense_entities) {
+    void iterate_scan(Func& func, const PlannedView& planned) const {
+        ECS_PROFILE_ZONE("TransactionView::iterate_scan");
+        const std::vector<Entity>& anchor_entities = *planned.anchor_entities;
+        if (planned.anchor_uses_dense_iteration && planned.anchor_storage != nullptr) {
+            iterate_scan_dense(func, planned, anchor_entities);
+            return;
+        }
+
+        for (const Entity entity : anchor_entities) {
             if (entity == null_entity) {
                 continue;
             }
-
             auto components = std::tuple<detail::component_pointer_t<TransactionType, Components>...>{
-                fetch<Components>(entity)...};
+                fetch_known_alive<Components>(entity, detail::component_index_of<detail::component_base_t<Components>, detail::component_base_t<Components>...>::value)...};
 
             if (all_present(components, std::index_sequence_for<Components...>{})) {
                 invoke(func, entity, components, std::index_sequence_for<Components...>{});
             }
         }
+    }
+
+    template <typename Func, std::size_t... Indices>
+    void iterate_scan_dense_impl(
+        Func& func,
+        const PlannedView& planned,
+        const std::vector<Entity>& anchor_entities,
+        std::index_sequence<Indices...>) const {
+        for (std::size_t dense_index = 0; dense_index < anchor_entities.size(); ++dense_index) {
+            const Entity entity = anchor_entities[dense_index];
+            if (entity == null_entity) {
+                continue;
+            }
+
+            auto components = std::tuple<detail::component_pointer_t<TransactionType, Components>...>{
+                fetch_anchor_dense<Components>(planned, entity, dense_index, Indices)...};
+
+            if (all_present(components, std::index_sequence_for<Components...>{})) {
+                invoke(func, entity, components, std::index_sequence_for<Components...>{});
+            }
+        }
+    }
+
+    template <typename Func>
+    void iterate_scan_dense(Func& func, const PlannedView& planned, const std::vector<Entity>& anchor_entities) const {
+        ECS_PROFILE_ZONE("TransactionView::iterate_scan_dense");
+        iterate_scan_dense_impl(func, planned, anchor_entities, std::index_sequence_for<Components...>{});
+    }
+
+    static bool plan_covers_component(const PlannedView& planned, std::size_t component_index) {
+        return planned.grouped_storages[component_index] != nullptr;
+    }
+
+    template <typename Component>
+    detail::component_pointer_t<TransactionType, Component> fetch_anchor_dense(
+        const PlannedView& planned,
+        Entity entity,
+        std::size_t dense_index,
+        std::size_t component_index) const {
+        if (component_index == planned.anchor_index && planned.anchor_storage != nullptr) {
+            return static_cast<detail::component_pointer_t<TransactionType, Component>>(
+                transaction_->try_get_visible_dense(*planned.anchor_storage, dense_index));
+        }
+        if (planned.group != nullptr && plan_covers_component(planned, component_index)) {
+            return static_cast<detail::component_pointer_t<TransactionType, Component>>(
+                transaction_->try_get_visible_dense(*planned.grouped_storages[component_index], dense_index));
+        }
+        return fetch_known_alive<Component>(entity, component_index);
+    }
+
+    template <typename Component>
+    detail::component_pointer_t<TransactionType, Component> fetch_grouped(
+        const PlannedView& planned,
+        Entity entity,
+        std::size_t dense_index,
+        std::size_t component_index) const {
+
+        if (planned.group != nullptr && plan_covers_component(planned, component_index)) {
+            const RawPagedSparseArray* raw = planned.grouped_storages[component_index];
+            return raw == nullptr
+                ? nullptr
+                : static_cast<detail::component_pointer_t<TransactionType, Component>>(
+                      transaction_->try_get_visible_dense(*raw, dense_index));
+        }
+        return fetch_known_alive<Component>(entity, component_index);
+    }
+
+    template <typename Func, std::size_t... Indices>
+    void iterate_group_impl(Func& func, const PlannedView& planned, std::index_sequence<Indices...>) const {
+        ECS_PROFILE_ZONE("TransactionView::iterate_group");
+        const std::vector<Entity>& anchor_entities = *planned.anchor_entities;
+        for (std::size_t dense_index = 0; dense_index < anchor_entities.size(); ++dense_index) {
+            const Entity entity = anchor_entities[dense_index];
+            if (entity == null_entity) {
+                continue;
+            }
+
+            auto components = std::tuple<detail::component_pointer_t<TransactionType, Components>...>{
+                fetch_grouped<Components>(planned, entity, dense_index, Indices)...};
+
+            if (all_present(components, std::index_sequence_for<Components...>{})) {
+                invoke(func, entity, components, std::index_sequence_for<Components...>{});
+            }
+        }
+    }
+
+    template <typename Func>
+    void iterate_group(Func& func, const PlannedView& planned) const {
+        iterate_group_impl(func, planned, std::index_sequence_for<Components...>{});
+    }
+
+    bool can_use_committed_counts() const {
+        return transaction_->has_stable_visibility() && !transaction_->has_pending_writes();
     }
 
     template <typename Component>
@@ -1004,14 +1355,20 @@ private:
         if constexpr (detail::is_singleton_component_v<Base>) {
             return transaction_->template try_get<Base>() == nullptr ? 0 : 1;
         } else {
-            const RawPagedSparseArray* storage = transaction_->raw_storage(component_id<Base>());
-            if (storage == nullptr) {
-                return 0;
+            if (can_use_committed_counts()) {
+                std::size_t count = 0;
+                if (const RawPagedSparseArray* storage = transaction_->raw_storage(component_id<Base>()); storage != nullptr) {
+                    count += storage->size();
+                }
+                if (const OwningGroupBase* owner = transaction_->owning_group(component_id<Base>()); owner != nullptr) {
+                    count += owner->entities().size();
+                }
+                return count;
             }
 
             std::size_t count = 0;
-            for (const Entity entity : storage->entities()) {
-                if (entity != null_entity && transaction_->template try_get<Base>(entity) != nullptr) {
+            for (const Entity entity : transaction_->entities()) {
+                if (transaction_->template try_get<Base>(entity) != nullptr) {
                     ++count;
                 }
             }
@@ -1019,53 +1376,246 @@ private:
         }
     }
 
+    std::size_t visible_rows_in_entities(const std::vector<Entity>& entities, ComponentId component) const {
+        std::size_t count = 0;
+        for (const Entity entity : entities) {
+            if (entity != null_entity && transaction_->try_get(entity, component) != nullptr) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::vector<Entity> component_source_entities(ComponentId component) const {
+        std::vector<Entity> entities;
+        if (const RawPagedSparseArray* storage = transaction_->raw_storage(component); storage != nullptr) {
+            entities.insert(entities.end(), storage->entities().begin(), storage->entities().end());
+        }
+        if (const OwningGroupBase* owner = transaction_->owning_group(component); owner != nullptr) {
+            const auto& grouped = owner->entities();
+            entities.insert(entities.end(), grouped.begin(), grouped.end());
+        }
+        normalize_entities(entities);
+        return entities;
+    }
+
+    SourceCandidate build_component_candidate(
+        std::size_t component_index,
+        ComponentId component,
+        std::string_view name,
+        std::size_t rows) const {
+
+        SourceCandidate candidate{};
+        candidate.anchor_index = component_index;
+        candidate.anchor_component = component;
+        candidate.anchor_name = name;
+        candidate.row_count = rows;
+
+        const RawPagedSparseArray* storage = transaction_->raw_storage(component);
+        const OwningGroupBase* owner = transaction_->owning_group(component);
+        const bool has_standalone = storage != nullptr && !storage->empty();
+        const bool has_group = owner != nullptr && !owner->entities().empty();
+
+        if (has_standalone && !has_group) {
+            candidate.entities = &storage->entities();
+            candidate.anchor_storage = storage;
+            candidate.anchor_uses_dense_iteration = true;
+            return candidate;
+        }
+        if (!has_standalone && has_group) {
+            candidate.entities = &owner->entities();
+            candidate.anchor_storage = owner->storage(component);
+            candidate.anchor_uses_dense_iteration = candidate.anchor_storage != nullptr;
+            return candidate;
+        }
+
+        candidate.materialized_entities = component_source_entities(component);
+        return candidate;
+    }
+
+    std::vector<SourceCandidate> build_group_candidates(std::size_t best_non_group_rows) const {
+        ECS_PROFILE_ZONE("TransactionView::build_group_candidates");
+        struct GroupRequest {
+            const OwningGroupBase* group = nullptr;
+            std::size_t covered_count = 0;
+        };
+
+        std::vector<GroupRequest> requested_groups;
+        requested_groups.reserve(sizeof...(Components));
+
+        for (const ComponentDescriptor& descriptor : component_descriptors()) {
+            const OwningGroupBase* group = transaction_->owning_group(descriptor.component);
+            if (group == nullptr || group->component_count() < 2 || transaction_->has_pending_for_group(group)) {
+                continue;
+            }
+
+            auto it = std::find_if(requested_groups.begin(), requested_groups.end(), [&](const GroupRequest& request) {
+                return request.group == group;
+            });
+            if (it == requested_groups.end()) {
+                requested_groups.push_back(GroupRequest{group, 1});
+            } else {
+                ++it->covered_count;
+            }
+        }
+
+        std::vector<SourceCandidate> candidates;
+        candidates.reserve(requested_groups.size());
+
+        for (const GroupRequest& request : requested_groups) {
+            if (request.covered_count < 2) {
+                continue;
+            }
+
+            SourceCandidate candidate{};
+            candidate.entities = &request.group->entities();
+            candidate.group = request.group;
+            candidate.row_count = can_use_committed_counts() ? candidate.entities->size() : 0;
+
+            for (const ComponentDescriptor& descriptor : component_descriptors()) {
+                const auto& component_infos = request.group->component_infos();
+                const auto info = std::find_if(component_infos.begin(), component_infos.end(), [&](const OwningGroupBase::ComponentInfo& entry) {
+                    return entry.component == descriptor.component;
+                });
+                if (info == component_infos.end()) {
+                    continue;
+                }
+
+                if (!can_use_committed_counts() && candidate.covered_component_indices.empty()) {
+                    candidate.row_count = visible_rows_in_entities(*candidate.entities, descriptor.component);
+                }
+
+                candidate.covered_component_indices.push_back(descriptor.component_index);
+                candidate.grouped_storages[descriptor.component_index] = info->storage;
+                if (candidate.covered_component_indices.size() == 1 || descriptor.component_index < candidate.anchor_index) {
+                    candidate.anchor_index = descriptor.component_index;
+                    candidate.anchor_component = descriptor.component;
+                    candidate.anchor_name = descriptor.component_name;
+                    candidate.anchor_storage = info->storage;
+                    candidate.anchor_uses_dense_iteration = candidate.anchor_storage != nullptr;
+                }
+            }
+
+            if (candidate.covered_component_indices.size() < 2 || candidate.row_count == 0) {
+                continue;
+            }
+            if (best_non_group_rows != std::numeric_limits<std::size_t>::max() &&
+                candidate.row_count > best_non_group_rows) {
+                continue;
+            }
+
+            candidates.push_back(std::move(candidate));
+        }
+        return candidates;
+    }
+
+    void apply_candidate(PlannedView& planned, const SourceCandidate& candidate) const {
+        if (candidate.entities != nullptr) {
+            planned.anchor_entities = candidate.entities;
+            planned.materialized_anchor_entities.clear();
+        } else {
+            planned.materialized_anchor_entities = candidate.materialized_entities;
+            planned.anchor_entities = &planned.materialized_anchor_entities;
+        }
+        planned.anchor_index = candidate.anchor_index;
+        planned.grouped_component_count = candidate.covered_component_indices.size();
+        planned.group = candidate.group;
+        planned.covered_component_indices = candidate.covered_component_indices;
+        planned.grouped_storages = candidate.grouped_storages;
+        planned.anchor_storage = candidate.anchor_storage;
+        planned.anchor_uses_dense_iteration = candidate.anchor_uses_dense_iteration;
+        planned.explain.anchor_component = candidate.anchor_component;
+        planned.explain.anchor_component_name = candidate.anchor_name;
+        planned.explain.anchor_component_index = candidate.anchor_index;
+        planned.explain.candidate_rows = candidate.row_count;
+    }
+
+    void append_candidate_explain(QueryExplain& explain,
+                                  const SourceCandidate& candidate,
+                                  bool chosen) const {
+        explain.candidates.push_back(QuerySourceCandidate{
+            candidate.group != nullptr ? QuerySourceKind::owning_group : QuerySourceKind::standalone_storage,
+            candidate.anchor_component,
+            candidate.anchor_index,
+            candidate.row_count,
+            candidate.covered_component_indices.size(),
+            chosen,
+            candidate.anchor_name,
+        });
+    }
+
+    static bool prefer_candidate(const SourceCandidate& candidate, const SourceCandidate* current) {
+        if (current == nullptr) {
+            return true;
+        }
+        if (candidate.row_count != current->row_count) {
+            return candidate.row_count < current->row_count;
+        }
+        if ((candidate.group != nullptr) != (current->group != nullptr)) {
+            return candidate.group != nullptr;
+        }
+        return candidate.anchor_index < current->anchor_index;
+    }
+
     template <std::size_t... Indices>
     PlannedView build_scan_plan_impl(std::index_sequence<Indices...>) const {
+        (void)sizeof...(Indices);
+        ECS_PROFILE_ZONE("TransactionView::build_scan_plan");
         PlannedView planned{};
         planned.explain.steps.reserve(sizeof...(Components));
+        planned.explain.candidates.reserve(sizeof...(Components));
 
-        bool initialized = false;
+        const SourceCandidate* chosen = nullptr;
         bool empty = false;
+        std::vector<SourceCandidate> component_candidates;
 
-        auto consider = [&](auto index_constant, auto component_constant) {
-            constexpr std::size_t index = decltype(index_constant)::value;
-            using Component = typename decltype(component_constant)::type;
-            using Base = detail::component_base_t<Component>;
-
-            const ComponentId component = component_id<Base>();
-            const std::size_t rows = visible_size<Component>();
-            const bool singleton = detail::is_singleton_component_v<Base>;
-            const RawPagedSparseArray* storage = singleton ? nullptr : transaction_->raw_storage(component);
-
+        for (const ComponentDescriptor& descriptor : component_descriptors()) {
+            const std::size_t index = descriptor.component_index;
+            const ComponentId component = descriptor.component;
+            const std::size_t rows = descriptor.visible_rows(*this);
             planned.explain.steps.push_back(QueryAccessStep{
                 component,
                 index,
                 rows,
-                singleton ? QueryAccessKind::singleton_read : QueryAccessKind::sparse_lookup,
+                descriptor.singleton ? QueryAccessKind::singleton_read : QueryAccessKind::sparse_lookup,
                 false,
-                detail::type_name<Base>(),
+                descriptor.component_name,
             });
 
-            if (!singleton && (storage == nullptr || rows == 0)) {
+            if (rows == 0) {
                 empty = true;
             }
 
-            if (!singleton && (!initialized || rows < planned.explain.candidate_rows)) {
-                initialized = true;
-                planned.anchor_storage = storage;
-                planned.anchor_index = index;
-                planned.explain.anchor_component = component;
-                planned.explain.anchor_component_name = detail::type_name<Base>();
-                planned.explain.anchor_component_index = index;
-                planned.explain.candidate_rows = rows;
+            if (!descriptor.singleton &&
+                (transaction_->raw_storage(component) != nullptr || transaction_->component_belongs_to_group(component))) {
+                component_candidates.push_back(build_component_candidate(
+                    index,
+                    component,
+                    descriptor.component_name,
+                    rows));
             }
-        };
+        }
 
-        (consider(std::integral_constant<std::size_t, Indices>{}, detail::type_tag<Components>{}), ...);
+        std::size_t best_non_group_rows = std::numeric_limits<std::size_t>::max();
+        for (const SourceCandidate& candidate : component_candidates) {
+            if (prefer_candidate(candidate, chosen)) {
+                chosen = &candidate;
+            }
+            if (candidate.group == nullptr && candidate.row_count < best_non_group_rows) {
+                best_non_group_rows = candidate.row_count;
+            }
+        }
 
-        if (empty || (detail::entity_component_count_v<detail::component_base_t<Components>...> != 0 &&
-                      (!initialized || planned.anchor_storage == nullptr))) {
-            planned.anchor_storage = nullptr;
+        std::vector<SourceCandidate> group_candidates = build_group_candidates(best_non_group_rows);
+        for (const SourceCandidate& candidate : group_candidates) {
+            if (prefer_candidate(candidate, chosen)) {
+                chosen = &candidate;
+            }
+        }
+
+        if (empty || (chosen == nullptr &&
+                      detail::entity_component_count_v<detail::component_base_t<Components>...> != 0)) {
+            planned.anchor_entities = nullptr;
             planned.explain.empty = true;
             planned.explain.anchor_component = null_component;
             planned.explain.anchor_component_name = {};
@@ -1075,13 +1625,41 @@ private:
             return planned;
         }
 
-        planned.explain.empty = false;
-        if constexpr (detail::entity_component_count_v<detail::component_base_t<Components>...> == 0) {
+        if (chosen == nullptr) {
+            planned.explain.empty = false;
             planned.explain.anchor_component = null_component;
             planned.explain.anchor_component_name = {};
             planned.explain.anchor_component_index = 0;
             planned.explain.candidate_rows = 1;
             planned.explain.estimated_entity_lookups = 0;
+            return planned;
+        }
+
+        for (const SourceCandidate& candidate : component_candidates) {
+            append_candidate_explain(planned.explain, candidate, &candidate == chosen);
+        }
+        for (const SourceCandidate& candidate : group_candidates) {
+            append_candidate_explain(planned.explain, candidate, &candidate == chosen);
+        }
+
+        apply_candidate(planned, *chosen);
+        planned.explain.empty = false;
+        if (chosen->group != nullptr) {
+            planned.explain.estimated_entity_lookups =
+                planned.explain.candidate_rows *
+                (detail::entity_component_count_v<detail::component_base_t<Components>...> - planned.grouped_component_count);
+            for (QueryAccessStep& step : planned.explain.steps) {
+                const bool covered = std::find(
+                    chosen->covered_component_indices.begin(),
+                    chosen->covered_component_indices.end(),
+                    step.component_index) != chosen->covered_component_indices.end();
+                if (!covered) {
+                    continue;
+                }
+                step.access = step.component_index == chosen->anchor_index
+                    ? QueryAccessKind::anchor_scan
+                    : QueryAccessKind::grouped_fetch;
+            }
         } else {
             planned.explain.estimated_entity_lookups =
                 planned.explain.candidate_rows *
@@ -1117,8 +1695,34 @@ private:
         text += "\n  Entity probes: " + std::to_string(plan.estimated_entity_lookups);
         text += "\n  Component value indexes: ";
         text += plan.uses_component_indexes ? "used" : "not used by view execution";
+        append_candidates(text, plan);
         append_steps(text, plan);
         return text;
+    }
+
+    static void append_candidates(std::string& text, const QueryExplain& plan) {
+        if (plan.candidates.empty()) {
+            return;
+        }
+
+        text += "\n  Source candidates:";
+        for (const QuerySourceCandidate& candidate : plan.candidates) {
+            text += "\n  - ";
+            if (candidate.source == QuerySourceKind::owning_group) {
+                text += "group";
+            } else if (candidate.source == QuerySourceKind::component_index) {
+                text += "index";
+            } else {
+                text += "storage";
+            }
+            text += " component[" + std::to_string(candidate.component_index) + "] ";
+            text += std::string(candidate.component_name);
+            text += ", rows=" + std::to_string(candidate.candidate_rows);
+            if (candidate.source == QuerySourceKind::owning_group) {
+                text += ", covers=" + std::to_string(candidate.grouped_component_count);
+            }
+            text += candidate.chosen ? " (chosen)" : " (not chosen)";
+        }
     }
 
     static void append_steps(std::string& text, const QueryExplain& plan) {
@@ -1130,6 +1734,10 @@ private:
                 text += "anchor scan";
             } else if (step.access == QueryAccessKind::index_seek) {
                 text += "index seek";
+            } else if (step.access == QueryAccessKind::singleton_read) {
+                text += "singleton read";
+            } else if (step.access == QueryAccessKind::grouped_fetch) {
+                text += "group row fetch";
             } else if (step.access == QueryAccessKind::singleton_read) {
                 text += "singleton read";
             } else {
@@ -1245,13 +1853,12 @@ public:
             return;
         }
 
-        if (planned.anchor_storage == nullptr) {
+        if (planned.anchor_entities == nullptr) {
             visit_entity(callback, null_entity);
             return;
         }
 
-        const auto& dense_entities = planned.anchor_storage->entities();
-        for (const Entity entity : dense_entities) {
+        for (const Entity entity : *planned.anchor_entities) {
             if (entity != null_entity) {
                 visit_entity(callback, entity);
             }
@@ -1262,7 +1869,8 @@ private:
     using expression_type = Expression;
 
     struct PlannedView {
-        const RawPagedSparseArray* anchor_storage = nullptr;
+        const std::vector<Entity>* anchor_entities = nullptr;
+        std::vector<Entity> materialized_anchor_entities;
         std::size_t anchor_index = 0;
         bool use_index = false;
         std::vector<Entity> candidates;
@@ -1307,14 +1915,9 @@ private:
         if constexpr (detail::is_singleton_component_v<Base>) {
             return transaction_->template try_get<Base>() == nullptr ? 0 : 1;
         } else {
-            const RawPagedSparseArray* storage = transaction_->raw_storage(component_id<Base>());
-            if (storage == nullptr) {
-                return 0;
-            }
-
             std::size_t count = 0;
-            for (const Entity entity : storage->entities()) {
-                if (entity != null_entity && transaction_->template try_get<Base>(entity) != nullptr) {
+            for (const Entity entity : transaction_->entities()) {
+                if (transaction_->template try_get<Base>(entity) != nullptr) {
                     ++count;
                 }
             }
@@ -1341,16 +1944,29 @@ private:
 
     PlannedView build_plan() const {
         PlannedView planned{};
-        planned.explain = TransactionView<TransactionType, Components...>(*transaction_).explain();
-        planned.anchor_storage = transaction_->raw_storage(planned.explain.anchor_component);
+        const auto base_plan = TransactionView<TransactionType, Components...>(*transaction_).build_scan_plan();
+        planned.explain = base_plan.explain;
+        if (base_plan.anchor_entities != nullptr) {
+            planned.materialized_anchor_entities = *base_plan.anchor_entities;
+            planned.anchor_entities = &planned.materialized_anchor_entities;
+        }
         planned.anchor_index = planned.explain.anchor_component_index;
 
         if (auto seed = build_seed_plan(expression_)) {
             if (seed->candidates.size() < planned.explain.candidate_rows) {
                 planned.use_index = true;
                 planned.candidates = std::move(seed->candidates);
-                planned.anchor_storage = nullptr;
+                planned.anchor_entities = nullptr;
                 planned.explain.uses_component_indexes = true;
+                planned.explain.candidates.push_back(QuerySourceCandidate{
+                    QuerySourceKind::component_index,
+                    null_component,
+                    seed->indexed_component_indices.front(),
+                    planned.candidates.size(),
+                    0,
+                    true,
+                    {},
+                });
                 mark_index_steps(planned.explain, seed->indexed_component_indices);
             }
         }
@@ -1427,6 +2043,13 @@ private:
         }
 
         explain.anchor_component_index = indices.front();
+        QuerySourceCandidate* index_candidate = nullptr;
+        for (QuerySourceCandidate& candidate : explain.candidates) {
+            if (candidate.source == QuerySourceKind::component_index && candidate.chosen) {
+                index_candidate = &candidate;
+                break;
+            }
+        }
         for (QueryAccessStep& step : explain.steps) {
             const bool indexed =
                 std::find(indices.begin(), indices.end(), step.component_index) != indices.end();
@@ -1434,6 +2057,10 @@ private:
                 if (step.component_index == explain.anchor_component_index) {
                     explain.anchor_component = step.component;
                     explain.anchor_component_name = step.component_name;
+                    if (index_candidate != nullptr) {
+                        index_candidate->component = step.component;
+                        index_candidate->component_name = step.component_name;
+                    }
                 }
                 step.access = QueryAccessKind::index_seek;
                 step.uses_component_index = true;

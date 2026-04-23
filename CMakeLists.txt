@@ -10,6 +10,7 @@ include(CTest)
 
 option(ECS_BUILD_EXAMPLE "Build the example executable" ON)
 option(ECS_BUILD_BENCHMARKS "Build Google Benchmark suites" OFF)
+option(ECS_BUILD_PROFILING "Build benchmark-friendly profiling instrumentation" OFF)
 
 file(GLOB_RECURSE ecs_public_headers CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
@@ -71,6 +72,15 @@ else()
     target_compile_options(ecs PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+if(ECS_BUILD_PROFILING)
+    target_compile_definitions(ecs PUBLIC ECS_ENABLE_PROFILING=1)
+    if(MSVC)
+        target_compile_options(ecs PRIVATE /Zi)
+    else()
+        target_compile_options(ecs PRIVATE -g -fno-omit-frame-pointer)
+    endif()
+endif()
+
 if(ECS_BUILD_EXAMPLE)
     add_executable(ecs_example
         examples/main.cpp
@@ -127,6 +137,28 @@ if(ECS_BUILD_BENCHMARKS)
     )
 
     FetchContent_MakeAvailable(google_benchmark)
+
+    if(ECS_BUILD_PROFILING)
+        FetchContent_Declare(
+            tracy
+            GIT_REPOSITORY https://github.com/wolfpld/tracy.git
+            GIT_TAG v0.11.1
+        )
+
+        FetchContent_MakeAvailable(tracy)
+
+        if(TARGET TracyClient)
+            target_link_libraries(ecs PRIVATE TracyClient)
+            target_compile_definitions(ecs PUBLIC TRACY_ENABLE=1)
+        else()
+            message(FATAL_ERROR "ECS_BUILD_PROFILING=ON requires TracyClient target from tracy")
+        endif()
+
+        if(NOT TARGET tracy-capture)
+            set(NO_FILESELECTOR ON CACHE BOOL "" FORCE)
+            add_subdirectory("${tracy_SOURCE_DIR}/capture" "${tracy_BINARY_DIR}/capture")
+        endif()
+    endif()
 
     add_subdirectory(benchmarks)
 endif()

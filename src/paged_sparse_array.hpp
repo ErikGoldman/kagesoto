@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "component_index.hpp"
+#include "profiler.hpp"
 #include "sparse_set.hpp"
 
 namespace ecs {
@@ -67,6 +68,9 @@ public:
         std::uint32_t item_count = 0;
         std::uint32_t overflow_index = npos32;
         std::array<RevisionRef, inline_revision_capacity> revisions{};
+        RevisionRef latest_committed{};
+        bool latest_committed_valid = false;
+        bool has_live_isolated = false;
     };
 
     struct RevisionOverflow {
@@ -204,8 +208,11 @@ public:
             return element_ptr(dense_index);
         }
 
-        const RevisionRef* committed = last_committed_ref(dense_index);
-        return committed == nullptr || committed->tombstone ? nullptr : revision_value_ptr(committed->value_index);
+        const RevisionInfo& header = revision_headers_[dense_index];
+        if (header.latest_committed_valid) {
+            return header.latest_committed.tombstone ? nullptr : revision_value_ptr(header.latest_committed.value_index);
+        }
+        return nullptr;
     }
 
     const void* get_raw(Entity entity) const {
@@ -221,6 +228,7 @@ public:
         Timestamp max_visible_tsn,
         const std::vector<Timestamp>& active_at_open,
         Timestamp own_tsn) const {
+        ECS_PROFILE_ZONE("RawPagedSparseArray::try_get_visible_raw");
 
         const std::size_t dense_index = dense_index_of(entity);
         if (dense_index == npos) {
@@ -229,6 +237,11 @@ public:
 
         if (is_direct_write_storage_mode(mode_)) {
             return element_ptr(dense_index);
+        }
+
+        const RevisionInfo& header = revision_headers_[dense_index];
+        if (latest_committed_visible(header, max_visible_tsn, active_at_open)) {
+            return header.latest_committed.tombstone ? nullptr : revision_value_ptr(header.latest_committed.value_index);
         }
 
         const VisibleRef visible = visible_ref(dense_index, max_visible_tsn, active_at_open, own_tsn);
@@ -306,6 +319,58 @@ public:
         return index < dense_entities_.size() && dense_entities_[index] != null_entity ? element_ptr(index) : nullptr;
     }
 
+    void reserve_rows(std::size_t rows) {
+        if (rows == 0) {
+            return;
+        }
+
+        ensure_dense_capacity(rows);
+        dense_entities_.reserve(rows);
+        revision_headers_.reserve(rows);
+        free_rows_.reserve(rows);
+        ensure_preallocated_trace_frame_capacity();
+    }
+
+    void reserve_revision_values(std::size_t additional_values) {
+        if (additional_values == 0 || is_direct_write_storage_mode(mode_)) {
+            return;
+        }
+
+        revision_values_.reserve(revision_values_.size() + (additional_values * component_size_));
+    }
+
+    void reserve_revision_overflow_nodes(std::size_t additional_nodes) {
+        if (additional_nodes == 0 || is_direct_write_storage_mode(mode_)) {
+            return;
+        }
+
+        revision_overflow_.reserve(revision_overflow_.size() + additional_nodes);
+    }
+
+    const void* try_get_visible_dense_raw(
+        std::size_t dense_index,
+        Timestamp max_visible_tsn,
+        const std::vector<Timestamp>& active_at_open,
+        Timestamp own_tsn) const {
+        ECS_PROFILE_ZONE("RawPagedSparseArray::try_get_visible_dense_raw");
+
+        if (dense_index >= dense_entities_.size() || dense_entities_[dense_index] == null_entity) {
+            return nullptr;
+        }
+
+        if (is_direct_write_storage_mode(mode_)) {
+            return element_ptr(dense_index);
+        }
+
+        const RevisionInfo& header = revision_headers_[dense_index];
+        if (latest_committed_visible(header, max_visible_tsn, active_at_open)) {
+            return header.latest_committed.tombstone ? nullptr : revision_value_ptr(header.latest_committed.value_index);
+        }
+
+        const VisibleRef visible = visible_ref(dense_index, max_visible_tsn, active_at_open, own_tsn);
+        return !visible.found || visible.tombstone ? nullptr : revision_value_ptr(visible.ref->value_index);
+    }
+
     PendingWrite stage_write(Entity entity,
                              Timestamp tsn,
                              const void* initial_value,
@@ -371,8 +436,34 @@ public:
         Timestamp max_visible_tsn,
         const std::vector<Timestamp>& active_at_open,
         Timestamp own_tsn) const {
+        ECS_PROFILE_ZONE("RawPagedSparseArray::visible_ref");
 
         VisibleRef result{};
+        if (active_at_open.empty()) {
+            for_each_ref(dense_index, [&](const RevisionRef& ref) {
+                if (ref.voided) {
+                    return false;
+                }
+
+                if (ref.isolated) {
+                    if (own_tsn != 0 && ref.tsn == own_tsn) {
+                        result.ref = &ref;
+                        result.found = true;
+                        result.tombstone = ref.tombstone;
+                    }
+                    return false;
+                }
+
+                if (ref.tsn <= max_visible_tsn) {
+                    result.ref = &ref;
+                    result.found = true;
+                    result.tombstone = ref.tombstone;
+                }
+                return false;
+            });
+            return result;
+        }
+
         for_each_ref(dense_index, [&](const RevisionRef& ref) {
             if (ref.voided) {
                 return false;
@@ -716,6 +807,16 @@ private:
         return false;
     }
 
+    static bool latest_committed_visible(
+        const RevisionInfo& header,
+        Timestamp max_visible_tsn,
+        const std::vector<Timestamp>& active_at_open) {
+        return header.latest_committed_valid &&
+               !header.has_live_isolated &&
+               header.latest_committed.tsn <= max_visible_tsn &&
+               (active_at_open.empty() || !contains_tsn(active_at_open, header.latest_committed.tsn));
+    }
+
     template <typename Func>
     void for_each_ref(std::size_t dense_index, Func&& func) const {
         const RevisionInfo& header = revision_headers_[dense_index];
@@ -810,6 +911,14 @@ private:
     void append_ref(std::size_t dense_index, const RevisionRef& ref) {
         RevisionInfo& header = revision_headers_[dense_index];
         append_ref_to(header, revision_overflow_, ref);
+        if (!ref.voided) {
+            if (ref.isolated) {
+                header.has_live_isolated = true;
+            } else {
+                header.latest_committed = ref;
+                header.latest_committed_valid = true;
+            }
+        }
     }
 
     static void append_ref_to(
@@ -887,12 +996,29 @@ private:
 
     void recompute_dense_head(Entity entity, std::size_t dense_index) {
         const RevisionRef* newest_non_void = nullptr;
+        const RevisionRef* newest_committed = nullptr;
+        bool has_live_isolated = false;
         for_each_ref(dense_index, [&](const RevisionRef& ref) {
             if (!ref.voided) {
                 newest_non_void = &ref;
+                if (ref.isolated) {
+                    has_live_isolated = true;
+                } else {
+                    newest_committed = &ref;
+                }
             }
             return false;
         });
+
+        RevisionInfo& header = revision_headers_[dense_index];
+        header.has_live_isolated = has_live_isolated;
+        if (newest_committed != nullptr) {
+            header.latest_committed = *newest_committed;
+            header.latest_committed_valid = true;
+        } else {
+            header.latest_committed = RevisionRef{};
+            header.latest_committed_valid = false;
+        }
 
         if (newest_non_void == nullptr) {
             clear_row(dense_index);
@@ -1131,6 +1257,18 @@ public:
     PendingWrite stage_value(Entity entity, Timestamp tsn, const T& value) {
         constexpr bool preserve_previous_value = std::tuple_size_v<typename ComponentIndices<T>::type> != 0;
         return RawPagedSparseArray::stage_write(entity, tsn, &value, true, preserve_previous_value);
+    }
+
+    void reserve_rows(std::size_t rows) {
+        RawPagedSparseArray::reserve_rows(rows);
+    }
+
+    void reserve_revision_values(std::size_t additional_values) {
+        RawPagedSparseArray::reserve_revision_values(additional_values);
+    }
+
+    void reserve_revision_overflow_nodes(std::size_t additional_nodes) {
+        RawPagedSparseArray::reserve_revision_overflow_nodes(additional_nodes);
     }
 
     T* staged_ptr(const PendingWrite& pending, Timestamp tsn) {

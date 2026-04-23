@@ -385,6 +385,32 @@ Run the executables directly or emit Google Benchmark JSON:
 ./build/bench/ecs_benchmark_trace --benchmark_out=trace.json --benchmark_out_format=json
 ```
 
+Scripted workflow:
+
+```bash
+# Build and run the default extended benchmark target.
+bash benchmark.sh
+
+# Run grouped vs ungrouped comparison benchmarks and write artifacts under artifacts/bench/<timestamp>.
+bash scripts/bench/compare.sh --min-time 0.25s
+
+# Build Tracy-enabled benchmarks and profile the default grouped hot case.
+bash scripts/bench/profile.sh --min-time 0.5s
+
+# Save a Tracy capture automatically using the bundled `tracy-capture` build,
+# or an external TracyCapture / tracy-capture binary if provided explicitly.
+TRACY_CAPTURE_TOOL=/path/to/TracyCapture bash scripts/bench/profile.sh
+```
+
+The script suite is Linux/WSL-oriented:
+
+- `scripts/bench/build.sh`: configure and build benchmark targets
+- `scripts/bench/run.sh`: run a benchmark target with JSON/log output
+- `scripts/bench/compare.sh`: run the grouped comparison benchmark family
+- `scripts/bench/profile.sh`: build with Tracy instrumentation and run a profiling-oriented benchmark set
+
+Profiling builds add Tracy zones to view planning, grouped iteration, and MVCC visibility paths. By default `profile.sh` focuses on `BM_CompareIterateTwoComponentsGrouped/(16384|32768)` so the trace is short and centered on the grouped hot path. Profiling configuration now also builds Tracy's bundled `tracy-capture` CLI alongside the selected benchmark target. The script writes benchmark JSON/log artifacts and a small note describing the Tracy capture step. If `TracyCapture` or `tracy-capture` is on `PATH`, or `TRACY_CAPTURE_TOOL` / `--capture-tool` is provided, the script will also save a `.tracy` capture file automatically.
+
 Suite mapping:
 
 - `ecs_benchmark_entities`: entity creation, destruction, component unpack, and remove/add benchmarks

@@ -7,12 +7,14 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include <benchmark/benchmark.h>
 
 #include "ecs/ecs.hpp"
+#include "../src/profiler.hpp"
 
 namespace ecs::benchmarks {
 
@@ -178,6 +180,43 @@ void write_component(ecs::Registry& registry, ecs::Entity entity, Args&&... args
     auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, PlayerComponent, HealthComponent, DamageComponent, SpriteComponent>();
     tx.write<Component>(entity, std::forward<Args>(args)...);
     tx.commit();
+}
+
+template <typename T>
+void observe_component(const T& value) {
+    using MutableT = std::remove_const_t<T>;
+    benchmark::DoNotOptimize(const_cast<MutableT&>(value));
+}
+
+template <typename Component, typename Transaction>
+void reserve_component_storage(Transaction& tx,
+                               std::size_t row_capacity,
+                               std::size_t additional_revision_values,
+                               std::size_t additional_overflow_nodes) {
+    if (const auto* storage = tx.template typed_raw_storage<Component>()) {
+        auto* writable_storage = const_cast<ecs::ComponentStorage<Component>*>(storage);
+        writable_storage->reserve_rows(row_capacity);
+        writable_storage->reserve_revision_values(additional_revision_values);
+        writable_storage->reserve_revision_overflow_nodes(additional_overflow_nodes);
+    }
+}
+
+inline void reserve_system_update_storage(ecs::Registry& registry) {
+    auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, PlayerComponent, HealthComponent, DamageComponent, SpriteComponent>();
+
+    const std::size_t position_rows = tx.template visible_component_size<PositionComponent>();
+    const std::size_t velocity_rows = tx.template visible_component_size<VelocityComponent>();
+    const std::size_t data_rows = tx.template visible_component_size<DataComponent>();
+    const std::size_t health_rows = tx.template visible_component_size<HealthComponent>();
+    const std::size_t damage_rows = tx.template visible_component_size<DamageComponent>();
+    const std::size_t sprite_rows = tx.template visible_component_size<SpriteComponent>();
+
+    reserve_component_storage<PositionComponent>(tx, position_rows, position_rows, position_rows);
+    reserve_component_storage<VelocityComponent>(tx, velocity_rows, data_rows, data_rows);
+    reserve_component_storage<DataComponent>(tx, data_rows, data_rows * 2, data_rows * 2);
+    reserve_component_storage<HealthComponent>(tx, health_rows, health_rows * 2, health_rows * 2);
+    reserve_component_storage<DamageComponent>(tx, damage_rows, 0, 0);
+    reserve_component_storage<SpriteComponent>(tx, sprite_rows, sprite_rows, sprite_rows);
 }
 
 class EntityFactory {
@@ -414,6 +453,7 @@ public:
     void update(ecs::Registry& registry, float dt) override {
         auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, PlayerComponent, HealthComponent, DamageComponent, SpriteComponent>();
         auto positions = try_storage<PositionComponent>(tx);
+        tx.reserve_pending_writes(positions.size());
         positions.each([&tx, dt](ecs::Entity entity, const PositionComponent&) {
             const VelocityComponent* velocity = tx.try_get<VelocityComponent>(entity);
             if (velocity != nullptr) {
@@ -437,6 +477,7 @@ public:
     void update(ecs::Registry& registry, float dt) override {
         auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, PlayerComponent, HealthComponent, DamageComponent, SpriteComponent>();
         auto data = try_storage<DataComponent>(tx);
+        tx.reserve_pending_writes(data.size());
         data.each([&tx, dt](ecs::Entity entity, const DataComponent&) {
             DataComponent* value = tx.write<DataComponent>(entity);
             update_data(*value, dt);
@@ -464,6 +505,7 @@ public:
     void update(ecs::Registry& registry, float) override {
         auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, PlayerComponent, HealthComponent, DamageComponent, SpriteComponent>();
         auto data = try_storage<DataComponent>(tx);
+        tx.reserve_pending_writes(data.size() * 2);
         data.each([&tx](ecs::Entity entity, const DataComponent&) {
             const PositionComponent* position = tx.try_get<PositionComponent>(entity);
             if (position != nullptr && tx.try_get<VelocityComponent>(entity) != nullptr) {
@@ -496,6 +538,7 @@ public:
     void update(ecs::Registry& registry, float) override {
         auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, PlayerComponent, HealthComponent, DamageComponent, SpriteComponent>();
         auto health = try_storage<HealthComponent>(tx);
+        tx.reserve_pending_writes(health.size());
         health.each([&tx](ecs::Entity entity, const HealthComponent&) {
             HealthComponent* value = tx.write<HealthComponent>(entity);
             update_health(*value);
@@ -516,6 +559,7 @@ public:
     void update(ecs::Registry& registry, float) override {
         auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, PlayerComponent, HealthComponent, DamageComponent, SpriteComponent>();
         auto health = try_storage<HealthComponent>(tx);
+        tx.reserve_pending_writes(health.size());
         health.each([&tx](ecs::Entity entity, const HealthComponent&) {
             const DamageComponent* damage = tx.try_get<DamageComponent>(entity);
             if (damage != nullptr) {
@@ -566,6 +610,7 @@ public:
     void update(ecs::Registry& registry, float) override {
         auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, PlayerComponent, HealthComponent, DamageComponent, SpriteComponent>();
         auto sprites = try_storage<SpriteComponent>(tx);
+        tx.reserve_pending_writes(sprites.size());
         sprites.each([&tx](ecs::Entity entity, const SpriteComponent&) {
             const PlayerComponent* player = tx.try_get<PlayerComponent>(entity);
             const HealthComponent* health = tx.try_get<HealthComponent>(entity);
@@ -669,6 +714,15 @@ public:
         state.counters["monster_count"] = static_cast<double>(counts.monster_count);
     }
 
+    void set_iteration_layout_counters(benchmark::State& state,
+                                       bool grouped_layout,
+                                       std::size_t grouped_component_count,
+                                       bool sparse_health) const {
+        state.counters["layout_grouped"] = grouped_layout ? 1.0 : 0.0;
+        state.counters["grouped_components"] = static_cast<double>(grouped_component_count);
+        state.counters["sparse_health"] = sparse_health ? 1.0 : 0.0;
+    }
+
     ComponentsCounter create_no_entities(Registry&, std::vector<Entity>& out) const {
         out.clear();
         return {};
@@ -768,6 +822,19 @@ public:
             }
         }
 
+        return counts;
+    }
+
+    ComponentsCounter create_entities_with_group_and_sparse_health(Registry& registry,
+                                                                   std::size_t count,
+                                                                   std::vector<Entity>& out) const {
+        ComponentsCounter counts = create_entities_with_minimal_components(registry, count, out);
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            if ((i % 8u) == 0u) {
+                write_component<HealthComponent>(registry, out[i], HealthComponent{100, 100, StatusEffect::Alive});
+                ++counts.hero_count;
+            }
+        }
         return counts;
     }
 
@@ -1022,6 +1089,7 @@ public:
         const ComponentsCounter hero_monster_counts = attach_mixed_hero_monster_components(application, entities);
         counts.hero_count = hero_monster_counts.hero_count;
         counts.monster_count = hero_monster_counts.monster_count;
+        reserve_system_update_storage(registry);
 
         for (auto _ : state) {
             application.update(kFakeTimeDelta);
@@ -1041,7 +1109,7 @@ public:
             auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, PlayerComponent, HealthComponent, DamageComponent, SpriteComponent>();
             auto positions = try_storage<PositionComponent>(tx);
             positions.each([](Entity, const PositionComponent& component) {
-                benchmark::DoNotOptimize(component);
+                observe_component(component);
             });
         }
 
@@ -1060,13 +1128,59 @@ public:
             positions.each([&tx](Entity entity, const PositionComponent& position) {
                 const VelocityComponent* velocity = tx.try_get<VelocityComponent>(entity);
                 if (velocity != nullptr) {
-                    benchmark::DoNotOptimize(position);
-                    benchmark::DoNotOptimize(*velocity);
+                    observe_component(position);
+                    observe_component(*velocity);
                 }
             });
         }
 
         set_counters(state, entities, counts);
+        set_iteration_layout_counters(state, false, 0, false);
+    }
+
+    void benchmark_iterate_two_components_grouped(benchmark::State& state) const {
+        ECS_PROFILE_ZONE("benchmark_iterate_two_components_grouped");
+        const std::size_t entity_count = static_cast<std::size_t>(state.range(0));
+        Registry registry;
+        std::vector<Entity> entities;
+        const ComponentsCounter counts = create_entities_with_minimal_components(registry, entity_count, entities);
+        registry.group<PositionComponent, VelocityComponent>();
+
+        for (auto _ : state) {
+            ECS_PROFILE_FRAME("ecs_benchmarks");
+            auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, PlayerComponent, HealthComponent, DamageComponent, SpriteComponent>();
+            tx.view<const PositionComponent, const VelocityComponent>().forEach([](Entity, const PositionComponent& position, const VelocityComponent& velocity) {
+                observe_component(position);
+                observe_component(velocity);
+            });
+        }
+
+        set_counters(state, entities, counts);
+        set_iteration_layout_counters(state, true, 2, false);
+    }
+
+    void benchmark_compare_iterate_two_components_standalone(benchmark::State& state) const {
+        ECS_PROFILE_ZONE("benchmark_compare_iterate_two_components_standalone");
+        const std::size_t entity_count = static_cast<std::size_t>(state.range(0));
+        Registry registry;
+        std::vector<Entity> entities;
+        const ComponentsCounter counts = create_entities_with_minimal_components(registry, entity_count, entities);
+
+        for (auto _ : state) {
+            ECS_PROFILE_FRAME("ecs_benchmarks");
+            auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, PlayerComponent, HealthComponent, DamageComponent, SpriteComponent>();
+            tx.view<const PositionComponent, const VelocityComponent>().forEach([](Entity, const PositionComponent& position, const VelocityComponent& velocity) {
+                observe_component(position);
+                observe_component(velocity);
+            });
+        }
+
+        set_counters(state, entities, counts);
+        set_iteration_layout_counters(state, false, 0, false);
+    }
+
+    void benchmark_compare_iterate_two_components_grouped(benchmark::State& state) const {
+        benchmark_iterate_two_components_grouped(state);
     }
 
     void benchmark_iterate_three_components_with_mixed_entities(benchmark::State& state) const {
@@ -1082,14 +1196,68 @@ public:
                 const PositionComponent* position = tx.try_get<PositionComponent>(entity);
                 const VelocityComponent* velocity = tx.try_get<VelocityComponent>(entity);
                 if (position != nullptr && velocity != nullptr) {
-                    benchmark::DoNotOptimize(*position);
-                    benchmark::DoNotOptimize(*velocity);
-                    benchmark::DoNotOptimize(value);
+                    observe_component(*position);
+                    observe_component(*velocity);
+                    observe_component(value);
                 }
             });
         }
 
         set_counters(state, entities, counts);
+        set_iteration_layout_counters(state, false, 0, false);
+    }
+
+    void benchmark_iterate_three_components_with_sparse_health(benchmark::State& state) const {
+        ECS_PROFILE_ZONE("benchmark_iterate_three_components_with_sparse_health");
+        const std::size_t entity_count = static_cast<std::size_t>(state.range(0));
+        Registry registry;
+        std::vector<Entity> entities;
+        const ComponentsCounter counts = create_entities_with_group_and_sparse_health(registry, entity_count, entities);
+
+        for (auto _ : state) {
+            ECS_PROFILE_FRAME("ecs_benchmarks");
+            auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, PlayerComponent, HealthComponent, DamageComponent, SpriteComponent>();
+            tx.view<const PositionComponent, const VelocityComponent, const HealthComponent>().forEach(
+                [](Entity, const PositionComponent& position, const VelocityComponent& velocity, const HealthComponent& health) {
+                    observe_component(position);
+                    observe_component(velocity);
+                    observe_component(health);
+                });
+        }
+
+        set_counters(state, entities, counts);
+        set_iteration_layout_counters(state, false, 0, true);
+    }
+
+    void benchmark_iterate_three_components_grouped_with_sparse_health(benchmark::State& state) const {
+        ECS_PROFILE_ZONE("benchmark_iterate_three_components_grouped_with_sparse_health");
+        const std::size_t entity_count = static_cast<std::size_t>(state.range(0));
+        Registry registry;
+        std::vector<Entity> entities;
+        const ComponentsCounter counts = create_entities_with_group_and_sparse_health(registry, entity_count, entities);
+        registry.group<PositionComponent, VelocityComponent>();
+
+        for (auto _ : state) {
+            ECS_PROFILE_FRAME("ecs_benchmarks");
+            auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, PlayerComponent, HealthComponent, DamageComponent, SpriteComponent>();
+            tx.view<const PositionComponent, const VelocityComponent, const HealthComponent>().forEach(
+                [](Entity, const PositionComponent& position, const VelocityComponent& velocity, const HealthComponent& health) {
+                    observe_component(position);
+                    observe_component(velocity);
+                    observe_component(health);
+                });
+        }
+
+        set_counters(state, entities, counts);
+        set_iteration_layout_counters(state, true, 2, true);
+    }
+
+    void benchmark_compare_iterate_three_components_sparse_health_standalone(benchmark::State& state) const {
+        benchmark_iterate_three_components_with_sparse_health(state);
+    }
+
+    void benchmark_compare_iterate_three_components_sparse_health_grouped(benchmark::State& state) const {
+        benchmark_iterate_three_components_grouped_with_sparse_health(state);
     }
 
 private:

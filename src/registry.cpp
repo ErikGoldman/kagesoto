@@ -75,7 +75,14 @@ bool Registry::destroy(Entity entity) {
     alive_entities_.pop_back();
     entity_dense_indices_[index] = npos;
 
+    std::vector<OwningGroupBase*> erased_groups;
     for (auto& slot : components_) {
+        if (slot.owner != nullptr &&
+            std::find(erased_groups.begin(), erased_groups.end(), slot.owner) == erased_groups.end()) {
+            if (slot.owner->erase_entity(*this, entity, trace_commit_context_)) {
+                erased_groups.push_back(slot.owner);
+            }
+        }
         if (slot.storage != nullptr && !slot.singleton) {
             slot.storage->erase(entity, trace_commit_context_);
         }
@@ -92,7 +99,9 @@ void Registry::clear() {
     for (auto& slot : components_) {
         delete slot.storage;
         slot.storage = nullptr;
+        slot.owner = nullptr;
     }
+    groups_.clear();
 
     current_versions_.clear();
     entity_dense_indices_.clear();
@@ -136,6 +145,18 @@ const void* Registry::try_get(Entity entity, ComponentId component) const {
     }
 
     if (components_[component].singleton) {
+        return try_get_singleton(component);
+    }
+
+    if (const OwningGroupBase* owner = components_[component].owner; owner != nullptr && owner->contains(entity)) {
+        return owner->try_get(component, entity);
+    }
+
+    return try_get_standalone(entity, component);
+}
+
+const void* Registry::try_get_standalone(Entity entity, ComponentId component) const {
+    if (!alive(entity) || component >= components_.size()) {
         return nullptr;
     }
 
@@ -159,6 +180,10 @@ bool Registry::remove(Entity entity, ComponentId component) {
         return false;
     }
 
+    if (OwningGroupBase* owner = components_[component].owner; owner != nullptr && owner->contains(entity)) {
+        return owner->remove_component(*this, entity, component, trace_commit_context_);
+    }
+
     RawPagedSparseArray* slot = components_[component].storage;
     return slot != nullptr && slot->erase(entity, trace_commit_context_);
 }
@@ -175,6 +200,38 @@ const RawPagedSparseArray* Registry::storage(ComponentId component) const {
         return nullptr;
     }
     return components_[component].storage;
+}
+
+RawPagedSparseArray* Registry::storage_for_entity(Entity entity, ComponentId component) {
+    if (component >= components_.size()) {
+        return nullptr;
+    }
+    if (OwningGroupBase* owner = components_[component].owner; owner != nullptr && owner->contains(entity)) {
+        return owner->storage(component);
+    }
+    return components_[component].storage;
+}
+
+const RawPagedSparseArray* Registry::storage_for_entity(Entity entity, ComponentId component) const {
+    if (component >= components_.size()) {
+        return nullptr;
+    }
+    if (const OwningGroupBase* owner = components_[component].owner; owner != nullptr && owner->contains(entity)) {
+        return owner->storage(component);
+    }
+    return components_[component].storage;
+}
+
+bool Registry::component_belongs_to_group(ComponentId component) const {
+    return component < components_.size() && components_[component].owner != nullptr;
+}
+
+void Registry::refresh_groups_for_entities(const std::vector<Entity>& entities) {
+    for (const Entity entity : entities) {
+        for (const auto& group : groups_) {
+            (void)group->promote_if_complete(*this, entity);
+        }
+    }
 }
 
 RawPagedSparseArray& Registry::assure_storage(
@@ -253,23 +310,38 @@ void Registry::recompute_classic_mode_flag() {
 
 void Registry::compact_trace_history() {
     for (ComponentSlot& slot : components_) {
-        if (slot.storage == nullptr || !is_trace_storage_mode(slot.mode)) {
+        if (!is_trace_storage_mode(slot.mode)) {
             continue;
         }
+
+        RawPagedSparseArray* target = slot.storage;
+        if (slot.owner != nullptr) {
+            target = slot.owner->storage(&slot - components_.data());
+        }
+        if (target == nullptr) {
+            continue;
+        }
+
         if (slot.mode == ComponentStorageMode::trace_ondemand) {
-            slot.storage->compact_trace_history(trace_commit_context_.timestamp, trace_max_history_);
+            target->compact_trace_history(trace_commit_context_.timestamp, trace_max_history_);
         } else {
-            slot.storage->compact_preallocated_trace_history(trace_commit_context_.timestamp, trace_max_history_);
+            target->compact_preallocated_trace_history(trace_commit_context_.timestamp, trace_max_history_);
         }
     }
 }
 
 void Registry::capture_preallocated_trace_frames() {
     for (ComponentSlot& slot : components_) {
-        if (slot.storage == nullptr || slot.mode != ComponentStorageMode::trace_preallocate) {
+        if (slot.mode != ComponentStorageMode::trace_preallocate) {
             continue;
         }
-        slot.storage->capture_preallocated_trace_frame(trace_commit_context_.timestamp);
+        RawPagedSparseArray* target = slot.storage;
+        if (slot.owner != nullptr) {
+            target = slot.owner->storage(&slot - components_.data());
+        }
+        if (target != nullptr) {
+            target->capture_preallocated_trace_frame(trace_commit_context_.timestamp);
+        }
     }
 }
 
