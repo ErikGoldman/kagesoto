@@ -30,6 +30,11 @@ struct ComponentStorageModeTraits {
 };
 
 template <typename T>
+struct ComponentSingletonTraits {
+    static constexpr bool value = false;
+};
+
+template <typename T>
 struct ComponentIdTraits {
     static ComponentId value() {
         static const ComponentId id = detail::next_component_id();
@@ -41,6 +46,18 @@ template <typename T>
 ComponentId component_id() {
     return ComponentIdTraits<T>::value();
 }
+
+namespace detail {
+
+inline constexpr Entity singleton_entity = make_entity(0, entity_version_mask);
+
+template <typename T>
+inline constexpr bool is_singleton_component_v = ComponentSingletonTraits<component_base_t<T>>::value;
+
+template <typename T>
+inline constexpr bool is_entity_component_v = !is_singleton_component_v<T>;
+
+}  // namespace detail
 
 class Registry;
 class Snapshot;
@@ -76,8 +93,12 @@ public:
         if (slot.storage != nullptr && slot.mode != mode) {
             throw std::logic_error("cannot change component storage mode after storage has been created");
         }
+        if (slot.storage != nullptr && slot.singleton != detail::is_singleton_component_v<T>) {
+            throw std::logic_error("cannot change component storage kind after storage has been created");
+        }
         slot.mode = mode;
         slot.mode_configured = true;
+        slot.singleton = detail::is_singleton_component_v<T>;
         recompute_classic_mode_flag();
     }
 
@@ -120,20 +141,28 @@ public:
     }
 
     template <typename T>
-    bool remove(Entity entity) {
+    std::enable_if_t<!detail::is_singleton_component_v<T>, bool> remove(Entity entity) {
         return remove(entity, component_id<T>());
     }
 
     template <typename T, typename Func>
-    void each_trace_change(Entity entity, Func&& func) const {
+    std::enable_if_t<!detail::is_singleton_component_v<T>, void> each_trace_change(Entity entity, Func&& func) const {
         const ComponentId id = component_id<T>();
         if (const auto* raw = static_cast<const ComponentStorage<T>*>(storage(id))) {
             raw->for_each_trace_change(entity, std::forward<Func>(func));
         }
     }
 
+    template <typename T, typename Func>
+    std::enable_if_t<detail::is_singleton_component_v<T>, void> each_trace_change(Func&& func) const {
+        const ComponentId id = component_id<T>();
+        if (const auto* raw = static_cast<const ComponentStorage<T>*>(storage(id))) {
+            raw->for_each_trace_change(detail::singleton_entity, std::forward<Func>(func));
+        }
+    }
+
     template <typename T>
-    bool rollback_to_timestamp(Entity entity, Timestamp timestamp) {
+    std::enable_if_t<!detail::is_singleton_component_v<T>, bool> rollback_to_timestamp(Entity entity, Timestamp timestamp) {
         require_no_readers();
         const ComponentId id = component_id<T>();
         if (!is_trace_storage_mode(storage_mode<T>())) {
@@ -144,6 +173,17 @@ public:
         }
         return static_cast<ComponentStorage<T>*>(components_[id].storage)
             ->rollback_to_trace_timestamp(entity, timestamp, trace_commit_context_);
+    }
+
+    template <typename T>
+    std::enable_if_t<detail::is_singleton_component_v<T>, bool> rollback_to_timestamp(Timestamp timestamp) {
+        require_no_readers();
+        const ComponentId id = component_id<T>();
+        if (!is_trace_storage_mode(storage_mode<T>())) {
+            throw std::logic_error("trace rollback requires trace component storage mode");
+        }
+        auto& raw = assure_singleton_storage<T>();
+        return raw.rollback_to_trace_timestamp(detail::singleton_entity, timestamp, trace_commit_context_);
     }
 
     Snapshot snapshot();
@@ -158,6 +198,7 @@ private:
         RawPagedSparseArray* storage = nullptr;
         ComponentStorageMode mode = ComponentStorageMode::mvcc;
         bool mode_configured = false;
+        bool singleton = false;
     };
 
     struct ClassicAccessRegistration {
@@ -172,6 +213,7 @@ private:
 
     bool has(Entity entity, ComponentId component) const;
     const void* try_get(Entity entity, ComponentId component) const;
+    const void* try_get_singleton(ComponentId component) const;
     RawPagedSparseArray* storage(ComponentId component);
     const RawPagedSparseArray* storage(ComponentId component) const;
     void require_no_readers() const;
@@ -244,6 +286,7 @@ private:
 
     template <typename T>
     ComponentStorage<T>& assure_storage() {
+        static_assert(!detail::is_singleton_component_v<T>, "singleton components use no-entity singleton storage");
         const ComponentId id = component_id<T>();
         ensure_component_slot(id);
 
@@ -251,6 +294,7 @@ private:
         if (!slot.mode_configured) {
             slot.mode = ComponentStorageModeTraits<T>::value;
             slot.mode_configured = true;
+            slot.singleton = false;
             recompute_classic_mode_flag();
         }
 
@@ -262,6 +306,47 @@ private:
         if (component == nullptr) {
             component = new ComponentStorage<T>(slot.mode, page_size_, trace_max_history_);
             slot.storage = component;
+        }
+
+        return *static_cast<ComponentStorage<T>*>(component);
+    }
+
+    template <typename T>
+    ComponentStorage<T>& assure_singleton_storage() {
+        static_assert(detail::is_singleton_component_v<T>, "non-singleton components use entity storage");
+        static_assert(std::is_trivially_copyable_v<T>, "Registry components must be trivially copyable");
+        static_assert(std::is_default_constructible_v<T>, "singleton components must be default constructible");
+        static_assert(std::tuple_size_v<typename ComponentIndices<T>::type> == 0,
+                      "singleton components cannot declare component indexes");
+
+        const ComponentId id = component_id<T>();
+        ensure_component_slot(id);
+
+        ComponentSlot& slot = components_[id];
+        if (!slot.mode_configured) {
+            slot.mode = ComponentStorageModeTraits<T>::value;
+            slot.mode_configured = true;
+            slot.singleton = true;
+            recompute_classic_mode_flag();
+        }
+
+        if (!slot.singleton) {
+            throw std::logic_error("component storage was already created as entity storage");
+        }
+
+        if (slot.mode == ComponentStorageMode::trace_preallocate && !trace_max_history_configured_) {
+            throw std::logic_error("trace_preallocate storage requires set_trace_max_history before storage creation");
+        }
+
+        RawPagedSparseArray* component = slot.storage;
+        if (component == nullptr) {
+            component = new ComponentStorage<T>(slot.mode, page_size_, trace_max_history_);
+            slot.storage = component;
+
+            auto& typed = *static_cast<ComponentStorage<T>*>(component);
+            T value{};
+            auto pending = typed.stage_value(detail::singleton_entity, 0, value);
+            typed.commit_staged(detail::singleton_entity, pending, 0, trace_commit_context_);
         }
 
         return *static_cast<ComponentStorage<T>*>(component);

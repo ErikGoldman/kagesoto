@@ -25,6 +25,10 @@ struct PreallocatedTraceByTrait {
     int value;
 };
 
+struct GameClock {
+    int tick = 17;
+};
+
 }  // namespace
 
 namespace ecs {
@@ -37,6 +41,11 @@ struct ComponentStorageModeTraits<ClassicByTrait> {
 template <>
 struct ComponentStorageModeTraits<PreallocatedTraceByTrait> {
     static constexpr ComponentStorageMode value = ComponentStorageMode::trace_preallocate;
+};
+
+template <>
+struct ComponentSingletonTraits<GameClock> {
+    static constexpr bool value = true;
 };
 
 }  // namespace ecs
@@ -89,6 +98,55 @@ TEST_CASE("preallocated trace storage requires explicit bounded history before c
     auto tx = configured.transaction<Position>();
     REQUIRE(tx.write<Position>(configured_entity, Position{3, 4}) != nullptr);
     tx.commit();
+}
+
+TEST_CASE("singleton components exist without an entity and are not removed by entity lifecycle changes") {
+    ecs::Registry registry(4);
+    const ecs::Entity entity = registry.create();
+
+    {
+        auto tx = registry.transaction<Position, GameClock>();
+        tx.write<Position>(entity, Position{1, 2});
+        tx.write<GameClock>()->tick = 42;
+        tx.commit();
+    }
+
+    REQUIRE(registry.destroy(entity));
+
+    auto tx = registry.transaction<GameClock>();
+    REQUIRE(tx.get<GameClock>().tick == 42);
+}
+
+TEST_CASE("singleton trace history works without an entity argument") {
+    ecs::Registry registry(4);
+    registry.set_storage_mode<GameClock>(ecs::ComponentStorageMode::trace_ondemand);
+
+    registry.set_current_trace_time(1);
+    {
+        auto tx = registry.transaction<GameClock>();
+        tx.write<GameClock>()->tick = 21;
+        tx.commit();
+    }
+
+    registry.set_current_trace_time(3);
+    {
+        auto tx = registry.transaction<GameClock>();
+        tx.write<GameClock>()->tick = 84;
+        tx.commit();
+    }
+
+    std::vector<int> seen;
+    registry.each_trace_change<GameClock>([&](ecs::TraceChangeInfo info, const GameClock* clock) {
+        if (!info.tombstone && clock != nullptr) {
+            seen.push_back(clock->tick);
+        }
+    });
+
+    REQUIRE(seen == std::vector<int>{17, 21, 84});
+    REQUIRE(registry.rollback_to_timestamp<GameClock>(1));
+
+    auto tx = registry.transaction<GameClock>();
+    REQUIRE(tx.get<GameClock>().tick == 21);
 }
 
 TEST_CASE("registry creates recycles and removes entities and components") {

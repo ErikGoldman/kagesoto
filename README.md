@@ -43,6 +43,8 @@ int main() {
 
 Transactions must declare the components they can access. A non-const declaration allows `tx.write<T>()`; a const declaration is read-only. View callbacks receive const component references, so mutate components by calling `tx.write<T>()` inside the transaction.
 
+Singleton components are declared with `ecs::ComponentSingletonTraits<T>`. They exist exactly once per registry, are default-constructed when first accessed, and use no entity ID for reads or writes.
+
 ## Core Concepts
 
 - `ecs::Registry` owns entities, component storage, transactions, snapshots, and storage-mode settings.
@@ -146,6 +148,54 @@ struct ComponentStorageModeTraits<Transform> {
 ```
 
 Once storage exists for a component type, changing that component's storage mode throws `std::logic_error`.
+
+## Singleton Components
+
+Declare a singleton by specializing `ecs::ComponentSingletonTraits<T>`. Singletons must be trivially copyable and default constructible.
+
+```cpp
+struct GameClock {
+    std::uint64_t tick = 0;
+};
+
+namespace ecs {
+
+template <>
+struct ComponentSingletonTraits<GameClock> {
+    static constexpr bool value = true;
+};
+
+}  // namespace ecs
+```
+
+Access singleton state without an entity:
+
+```cpp
+ecs::Registry registry;
+
+{
+    auto tx = registry.transaction<GameClock>();
+    GameClock* clock = tx.write<GameClock>();
+    clock->tick = 42;
+    tx.commit();
+}
+
+auto read_tx = registry.transaction<GameClock>();
+const GameClock& clock = read_tx.get<GameClock>();
+```
+
+Views can include singleton components. A singleton-only view calls the callback once with `ecs::null_entity`.
+
+```cpp
+auto tx = registry.transaction<Position, GameClock>();
+
+tx.view<const Position, const GameClock>().forEach(
+    [](ecs::Entity entity, const Position& position, const GameClock& clock) {
+        // position belongs to entity, clock is the registry singleton.
+    });
+```
+
+Singletons cannot declare component indexes, and predicate filters such as `where_eq` are not available on singleton fields.
 
 ## Query Views and Indexes
 

@@ -20,6 +20,10 @@ struct Velocity {
     int dy;
 };
 
+struct GameClock {
+    int tick = 123;
+};
+
 template <typename TransactionType, typename Component, typename = void>
 struct can_try_get : std::false_type {};
 
@@ -38,6 +42,33 @@ struct can_write<TransactionType,
                  std::void_t<decltype(std::declval<TransactionType&>().template write<Component>(ecs::null_entity))>>
     : std::true_type {};
 
+template <typename TransactionType, typename Component, typename = void>
+struct can_try_get_singleton : std::false_type {};
+
+template <typename TransactionType, typename Component>
+struct can_try_get_singleton<TransactionType,
+                             Component,
+                             std::void_t<decltype(std::declval<TransactionType&>().template try_get<Component>())>>
+    : std::true_type {};
+
+template <typename TransactionType, typename Component, typename = void>
+struct can_write_singleton : std::false_type {};
+
+template <typename TransactionType, typename Component>
+struct can_write_singleton<TransactionType,
+                           Component,
+                           std::void_t<decltype(std::declval<TransactionType&>().template write<Component>())>>
+    : std::true_type {};
+
+template <typename TransactionType, typename Component, typename = void>
+struct can_storage : std::false_type {};
+
+template <typename TransactionType, typename Component>
+struct can_storage<TransactionType,
+                   Component,
+                   std::void_t<decltype(std::declval<TransactionType&>().template storage<Component>())>>
+    : std::true_type {};
+
 ecs::Registry make_mvcc_registry() {
     ecs::Registry registry(4);
     registry.set_storage_mode<Position>(ecs::ComponentStorageMode::mvcc);
@@ -46,6 +77,15 @@ ecs::Registry make_mvcc_registry() {
 }
 
 }  // namespace
+
+namespace ecs {
+
+template <>
+struct ComponentSingletonTraits<GameClock> {
+    static constexpr bool value = true;
+};
+
+}  // namespace ecs
 
 TEST_CASE("transactions stage copy-on-write updates and commit them atomically per component") {
     auto registry = make_mvcc_registry();
@@ -84,6 +124,7 @@ TEST_CASE("transactions stage copy-on-write updates and commit them atomically p
 TEST_CASE("typed transactions enforce declared read and write component access at compile time") {
     using ReadOnlyTx = ecs::Transaction<const Position>;
     using MixedTx = ecs::Transaction<Position, const Velocity>;
+    using SingletonTx = ecs::Transaction<GameClock>;
 
     static_assert(can_try_get<ReadOnlyTx, Position>::value);
     static_assert(!can_write<ReadOnlyTx, Position>::value);
@@ -92,6 +133,46 @@ TEST_CASE("typed transactions enforce declared read and write component access a
     static_assert(can_try_get<MixedTx, Velocity>::value);
     static_assert(can_write<MixedTx, Position>::value);
     static_assert(!can_write<MixedTx, Velocity>::value);
+
+    static_assert(can_try_get_singleton<SingletonTx, GameClock>::value);
+    static_assert(can_write_singleton<SingletonTx, GameClock>::value);
+    static_assert(!can_try_get<SingletonTx, GameClock>::value);
+    static_assert(!can_write<SingletonTx, GameClock>::value);
+    static_assert(!can_storage<SingletonTx, GameClock>::value);
+}
+
+TEST_CASE("singleton transactions expose a default-constructed value and stage writes without an entity") {
+    ecs::Registry registry(4);
+
+    {
+        auto tx = registry.transaction<GameClock>();
+        const GameClock* clock = tx.try_get<GameClock>();
+        REQUIRE(clock != nullptr);
+        REQUIRE(clock->tick == 123);
+
+        GameClock* staged = tx.write<GameClock>();
+        REQUIRE(staged != nullptr);
+        REQUIRE(staged != clock);
+        staged->tick = 456;
+        tx.commit();
+    }
+
+    auto read_tx = registry.transaction<GameClock>();
+    REQUIRE(read_tx.get<GameClock>().tick == 456);
+}
+
+TEST_CASE("singleton mvcc writes roll back when the transaction closes without commit") {
+    ecs::Registry registry(4);
+
+    {
+        auto tx = registry.transaction<GameClock>();
+        GameClock* clock = tx.write<GameClock>();
+        REQUIRE(clock != nullptr);
+        clock->tick = 999;
+    }
+
+    auto read_tx = registry.transaction<GameClock>();
+    REQUIRE(read_tx.get<GameClock>().tick == 123);
 }
 
 TEST_CASE("transactions roll back staged writes when not committed") {

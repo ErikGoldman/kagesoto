@@ -76,7 +76,7 @@ bool Registry::destroy(Entity entity) {
     entity_dense_indices_[index] = npos;
 
     for (auto& slot : components_) {
-        if (slot.storage != nullptr) {
+        if (slot.storage != nullptr && !slot.singleton) {
             slot.storage->erase(entity, trace_commit_context_);
         }
     }
@@ -135,14 +135,27 @@ const void* Registry::try_get(Entity entity, ComponentId component) const {
         return nullptr;
     }
 
+    if (components_[component].singleton) {
+        return nullptr;
+    }
+
     const RawPagedSparseArray* slot = components_[component].storage;
     return slot != nullptr ? slot->try_get_raw(entity) : nullptr;
+}
+
+const void* Registry::try_get_singleton(ComponentId component) const {
+    if (component >= components_.size() || !components_[component].singleton) {
+        return nullptr;
+    }
+
+    const RawPagedSparseArray* slot = components_[component].storage;
+    return slot != nullptr ? slot->try_get_raw(detail::singleton_entity) : nullptr;
 }
 
 bool Registry::remove(Entity entity, ComponentId component) {
     require_no_readers();
 
-    if (component >= components_.size()) {
+    if (component >= components_.size() || components_[component].singleton) {
         return false;
     }
 
@@ -175,6 +188,7 @@ RawPagedSparseArray& Registry::assure_storage(
     if (!slot.mode_configured) {
         slot.mode = resolved_storage_mode(componentId);
         slot.mode_configured = true;
+        slot.singleton = false;
         recompute_classic_mode_flag();
     }
 

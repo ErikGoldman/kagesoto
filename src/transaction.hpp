@@ -17,6 +17,21 @@
 
 namespace ecs {
 
+namespace detail {
+
+template <typename... Args>
+struct first_argument_is_entity : std::false_type {};
+
+template <typename First, typename... Rest>
+struct first_argument_is_entity<First, Rest...>
+    : std::is_same<std::decay_t<First>, Entity> {};
+
+template <typename... Components>
+inline constexpr std::size_t entity_component_count_v =
+    ((!is_singleton_component_v<Components> ? std::size_t{1} : std::size_t{0}) + ... + std::size_t{0});
+
+}  // namespace detail
+
 template <typename T, typename TransactionType>
 class TransactionStorageView;
 
@@ -33,6 +48,7 @@ enum class QueryAccessKind {
     anchor_scan,
     index_seek,
     sparse_lookup,
+    singleton_read,
 };
 
 struct QueryAccessStep {
@@ -166,9 +182,14 @@ public:
         return try_get(entity, component) != nullptr;
     }
 
-    template <typename T>
+    template <typename T, typename = std::enable_if_t<!detail::is_singleton_component_v<T>>>
     bool has(Entity entity) const {
         return try_get<T>(entity) != nullptr;
+    }
+
+    template <typename T, typename = std::enable_if_t<detail::is_singleton_component_v<T>>, typename = void>
+    bool has() const {
+        return try_get<T>() != nullptr;
     }
 
     const void* try_get(Entity entity, ComponentId component) const {
@@ -181,18 +202,30 @@ public:
         return raw == nullptr ? nullptr : raw->try_get_visible_raw(entity, max_visible_tsn_, active_at_open_, 0);
     }
 
-    template <typename T>
+    template <typename T, typename = std::enable_if_t<!detail::is_singleton_component_v<T>>>
     const T* try_get(Entity entity) const {
         return static_cast<const T*>(try_get(entity, component_id<T>()));
     }
 
-    template <typename T>
+    template <typename T, typename = std::enable_if_t<detail::is_singleton_component_v<T>>, typename = void>
+    const T* try_get() const {
+        require_open();
+        auto& storage = registry_->template assure_singleton_storage<T>();
+        return storage.try_get_visible(detail::singleton_entity, max_visible_tsn_, active_at_open_, 0);
+    }
+
+    template <typename T, typename = std::enable_if_t<!detail::is_singleton_component_v<T>>>
     const T& get(Entity entity) const {
         const T* component = try_get<T>(entity);
         if (component == nullptr) {
             throw std::out_of_range("entity does not have this component");
         }
         return *component;
+    }
+
+    template <typename T, typename = std::enable_if_t<detail::is_singleton_component_v<T>>, typename = void>
+    const T& get() const {
+        return *try_get<T>();
     }
 
     std::size_t entity_count() const {
@@ -325,9 +358,16 @@ public:
         return try_get(entity, component) != nullptr;
     }
 
-    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...>>>
+    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...> &&
+                                                      !detail::is_singleton_component_v<T>>>
     bool has(Entity entity) const {
         return try_get<T>(entity) != nullptr;
+    }
+
+    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...> &&
+                                                      detail::is_singleton_component_v<T>>, typename = void>
+    bool has() const {
+        return try_get<T>() != nullptr;
     }
 
     const void* try_get(Entity entity, ComponentId component) const {
@@ -340,12 +380,22 @@ public:
         return raw == nullptr ? nullptr : raw->try_get_visible_raw(entity, max_visible_tsn_, active_at_open_, tsn_);
     }
 
-    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...>>>
+    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...> &&
+                                                      !detail::is_singleton_component_v<T>>>
     const T* try_get(Entity entity) const {
         return static_cast<const T*>(try_get(entity, component_id<T>()));
     }
 
-    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...>>>
+    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...> &&
+                                                      detail::is_singleton_component_v<T>>, typename = void>
+    const T* try_get() const {
+        require_open();
+        auto& storage = registry_->template assure_singleton_storage<T>();
+        return storage.try_get_visible(detail::singleton_entity, max_visible_tsn_, active_at_open_, tsn_);
+    }
+
+    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...> &&
+                                                      !detail::is_singleton_component_v<T>>>
     const T& get(Entity entity) const {
         const T* component = try_get<T>(entity);
         if (component == nullptr) {
@@ -354,7 +404,14 @@ public:
         return *component;
     }
 
-    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...>>>
+    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...> &&
+                                                      detail::is_singleton_component_v<T>>, typename = void>
+    const T& get() const {
+        return *try_get<T>();
+    }
+
+    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...> &&
+                                                      !detail::is_singleton_component_v<T>>>
     TransactionStorageView<T, Transaction<DeclaredComponents...>> storage() {
         return TransactionStorageView<T, Transaction<DeclaredComponents...>>(*this);
     }
@@ -365,7 +422,8 @@ public:
         return TransactionView<Transaction<DeclaredComponents...>, Components...>(*this);
     }
 
-    template <typename T, typename = std::enable_if_t<detail::writable_component_v<T, DeclaredComponents...>>>
+    template <typename T, typename = std::enable_if_t<detail::writable_component_v<T, DeclaredComponents...> &&
+                                                      !detail::is_singleton_component_v<T>>>
     T* write(Entity entity) {
         static_assert(std::is_trivially_copyable_v<T>, "Registry components must be trivially copyable");
         require_open();
@@ -384,7 +442,8 @@ public:
 
     template <typename T,
               typename... Args,
-              typename = std::enable_if_t<detail::writable_component_v<T, DeclaredComponents...>>>
+              typename = std::enable_if_t<detail::writable_component_v<T, DeclaredComponents...> &&
+                                          !detail::is_singleton_component_v<T>>>
     T* write(Entity entity, Args&&... args) {
         static_assert(std::is_trivially_copyable_v<T>, "Registry components must be trivially copyable");
         require_open();
@@ -401,6 +460,48 @@ public:
         auto pending = storage.stage_value(entity, tsn_, value);
         T* staged = storage.staged_ptr(pending, tsn_);
         writes_.push_back(std::make_unique<PendingWrite<T>>(entity, &storage, pending));
+        return staged;
+    }
+
+    template <typename T, typename = std::enable_if_t<detail::writable_component_v<T, DeclaredComponents...> &&
+                                                      detail::is_singleton_component_v<T>>>
+    T* write() {
+        static_assert(std::is_trivially_copyable_v<T>, "Registry components must be trivially copyable");
+        require_open();
+
+        if (auto* pending = find_pending_singleton<T>()) {
+            return pending->storage->staged_ptr(pending->pending, tsn_);
+        }
+
+        auto& storage = registry_->template assure_singleton_storage<T>();
+        auto pending = storage.stage_write(detail::singleton_entity, tsn_, active_at_open_, max_visible_tsn_);
+        T* staged = storage.staged_ptr(pending, tsn_);
+        writes_.push_back(std::make_unique<PendingWrite<T>>(detail::singleton_entity, &storage, pending, false));
+        return staged;
+    }
+
+    template <typename T,
+              typename... Args,
+              typename = std::enable_if_t<detail::writable_component_v<T, DeclaredComponents...> &&
+                                          detail::is_singleton_component_v<T> &&
+                                          (sizeof...(Args) > 0) &&
+                                          !detail::first_argument_is_entity<Args...>::value>,
+              typename = void>
+    T* write(Args&&... args) {
+        static_assert(std::is_trivially_copyable_v<T>, "Registry components must be trivially copyable");
+        require_open();
+
+        T value{std::forward<Args>(args)...};
+        if (auto* pending = find_pending_singleton<T>()) {
+            T* staged = pending->storage->staged_ptr(pending->pending, tsn_);
+            std::memcpy(staged, &value, sizeof(T));
+            return staged;
+        }
+
+        auto& storage = registry_->template assure_singleton_storage<T>();
+        auto pending = storage.stage_value(detail::singleton_entity, tsn_, value);
+        T* staged = storage.staged_ptr(pending, tsn_);
+        writes_.push_back(std::make_unique<PendingWrite<T>>(detail::singleton_entity, &storage, pending, false));
         return staged;
     }
 
@@ -423,9 +524,10 @@ public:
 
 private:
     struct PendingWriteBase {
-        PendingWriteBase(Entity pending_entity, ComponentId pending_component)
+        PendingWriteBase(Entity pending_entity, ComponentId pending_component, bool pending_requires_alive)
             : entity(pending_entity),
-              component(pending_component) {}
+              component(pending_component),
+              requires_alive(pending_requires_alive) {}
 
         virtual ~PendingWriteBase() = default;
         virtual void commit(Timestamp tsn, TraceCommitContext trace_context) = 0;
@@ -434,14 +536,16 @@ private:
 
         Entity entity;
         ComponentId component;
+        bool requires_alive;
     };
 
     template <typename T>
     struct PendingWrite final : PendingWriteBase {
         PendingWrite(Entity entity,
                      ComponentStorage<T>* pending_storage,
-                     typename ComponentStorage<T>::PendingWrite pending_write)
-            : PendingWriteBase(entity, component_id<T>()),
+                     typename ComponentStorage<T>::PendingWrite pending_write,
+                     bool pending_requires_alive = true)
+            : PendingWriteBase(entity, component_id<T>(), pending_requires_alive),
               storage(pending_storage),
               pending(pending_write) {}
 
@@ -472,6 +576,17 @@ private:
         return nullptr;
     }
 
+    template <typename T>
+    PendingWrite<T>* find_pending_singleton() {
+        const ComponentId component = component_id<T>();
+        for (const auto& write : writes_) {
+            if (!write->requires_alive && write->component == component) {
+                return static_cast<PendingWrite<T>*>(write.get());
+            }
+        }
+        return nullptr;
+    }
+
     bool rollback_supported() const {
         for (const auto& write : writes_) {
             if (!write->rollback_supported()) {
@@ -485,7 +600,9 @@ private:
         require_open();
 
         for (const auto& write : writes_) {
-            registry_->require_alive(write->entity);
+            if (write->requires_alive) {
+                registry_->require_alive(write->entity);
+            }
         }
 
         for (auto& write : writes_) {
@@ -783,11 +900,12 @@ public:
         return format_explain(explain());
     }
 
-    template <auto Member, typename Value>
+    template <auto Member,
+              typename Value,
+              typename Component = typename detail::member_pointer_traits<decltype(Member)>::component_type,
+              typename = std::enable_if_t<detail::contains_component_v<Component, Components...> &&
+                                          !detail::is_singleton_component_v<Component>>>
     auto where(PredicateOperator op, Value&& value) const {
-        using component_type = typename detail::member_pointer_traits<decltype(Member)>::component_type;
-        static_assert(detail::contains_component_v<component_type, Components...>,
-                      "predicate member must belong to a component in the view");
         using predicate_type = ViewPredicate<Member, std::decay_t<Value>>;
         return FilteredTransactionView<TransactionType, predicate_type, Components...>(
             *transaction_,
@@ -821,7 +939,14 @@ public:
     void forEach(Func&& func) const {
         auto&& callback = func;
         const auto planned = build_scan_plan();
+        if (planned.explain.empty) {
+            return;
+        }
+
         if (planned.anchor_storage == nullptr) {
+            auto components = std::tuple<detail::component_pointer_t<TransactionType, Components>...>{
+                fetch<Components>(null_entity)...};
+            invoke(callback, null_entity, components, std::index_sequence_for<Components...>{});
             return;
         }
 
@@ -838,7 +963,12 @@ private:
     template <typename Component>
     detail::component_pointer_t<TransactionType, Component> fetch(Entity entity) const {
         using Base = detail::component_base_t<Component>;
-        return transaction_->template try_get<Base>(entity);
+        if constexpr (detail::is_singleton_component_v<Base>) {
+            (void)entity;
+            return transaction_->template try_get<Base>();
+        } else {
+            return transaction_->template try_get<Base>(entity);
+        }
     }
 
     template <typename Tuple, std::size_t... Indices>
@@ -871,18 +1001,22 @@ private:
     template <typename Component>
     std::size_t visible_size() const {
         using Base = detail::component_base_t<Component>;
-        const RawPagedSparseArray* storage = transaction_->raw_storage(component_id<Base>());
-        if (storage == nullptr) {
-            return 0;
-        }
-
-        std::size_t count = 0;
-        for (const Entity entity : storage->entities()) {
-            if (entity != null_entity && transaction_->template try_get<Base>(entity) != nullptr) {
-                ++count;
+        if constexpr (detail::is_singleton_component_v<Base>) {
+            return transaction_->template try_get<Base>() == nullptr ? 0 : 1;
+        } else {
+            const RawPagedSparseArray* storage = transaction_->raw_storage(component_id<Base>());
+            if (storage == nullptr) {
+                return 0;
             }
+
+            std::size_t count = 0;
+            for (const Entity entity : storage->entities()) {
+                if (entity != null_entity && transaction_->template try_get<Base>(entity) != nullptr) {
+                    ++count;
+                }
+            }
+            return count;
         }
-        return count;
     }
 
     template <std::size_t... Indices>
@@ -899,23 +1033,24 @@ private:
             using Base = detail::component_base_t<Component>;
 
             const ComponentId component = component_id<Base>();
-            const RawPagedSparseArray* storage = transaction_->raw_storage(component);
             const std::size_t rows = visible_size<Component>();
+            const bool singleton = detail::is_singleton_component_v<Base>;
+            const RawPagedSparseArray* storage = singleton ? nullptr : transaction_->raw_storage(component);
 
             planned.explain.steps.push_back(QueryAccessStep{
                 component,
                 index,
                 rows,
-                QueryAccessKind::sparse_lookup,
+                singleton ? QueryAccessKind::singleton_read : QueryAccessKind::sparse_lookup,
                 false,
                 detail::type_name<Base>(),
             });
 
-            if (storage == nullptr || rows == 0) {
+            if (!singleton && (storage == nullptr || rows == 0)) {
                 empty = true;
             }
 
-            if (!initialized || rows < planned.explain.candidate_rows) {
+            if (!singleton && (!initialized || rows < planned.explain.candidate_rows)) {
                 initialized = true;
                 planned.anchor_storage = storage;
                 planned.anchor_index = index;
@@ -928,7 +1063,8 @@ private:
 
         (consider(std::integral_constant<std::size_t, Indices>{}, detail::type_tag<Components>{}), ...);
 
-        if (!initialized || empty || planned.anchor_storage == nullptr) {
+        if (empty || (detail::entity_component_count_v<detail::component_base_t<Components>...> != 0 &&
+                      (!initialized || planned.anchor_storage == nullptr))) {
             planned.anchor_storage = nullptr;
             planned.explain.empty = true;
             planned.explain.anchor_component = null_component;
@@ -940,8 +1076,18 @@ private:
         }
 
         planned.explain.empty = false;
-        planned.explain.estimated_entity_lookups = planned.explain.candidate_rows * (sizeof...(Components) - 1);
-        planned.explain.steps[planned.anchor_index].access = QueryAccessKind::anchor_scan;
+        if constexpr (detail::entity_component_count_v<detail::component_base_t<Components>...> == 0) {
+            planned.explain.anchor_component = null_component;
+            planned.explain.anchor_component_name = {};
+            planned.explain.anchor_component_index = 0;
+            planned.explain.candidate_rows = 1;
+            planned.explain.estimated_entity_lookups = 0;
+        } else {
+            planned.explain.estimated_entity_lookups =
+                planned.explain.candidate_rows *
+                (detail::entity_component_count_v<detail::component_base_t<Components>...> - 1);
+            planned.explain.steps[planned.anchor_index].access = QueryAccessKind::anchor_scan;
+        }
         return planned;
     }
 
@@ -960,9 +1106,13 @@ private:
             return text;
         }
 
-        text += "\n  Anchor: component[" + std::to_string(plan.anchor_component_index) + "] ";
-        text += std::string(plan.anchor_component_name);
-        text += plan.uses_component_indexes ? " via index seek" : " via anchor scan";
+        if (plan.anchor_component == null_component) {
+            text += "\n  Anchor: singleton-only";
+        } else {
+            text += "\n  Anchor: component[" + std::to_string(plan.anchor_component_index) + "] ";
+            text += std::string(plan.anchor_component_name);
+            text += plan.uses_component_indexes ? " via index seek" : " via anchor scan";
+        }
         text += "\n  Candidates: " + std::to_string(plan.candidate_rows);
         text += "\n  Entity probes: " + std::to_string(plan.estimated_entity_lookups);
         text += "\n  Component value indexes: ";
@@ -980,6 +1130,8 @@ private:
                 text += "anchor scan";
             } else if (step.access == QueryAccessKind::index_seek) {
                 text += "index seek";
+            } else if (step.access == QueryAccessKind::singleton_read) {
+                text += "singleton read";
             } else {
                 text += "sparse entity probe";
             }
@@ -1014,11 +1166,12 @@ public:
         return TransactionView<TransactionType, Components...>::format_explain(explain());
     }
 
-    template <auto Member, typename Value>
+    template <auto Member,
+              typename Value,
+              typename Component = typename detail::member_pointer_traits<decltype(Member)>::component_type,
+              typename = std::enable_if_t<detail::contains_component_v<Component, Components...> &&
+                                          !detail::is_singleton_component_v<Component>>>
     auto where(PredicateOperator op, Value&& value) const {
-        using component_type = typename detail::member_pointer_traits<decltype(Member)>::component_type;
-        static_assert(detail::contains_component_v<component_type, Components...>,
-                      "predicate member must belong to a component in the view");
         using predicate_type = ViewPredicate<Member, std::decay_t<Value>>;
         return FilteredTransactionView<TransactionType, AndPredicate<Expression, predicate_type>, Components...>(
             *transaction_,
@@ -1037,11 +1190,12 @@ public:
     auto where_lt(Value&& value) const { return where<Member>(PredicateOperator::lt, std::forward<Value>(value)); }
     template <auto Member, typename Value>
     auto where_lte(Value&& value) const { return where<Member>(PredicateOperator::lte, std::forward<Value>(value)); }
-    template <auto Member, typename Value>
+    template <auto Member,
+              typename Value,
+              typename Component = typename detail::member_pointer_traits<decltype(Member)>::component_type,
+              typename = std::enable_if_t<detail::contains_component_v<Component, Components...> &&
+                                          !detail::is_singleton_component_v<Component>>>
     auto or_where(PredicateOperator op, Value&& value) const {
-        using component_type = typename detail::member_pointer_traits<decltype(Member)>::component_type;
-        static_assert(detail::contains_component_v<component_type, Components...>,
-                      "predicate member must belong to a component in the view");
         using predicate_type = ViewPredicate<Member, std::decay_t<Value>>;
         return FilteredTransactionView<TransactionType, OrPredicate<Expression, predicate_type>, Components...>(
             *transaction_,
@@ -1091,6 +1245,11 @@ public:
             return;
         }
 
+        if (planned.anchor_storage == nullptr) {
+            visit_entity(callback, null_entity);
+            return;
+        }
+
         const auto& dense_entities = planned.anchor_storage->entities();
         for (const Entity entity : dense_entities) {
             if (entity != null_entity) {
@@ -1113,7 +1272,12 @@ private:
     template <typename Component>
     detail::component_pointer_t<TransactionType, Component> fetch(Entity entity) const {
         using Base = detail::component_base_t<Component>;
-        return transaction_->template try_get<Base>(entity);
+        if constexpr (detail::is_singleton_component_v<Base>) {
+            (void)entity;
+            return transaction_->template try_get<Base>();
+        } else {
+            return transaction_->template try_get<Base>(entity);
+        }
     }
 
     template <typename Tuple, std::size_t... Indices>
@@ -1140,18 +1304,22 @@ private:
     template <typename Component>
     std::size_t visible_size() const {
         using Base = detail::component_base_t<Component>;
-        const RawPagedSparseArray* storage = transaction_->raw_storage(component_id<Base>());
-        if (storage == nullptr) {
-            return 0;
-        }
-
-        std::size_t count = 0;
-        for (const Entity entity : storage->entities()) {
-            if (entity != null_entity && transaction_->template try_get<Base>(entity) != nullptr) {
-                ++count;
+        if constexpr (detail::is_singleton_component_v<Base>) {
+            return transaction_->template try_get<Base>() == nullptr ? 0 : 1;
+        } else {
+            const RawPagedSparseArray* storage = transaction_->raw_storage(component_id<Base>());
+            if (storage == nullptr) {
+                return 0;
             }
+
+            std::size_t count = 0;
+            for (const Entity entity : storage->entities()) {
+                if (entity != null_entity && transaction_->template try_get<Base>(entity) != nullptr) {
+                    ++count;
+                }
+            }
+            return count;
         }
-        return count;
     }
 
     template <typename Expr>
@@ -1164,6 +1332,8 @@ private:
             return expression_matches(expression.left, entity) || expression_matches(expression.right, entity);
         } else {
             using Component = typename Expr::component_type;
+            static_assert(!detail::is_singleton_component_v<Component>,
+                          "predicates on singleton components are not supported");
             const Component* component = transaction_->template try_get<Component>(entity);
             return component != nullptr && expression.matches(*component);
         }
@@ -1188,7 +1358,9 @@ private:
         if (planned.use_index) {
             planned.explain.empty = planned.candidates.empty();
             planned.explain.candidate_rows = planned.candidates.size();
-            planned.explain.estimated_entity_lookups = planned.candidates.size() * (sizeof...(Components) - 1);
+            planned.explain.estimated_entity_lookups =
+                planned.candidates.size() *
+                (detail::entity_component_count_v<detail::component_base_t<Components>...> - 1);
         }
 
         return planned;

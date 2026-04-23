@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <utility>
 #include <type_traits>
 #include <vector>
 
@@ -18,7 +19,30 @@ struct Velocity {
     int dy;
 };
 
+struct GameClock {
+    int tick = 7;
+};
+
+template <typename ViewType, typename = void>
+struct can_where_singleton : std::false_type {};
+
+template <typename ViewType>
+struct can_where_singleton<ViewType,
+                           std::void_t<decltype(std::declval<ViewType>().template where<&GameClock::tick>(
+                               ecs::PredicateOperator::eq,
+                               7))>>
+    : std::true_type {};
+
 }  // namespace
+
+namespace ecs {
+
+template <>
+struct ComponentSingletonTraits<GameClock> {
+    static constexpr bool value = true;
+};
+
+}  // namespace ecs
 
 TEST_CASE("transaction views iterate matching entities with const component references") {
     ecs::Registry registry(4);
@@ -202,4 +226,63 @@ TEST_CASE("transaction view explain text marks empty results") {
     REQUIRE(explain.find("Result: empty") != std::string::npos);
     REQUIRE(explain.find("component[0] Position") != std::string::npos);
     REQUIRE(explain.find("component[1] Velocity") != std::string::npos);
+}
+
+TEST_CASE("singleton-only views invoke once with null_entity") {
+    ecs::Registry registry(4);
+    auto tx = registry.transaction<GameClock>();
+
+    int calls = 0;
+    tx.view<const GameClock>().forEach([&](ecs::Entity entity, const GameClock& clock) {
+        ++calls;
+        REQUIRE(entity == ecs::null_entity);
+        REQUIRE(clock.tick == 7);
+    });
+
+    REQUIRE(calls == 1);
+}
+
+TEST_CASE("mixed views pass singleton components alongside entity components") {
+    ecs::Registry registry(4);
+    const ecs::Entity entity = registry.create();
+
+    {
+        auto tx = registry.transaction<Position, GameClock>();
+        tx.write<Position>(entity, Position{3, 4});
+        tx.write<GameClock>()->tick = 11;
+        tx.commit();
+    }
+
+    auto tx = registry.transaction<Position, GameClock>();
+    int calls = 0;
+    tx.view<const Position, const GameClock>().forEach([&](ecs::Entity current, const Position& position, const GameClock& clock) {
+        ++calls;
+        REQUIRE(current == entity);
+        REQUIRE(position.x == 3);
+        REQUIRE(clock.tick == 11);
+    });
+
+    REQUIRE(calls == 1);
+}
+
+TEST_CASE("singleton-only view explain reports singleton reads without probes") {
+    ecs::Registry registry(4);
+    auto tx = registry.transaction<GameClock>();
+
+    const ecs::QueryExplain explain = tx.view<const GameClock>().explain();
+    REQUIRE_FALSE(explain.empty);
+    REQUIRE(explain.anchor_component == ecs::null_component);
+    REQUIRE(explain.candidate_rows == 1);
+    REQUIRE(explain.estimated_entity_lookups == 0);
+    REQUIRE(explain.steps.size() == 1);
+    REQUIRE(explain.steps.front().access == ecs::QueryAccessKind::singleton_read);
+
+    const std::string text = tx.view<const GameClock>().explain_text();
+    REQUIRE(text.find("Anchor: singleton-only") != std::string::npos);
+    REQUIRE(text.find("singleton read") != std::string::npos);
+}
+
+TEST_CASE("views do not allow predicates on singleton components") {
+    using View = decltype(std::declval<ecs::Transaction<GameClock>&>().template view<const GameClock>());
+    static_assert(!can_where_singleton<View>::value);
 }
