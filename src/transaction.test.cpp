@@ -295,7 +295,7 @@ TEST_CASE("classic component storage persists writes when a transaction closes w
 
 TEST_CASE("trace component storage records timestamped history and can roll back to an earlier timestamp") {
     ecs::Registry registry(4);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_ondemand);
     registry.set_trace_max_history(16);
     const ecs::Entity entity = registry.create();
 
@@ -317,7 +317,7 @@ TEST_CASE("trace component storage records timestamped history and can roll back
     REQUIRE(registry.remove<Position>(entity));
 
     struct RecordedChange {
-        std::uint32_t timestamp;
+        ecs::Timestamp timestamp;
         std::uint16_t writer_id;
         bool tombstone;
         int x;
@@ -375,7 +375,7 @@ TEST_CASE("trace component storage records timestamped history and can roll back
 
 TEST_CASE("trace component storage compacts history to the configured timestamp window") {
     ecs::Registry registry(4);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_ondemand);
     registry.set_trace_max_history(2);
     const ecs::Entity entity = registry.create();
 
@@ -400,7 +400,7 @@ TEST_CASE("trace component storage compacts history to the configured timestamp 
         tx.commit();
     }
 
-    std::vector<std::uint32_t> timestamps;
+    std::vector<ecs::Timestamp> timestamps;
     registry.each_trace_change<Position>(entity, [&](ecs::TraceChangeInfo info, const Position*) {
         timestamps.push_back(info.timestamp);
     });
@@ -419,7 +419,7 @@ TEST_CASE("trace component storage compacts history to the configured timestamp 
 
 TEST_CASE("trace rollback before the first change appends a tombstone and removes the current value") {
     ecs::Registry registry(4);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_ondemand);
     const ecs::Entity entity = registry.create();
 
     registry.set_current_trace_time(3);
@@ -449,7 +449,7 @@ TEST_CASE("trace rollback before the first change appends a tombstone and remove
 
 TEST_CASE("trace rollback to a tombstone timestamp keeps the component absent") {
     ecs::Registry registry(4);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_ondemand);
     const ecs::Entity entity = registry.create();
 
     registry.set_current_trace_time(1);
@@ -485,25 +485,20 @@ TEST_CASE("trace rollback to a tombstone timestamp keeps the component absent") 
     REQUIRE(changes.back().tombstone);
 }
 
-TEST_CASE("trace configuration rejects out of range and non monotonic timestamps") {
+TEST_CASE("trace configuration rejects zero history and non monotonic timestamps") {
     ecs::Registry registry(4);
 
-    REQUIRE_THROWS_AS(
-        registry.set_trace_max_history(ecs::RawPagedSparseArray::max_trace_time() + 1u),
-        std::out_of_range);
+    REQUIRE_THROWS_AS(registry.set_trace_max_history(0), std::out_of_range);
 
     registry.set_current_trace_time(7);
     REQUIRE(registry.current_trace_time() == 7);
 
-    REQUIRE_THROWS_AS(
-        registry.set_current_trace_time(ecs::RawPagedSparseArray::max_trace_time() + 1u),
-        std::out_of_range);
     REQUIRE_THROWS_AS(registry.set_current_trace_time(6), std::logic_error);
 }
 
 TEST_CASE("trace operations require all readers to be closed") {
     ecs::Registry registry(4);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_ondemand);
     const ecs::Entity entity = registry.create();
 
     registry.set_current_trace_time(1);
@@ -520,7 +515,7 @@ TEST_CASE("trace operations require all readers to be closed") {
 
 TEST_CASE("trace compaction and rollback work across multiple entities") {
     ecs::Registry registry(4);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_ondemand);
     registry.set_trace_max_history(2);
     const ecs::Entity first = registry.create();
     const ecs::Entity second = registry.create();
@@ -552,17 +547,17 @@ TEST_CASE("trace compaction and rollback work across multiple entities") {
     REQUIRE(read_tx.get<Position>(second).x == 4);
     read_tx.commit();
 
-    std::vector<std::uint32_t> first_timestamps;
+    std::vector<ecs::Timestamp> first_timestamps;
     registry.each_trace_change<Position>(first, [&](ecs::TraceChangeInfo info, const Position*) {
         first_timestamps.push_back(info.timestamp);
     });
-    std::vector<std::uint32_t> second_timestamps;
+    std::vector<ecs::Timestamp> second_timestamps;
     registry.each_trace_change<Position>(second, [&](ecs::TraceChangeInfo info, const Position*) {
         second_timestamps.push_back(info.timestamp);
     });
 
-    REQUIRE(first_timestamps == std::vector<std::uint32_t>{3, 4});
-    REQUIRE(second_timestamps == std::vector<std::uint32_t>{1, 4});
+    REQUIRE(first_timestamps == std::vector<ecs::Timestamp>{3, 4});
+    REQUIRE(second_timestamps == std::vector<ecs::Timestamp>{1, 4});
 
     registry.set_current_trace_time(5);
     REQUIRE(registry.rollback_to_timestamp<Position>(first, 3));
@@ -575,7 +570,7 @@ TEST_CASE("trace compaction and rollback work across multiple entities") {
 
 TEST_CASE("trace history survives tombstone rollback and row reuse") {
     ecs::Registry registry(4);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_ondemand);
     const ecs::Entity entity = registry.create();
 
     registry.set_current_trace_time(1);
@@ -595,19 +590,168 @@ TEST_CASE("trace history survives tombstone rollback and row reuse") {
         tx.commit();
     }
 
-    std::vector<std::uint32_t> timestamps;
+    std::vector<ecs::Timestamp> timestamps;
     std::vector<bool> tombstones;
     registry.each_trace_change<Position>(entity, [&](ecs::TraceChangeInfo info, const Position*) {
         timestamps.push_back(info.timestamp);
         tombstones.push_back(info.tombstone);
     });
 
-    REQUIRE(timestamps == std::vector<std::uint32_t>{1, 2, 3});
+    REQUIRE(timestamps == std::vector<ecs::Timestamp>{1, 2, 3});
     REQUIRE(tombstones == std::vector<bool>{false, true, false});
 
     auto tx = registry.transaction<Position>();
     REQUIRE(tx.get<Position>(entity).x == 3);
     REQUIRE(tx.get<Position>(entity).y == 3);
+}
+
+TEST_CASE("preallocated trace writes in place and persists direct writes without commit") {
+    ecs::Registry registry(4);
+    registry.set_trace_max_history(3);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
+    const ecs::Entity entity = registry.create();
+
+    registry.set_current_trace_time(1);
+    {
+        auto tx = registry.transaction<Position>();
+        tx.write<Position>(entity, Position{1, 2});
+    }
+
+    auto tx = registry.transaction<Position>();
+    const Position* original = tx.try_get<Position>(entity);
+    REQUIRE(original != nullptr);
+
+    Position* staged = tx.write<Position>(entity);
+    REQUIRE(staged == original);
+    staged->x = 7;
+    staged->y = 8;
+    tx.commit();
+
+    auto read_tx = registry.transaction<Position>();
+    REQUIRE(read_tx.get<Position>(entity).x == 7);
+    REQUIRE(read_tx.get<Position>(entity).y == 8);
+}
+
+TEST_CASE("preallocated trace checkpoints on trace time and rolls back retained frames") {
+    ecs::Registry registry(4);
+    registry.set_trace_max_history(3);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
+    const ecs::Entity entity = registry.create();
+
+    registry.set_current_trace_time(1);
+    {
+        auto tx = registry.transaction<Position>();
+        tx.write<Position>(entity, Position{1, 10});
+        tx.commit();
+    }
+
+    registry.set_current_trace_time(2);
+    {
+        auto tx = registry.transaction<Position>();
+        tx.write<Position>(entity, Position{2, 20});
+        tx.commit();
+    }
+
+    registry.set_current_trace_time(3);
+    REQUIRE(registry.rollback_to_timestamp<Position>(entity, 1));
+
+    auto tx = registry.transaction<Position>();
+    REQUIRE(tx.get<Position>(entity).x == 1);
+    REQUIRE(tx.get<Position>(entity).y == 10);
+}
+
+TEST_CASE("preallocated trace restores tombstones and does not leak row reuse") {
+    ecs::Registry registry(4);
+    registry.set_trace_max_history(4);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
+    const ecs::Entity first = registry.create();
+
+    registry.set_current_trace_time(1);
+    {
+        auto tx = registry.transaction<Position>();
+        tx.write<Position>(first, Position{1, 1});
+        tx.commit();
+    }
+
+    registry.set_current_trace_time(2);
+    REQUIRE(registry.remove<Position>(first));
+
+    registry.set_current_trace_time(3);
+    const ecs::Entity second = registry.create();
+    {
+        auto tx = registry.transaction<Position>();
+        tx.write<Position>(second, Position{3, 3});
+        tx.commit();
+    }
+
+    registry.set_current_trace_time(4);
+    REQUIRE(registry.rollback_to_timestamp<Position>(first, 1));
+
+    {
+        auto tx = registry.transaction<Position>();
+        REQUIRE(tx.get<Position>(first).x == 1);
+        REQUIRE(tx.get<Position>(first).y == 1);
+        REQUIRE(tx.get<Position>(second).x == 3);
+        REQUIRE(tx.get<Position>(second).y == 3);
+    }
+
+    REQUIRE(registry.rollback_to_timestamp<Position>(first, 2));
+    {
+        auto tombstone_tx = registry.transaction<Position>();
+        REQUIRE_FALSE(tombstone_tx.has<Position>(first));
+    }
+}
+
+TEST_CASE("preallocated trace reports retained per tick changes and prunes old frames") {
+    ecs::Registry registry(4);
+    registry.set_trace_max_history(2);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
+    const ecs::Entity entity = registry.create();
+
+    registry.set_current_trace_time(1);
+    {
+        auto tx = registry.transaction<Position>();
+        tx.write<Position>(entity, Position{1, 1});
+        tx.commit();
+    }
+
+    registry.set_current_trace_time(2);
+    REQUIRE(registry.remove<Position>(entity));
+
+    registry.set_current_trace_time(3);
+    {
+        auto tx = registry.transaction<Position>();
+        tx.write<Position>(entity, Position{3, 3});
+        tx.commit();
+    }
+
+    registry.set_current_trace_time(4);
+
+    std::vector<ecs::TraceChangeInfo> changes;
+    registry.each_trace_change<Position>(entity, [&](ecs::TraceChangeInfo info, const Position*) {
+        changes.push_back(info);
+    });
+
+    REQUIRE(changes.size() == 2);
+    REQUIRE(changes[0].timestamp == 2);
+    REQUIRE(changes[0].tombstone);
+    REQUIRE(changes[1].timestamp == 3);
+    REQUIRE_FALSE(changes[1].tombstone);
+    REQUIRE_THROWS_AS(registry.rollback_to_timestamp<Position>(entity, 1), std::out_of_range);
+}
+
+TEST_CASE("preallocated trace uses direct write access guards and rejects rollback") {
+    ecs::Registry registry(4);
+    registry.set_trace_max_history(2);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
+
+    const ecs::Entity entity = registry.create();
+    auto tx = registry.transaction<Position>();
+    tx.write<Position>(entity, Position{1, 2});
+
+    REQUIRE_THROWS_AS(tx.rollback(), std::logic_error);
+    REQUIRE_THROWS_AS(registry.snapshot(), std::logic_error);
+    REQUIRE_THROWS_AS(registry.transaction<const Position>(), std::logic_error);
 }
 
 TEST_CASE("classic component storage rejects concurrent snapshots and transactions") {

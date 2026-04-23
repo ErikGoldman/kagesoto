@@ -50,7 +50,7 @@ Transactions must declare the components they can access. A non-const declaratio
 - Components are plain trivially copyable C++ structs.
 - `registry.transaction<T...>()` opens a snapshot-visible read/write transaction for declared component types.
 - `tx.write<T>(entity, value)` stages or applies a component value, depending on the component storage mode.
-- `tx.commit()` publishes staged writes. In MVCC and trace modes, closing a transaction without committing rolls staged writes back.
+- `tx.commit()` publishes staged writes. In MVCC and `trace_ondemand` modes, closing a transaction without committing rolls staged writes back. `classic` and `trace_preallocate` write directly.
 - `registry.snapshot()` opens a read-only snapshot over committed component state.
 
 ```cpp
@@ -110,21 +110,22 @@ Views choose the smallest visible component storage as the anchor scan and use s
 
 ## Modes and Settings
 
-Components default to `ecs::ComponentStorageMode::classic`, but storage mode can be configured per component before that component's storage is created.
+Components default to `ecs::ComponentStorageMode::mvcc`, but storage mode can be configured per component before that component's storage is created.
 
 ```cpp
 ecs::Registry registry(1024); // page size defaults to 1024
 
 registry.set_storage_mode<Position>(ecs::ComponentStorageMode::mvcc);
-registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::trace);
+registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::trace_ondemand);
 registry.set_trace_max_history(128);
 ```
 
 Storage modes:
 
-- `classic`: default in-place component storage for lower overhead. Writes are immediately visible through that transaction, explicit rollback is not supported, and the registry enforces per-component reader/writer access constraints.
+- `classic`: in-place component storage for lower overhead. Writes are immediately visible through that transaction, explicit rollback is not supported, and the registry enforces per-component reader/writer access constraints.
 - `mvcc`: copy-on-write component storage. Transactions see stable snapshots, staged writes can be committed or rolled back, and uncommitted writes are isolated.
-- `trace`: MVCC-style storage with timestamped history. Use it when you need per-entity component change history or rollback to earlier trace timestamps.
+- `trace_ondemand`: MVCC-style trace storage with timestamped per-write history. Use it when traced components change infrequently.
+- `trace_preallocate`: in-place trace storage with a preallocated circular history copied at trace-time boundaries. Use it when traced components usually change every tick. Set a bounded `trace_max_history` before creating this storage.
 
 Set a component type's default mode by specializing `ComponentStorageModeTraits`:
 
@@ -216,11 +217,11 @@ Available predicate operators are `eq`, `ne`, `gt`, `gte`, `lt`, and `lte`, expo
 
 ## Trace History
 
-Trace mode records committed component changes with the registry's current trace timestamp. Timestamps are monotonic and use the 22-bit timestamp range exposed by `ecs::RawPagedSparseArray::max_trace_time()`.
+Trace mode records component changes with the registry's current 64-bit trace timestamp. `trace_ondemand` records committed writes. `trace_preallocate` copies the current dense component state whenever `set_current_trace_time()` advances. Timestamps are monotonic and use the same `ecs::Timestamp` type as transaction timestamps.
 
 ```cpp
 ecs::Registry registry;
-registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace);
+registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_ondemand);
 registry.set_trace_max_history(16);
 
 const ecs::Entity entity = registry.create();
@@ -256,7 +257,36 @@ registry.set_current_trace_time(6);
 registry.rollback_to_timestamp<Position>(entity, 3);
 ```
 
-Trace operations that mutate history require open readers and transactions to be closed first.
+For high-frequency components, configure `trace_preallocate` before the component storage is created. `set_trace_max_history()` is required because it controls the circular history depth.
+
+```cpp
+ecs::Registry registry;
+registry.set_trace_max_history(64);
+registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
+
+const ecs::Entity mover = registry.create();
+
+registry.set_current_trace_time(1);
+{
+    auto tx = registry.transaction<Position>();
+    tx.write<Position>(mover, Position{0, 0});
+    tx.commit();
+}
+
+registry.set_current_trace_time(2); // copies the timestamp 1 dense state into the ring
+{
+    auto tx = registry.transaction<Position>();
+    Position* position = tx.write<Position>(mover);
+    position->x += 1;
+    position->y += 1;
+    tx.commit();
+}
+
+registry.set_current_trace_time(3); // copies the timestamp 2 dense state into the ring
+registry.rollback_to_timestamp<Position>(mover, 1);
+```
+
+Trace operations that mutate history require readers and transactions to be closed first.
 
 ## Layout
 
@@ -293,7 +323,7 @@ The benchmark suite mirrors the data setup and benchmark shapes used in `abeimle
 
 ```bash
 cmake -S . -B build/bench -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DECS_BUILD_BENCHMARKS=ON
-cmake --build build/bench --target ecs_benchmark_entities ecs_benchmark_basic ecs_benchmark_extended
+cmake --build build/bench --target ecs_benchmark_entities ecs_benchmark_basic ecs_benchmark_extended ecs_benchmark_trace
 ```
 
 Run the executables directly or emit Google Benchmark JSON:
@@ -302,6 +332,7 @@ Run the executables directly or emit Google Benchmark JSON:
 ./build/bench/ecs_benchmark_entities --benchmark_out=entities.json --benchmark_out_format=json
 ./build/bench/ecs_benchmark_basic --benchmark_out=basic.json --benchmark_out_format=json
 ./build/bench/ecs_benchmark_extended --benchmark_out=extended.json --benchmark_out_format=json
+./build/bench/ecs_benchmark_trace --benchmark_out=trace.json --benchmark_out_format=json
 ```
 
 Suite mapping:
@@ -309,6 +340,7 @@ Suite mapping:
 - `ecs_benchmark_entities`: entity creation, destruction, component unpack, and remove/add benchmarks
 - `ecs_benchmark_basic`: the 2-system update benchmarks (`MovementSystem` and `DataSystem`)
 - `ecs_benchmark_extended`: the 7-system update benchmarks plus iteration benchmarks
+- `ecs_benchmark_trace`: high-frequency traced position updates comparing `trace_ondemand` and `trace_preallocate`
 
 ## Notes
 

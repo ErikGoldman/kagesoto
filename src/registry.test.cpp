@@ -21,6 +21,10 @@ struct ClassicByTrait {
     int value;
 };
 
+struct PreallocatedTraceByTrait {
+    int value;
+};
+
 }  // namespace
 
 namespace ecs {
@@ -28,6 +32,11 @@ namespace ecs {
 template <>
 struct ComponentStorageModeTraits<ClassicByTrait> {
     static constexpr ComponentStorageMode value = ComponentStorageMode::classic;
+};
+
+template <>
+struct ComponentStorageModeTraits<PreallocatedTraceByTrait> {
+    static constexpr ComponentStorageMode value = ComponentStorageMode::trace_preallocate;
 };
 
 }  // namespace ecs
@@ -50,11 +59,12 @@ TEST_CASE("component storage modes default to MVCC and can be configured per com
 
     REQUIRE(registry.storage_mode<Position>() == ecs::ComponentStorageMode::mvcc);
     REQUIRE(registry.storage_mode<ClassicByTrait>() == ecs::ComponentStorageMode::classic);
+    REQUIRE(registry.storage_mode<PreallocatedTraceByTrait>() == ecs::ComponentStorageMode::trace_preallocate);
 
-    registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::trace);
+    registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::trace_ondemand);
     registry.set_storage_mode<Position>(ecs::ComponentStorageMode::classic);
     REQUIRE(registry.storage_mode<Position>() == ecs::ComponentStorageMode::classic);
-    REQUIRE(registry.storage_mode<Velocity>() == ecs::ComponentStorageMode::trace);
+    REQUIRE(registry.storage_mode<Velocity>() == ecs::ComponentStorageMode::trace_ondemand);
 
     const ecs::Entity entity = registry.create();
     auto tx = registry.transaction<Position, Velocity>();
@@ -62,6 +72,23 @@ TEST_CASE("component storage modes default to MVCC and can be configured per com
     tx.commit();
 
     REQUIRE_THROWS_AS(registry.set_storage_mode<Position>(ecs::ComponentStorageMode::mvcc), std::logic_error);
+}
+
+TEST_CASE("preallocated trace storage requires explicit bounded history before creation") {
+    ecs::Registry registry(4);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
+    const ecs::Entity entity = registry.create();
+
+    REQUIRE_THROWS_AS(registry.transaction<Position>().write<Position>(entity, Position{1, 2}), std::logic_error);
+
+    ecs::Registry configured(4);
+    configured.set_trace_max_history(3);
+    configured.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
+    const ecs::Entity configured_entity = configured.create();
+
+    auto tx = configured.transaction<Position>();
+    REQUIRE(tx.write<Position>(configured_entity, Position{3, 4}) != nullptr);
+    tx.commit();
 }
 
 TEST_CASE("registry creates recycles and removes entities and components") {

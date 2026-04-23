@@ -415,7 +415,7 @@ public:
         }
 
         if (!rollback_supported()) {
-            throw std::logic_error("classic component storage does not support transaction rollback");
+            throw std::logic_error("direct-write component storage does not support transaction rollback");
         }
 
         finalize_writes(false);
@@ -454,7 +454,7 @@ private:
         }
 
         bool rollback_supported() const override {
-            return storage->storage_mode() != ComponentStorageMode::classic;
+            return !is_direct_write_storage_mode(storage->storage_mode());
         }
 
         ComponentStorage<T>* storage;

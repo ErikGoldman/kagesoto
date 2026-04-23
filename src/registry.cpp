@@ -180,7 +180,15 @@ RawPagedSparseArray& Registry::assure_storage(
 
     RawPagedSparseArray* component = slot.storage;
     if (component == nullptr) {
-        component = new RawPagedSparseArray(component_size, component_alignment, slot.mode, page_size_);
+        if (slot.mode == ComponentStorageMode::trace_preallocate && !trace_max_history_configured_) {
+            throw std::logic_error("trace_preallocate storage requires set_trace_max_history before storage creation");
+        }
+        component = new RawPagedSparseArray(
+            component_size,
+            component_alignment,
+            slot.mode,
+            page_size_,
+            trace_max_history_);
         slot.storage = component;
     }
     return *component;
@@ -222,7 +230,7 @@ ComponentStorageMode Registry::resolved_storage_mode(ComponentId componentId) co
 void Registry::recompute_classic_mode_flag() {
     has_classic_storage_mode_ = false;
     for (const ComponentSlot& slot : components_) {
-        if (slot.mode_configured && slot.mode == ComponentStorageMode::classic) {
+        if (slot.mode_configured && is_direct_write_storage_mode(slot.mode)) {
             has_classic_storage_mode_ = true;
             return;
         }
@@ -231,10 +239,23 @@ void Registry::recompute_classic_mode_flag() {
 
 void Registry::compact_trace_history() {
     for (ComponentSlot& slot : components_) {
-        if (slot.storage == nullptr || slot.mode != ComponentStorageMode::trace) {
+        if (slot.storage == nullptr || !is_trace_storage_mode(slot.mode)) {
             continue;
         }
-        slot.storage->compact_trace_history(trace_commit_context_.timestamp, trace_max_history_);
+        if (slot.mode == ComponentStorageMode::trace_ondemand) {
+            slot.storage->compact_trace_history(trace_commit_context_.timestamp, trace_max_history_);
+        } else {
+            slot.storage->compact_preallocated_trace_history(trace_commit_context_.timestamp, trace_max_history_);
+        }
+    }
+}
+
+void Registry::capture_preallocated_trace_frames() {
+    for (ComponentSlot& slot : components_) {
+        if (slot.storage == nullptr || slot.mode != ComponentStorageMode::trace_preallocate) {
+            continue;
+        }
+        slot.storage->capture_preallocated_trace_frame(trace_commit_context_.timestamp);
     }
 }
 
@@ -281,19 +302,19 @@ void Registry::register_snapshot_classic_access() {
 
     for (std::size_t i = 0; i < components_.size(); ++i) {
         const ComponentSlot& slot = components_[i];
-        if (!slot.mode_configured || slot.mode != ComponentStorageMode::classic) {
+        if (!slot.mode_configured || !is_direct_write_storage_mode(slot.mode)) {
             continue;
         }
 
         ClassicAccessState& state = classic_access_[i];
         if (state.writers != 0) {
-            throw std::logic_error("classic component storage mode does not allow snapshots while a writer is active");
+            throw std::logic_error("direct-write component storage mode does not allow snapshots while a writer is active");
         }
     }
 
     for (std::size_t i = 0; i < components_.size(); ++i) {
         const ComponentSlot& slot = components_[i];
-        if (!slot.mode_configured || slot.mode != ComponentStorageMode::classic) {
+        if (!slot.mode_configured || !is_direct_write_storage_mode(slot.mode)) {
             continue;
         }
         ++classic_access_[i].readers;
@@ -309,7 +330,7 @@ void Registry::unregister_snapshot_classic_access() {
 
     for (std::size_t i = 0; i < components_.size() && i < classic_access_.size(); ++i) {
         const ComponentSlot& slot = components_[i];
-        if (!slot.mode_configured || slot.mode != ComponentStorageMode::classic) {
+        if (!slot.mode_configured || !is_direct_write_storage_mode(slot.mode)) {
             continue;
         }
         if (classic_access_[i].readers != 0) {

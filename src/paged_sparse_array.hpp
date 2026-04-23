@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -19,16 +20,27 @@ namespace ecs {
 enum class ComponentStorageMode : std::uint8_t {
     mvcc,
     classic,
-    trace,
+    trace_ondemand,
+    trace_preallocate,
 };
 
+constexpr bool is_trace_storage_mode(ComponentStorageMode mode) {
+    return mode == ComponentStorageMode::trace_ondemand ||
+           mode == ComponentStorageMode::trace_preallocate;
+}
+
+constexpr bool is_direct_write_storage_mode(ComponentStorageMode mode) {
+    return mode == ComponentStorageMode::classic ||
+           mode == ComponentStorageMode::trace_preallocate;
+}
+
 struct TraceCommitContext {
-    std::uint32_t timestamp = 0;
+    Timestamp timestamp = 0;
     std::uint16_t writer_id = 0;
 };
 
 struct TraceChangeInfo {
-    std::uint32_t timestamp = 0;
+    Timestamp timestamp = 0;
     std::uint16_t writer_id = 0;
     bool tombstone = false;
 };
@@ -39,15 +51,13 @@ public:
     static constexpr std::size_t overflow_revision_capacity = 5;
     static constexpr std::uint32_t npos32 = std::numeric_limits<std::uint32_t>::max();
     static constexpr std::size_t npos = std::numeric_limits<std::size_t>::max();
-    static constexpr std::uint32_t trace_timestamp_bits = 22;
-    static constexpr std::uint32_t trace_writer_id_bits = 10;
-    static constexpr std::uint32_t max_trace_timestamp = (1u << trace_timestamp_bits) - 1u;
-    static constexpr std::uint16_t max_trace_writer_id = static_cast<std::uint16_t>((1u << trace_writer_id_bits) - 1u);
+    static constexpr std::uint16_t max_trace_writer_id = std::numeric_limits<std::uint16_t>::max();
 
     struct RevisionRef {
         Timestamp tsn = 0;
         std::uint32_t value_index = npos32;
-        std::uint32_t trace_tag = 0;
+        Timestamp trace_timestamp = 0;
+        std::uint16_t trace_writer_id = 0;
         bool isolated = false;
         bool tombstone = false;
         bool voided = true;
@@ -77,20 +87,37 @@ public:
         bool tombstone = false;
     };
 
+    struct PreallocatedTraceFrame {
+        Timestamp timestamp = 0;
+        bool valid = false;
+        std::vector<Entity> dense_entities;
+        std::vector<unsigned char> dense_data;
+    };
+
     RawPagedSparseArray(std::size_t component_size,
                         std::size_t component_alignment,
                         ComponentStorageMode mode = ComponentStorageMode::mvcc,
-                        std::size_t page_size = 1024)
+                        std::size_t page_size = 1024,
+                        std::size_t preallocated_trace_capacity = 0)
         : component_size_(component_size),
           component_alignment_(component_alignment),
           mode_(mode),
-          index_(page_size) {
+          index_(page_size),
+          preallocated_trace_capacity_(preallocated_trace_capacity) {
         if (component_size_ == 0) {
             throw std::invalid_argument("component size must be greater than zero");
         }
 
         if (component_alignment_ == 0 || (component_alignment_ & (component_alignment_ - 1)) != 0) {
             throw std::invalid_argument("component alignment must be a non-zero power of two");
+        }
+
+        if (mode_ == ComponentStorageMode::trace_preallocate && preallocated_trace_capacity_ == 0) {
+            throw std::logic_error("trace_preallocate storage requires explicit non-zero trace max history");
+        }
+
+        if (mode_ == ComponentStorageMode::trace_preallocate) {
+            preallocated_trace_frames_.resize(preallocated_trace_capacity_);
         }
     }
 
@@ -110,10 +137,15 @@ public:
           revision_headers_(std::move(other.revision_headers_)),
           revision_overflow_(std::move(other.revision_overflow_)),
           revision_values_(std::move(other.revision_values_)),
+          preallocated_trace_frames_(std::move(other.preallocated_trace_frames_)),
+          preallocated_trace_next_frame_(other.preallocated_trace_next_frame_),
+          preallocated_trace_capacity_(other.preallocated_trace_capacity_),
           free_rows_(std::move(other.free_rows_)) {
         other.dense_data_ = nullptr;
         other.dense_capacity_ = 0;
         other.committed_count_ = 0;
+        other.preallocated_trace_next_frame_ = 0;
+        other.preallocated_trace_capacity_ = 0;
     }
 
     RawPagedSparseArray& operator=(RawPagedSparseArray&& other) noexcept {
@@ -130,10 +162,15 @@ public:
             revision_headers_ = std::move(other.revision_headers_);
             revision_overflow_ = std::move(other.revision_overflow_);
             revision_values_ = std::move(other.revision_values_);
+            preallocated_trace_frames_ = std::move(other.preallocated_trace_frames_);
+            preallocated_trace_next_frame_ = other.preallocated_trace_next_frame_;
+            preallocated_trace_capacity_ = other.preallocated_trace_capacity_;
             free_rows_ = std::move(other.free_rows_);
             other.dense_data_ = nullptr;
             other.dense_capacity_ = 0;
             other.committed_count_ = 0;
+            other.preallocated_trace_next_frame_ = 0;
+            other.preallocated_trace_capacity_ = 0;
         }
         return *this;
     }
@@ -149,8 +186,8 @@ public:
         return mode_;
     }
 
-    static constexpr std::uint32_t max_trace_time() {
-        return max_trace_timestamp;
+    static constexpr Timestamp max_trace_time() {
+        return std::numeric_limits<Timestamp>::max();
     }
 
     static constexpr std::uint16_t max_trace_writer() {
@@ -163,7 +200,7 @@ public:
             return nullptr;
         }
 
-        if (mode_ == ComponentStorageMode::classic) {
+        if (is_direct_write_storage_mode(mode_)) {
             return element_ptr(dense_index);
         }
 
@@ -190,7 +227,7 @@ public:
             return nullptr;
         }
 
-        if (mode_ == ComponentStorageMode::classic) {
+        if (is_direct_write_storage_mode(mode_)) {
             return element_ptr(dense_index);
         }
 
@@ -204,7 +241,7 @@ public:
             return false;
         }
 
-        if (mode_ == ComponentStorageMode::classic) {
+        if (is_direct_write_storage_mode(mode_)) {
             clear_row(dense_index);
             --committed_count_;
             return true;
@@ -215,10 +252,10 @@ public:
             return false;
         }
 
-        if (mode_ == ComponentStorageMode::trace) {
+        if (mode_ == ComponentStorageMode::trace_ondemand) {
             append_ref(
                 dense_index,
-                RevisionRef{0, npos32, pack_trace_tag(trace_context), false, true, false});
+                RevisionRef{0, npos32, trace_context.timestamp, trace_context.writer_id, false, true, false});
             std::memset(element_ptr(dense_index), 0, component_size_);
             --committed_count_;
             return true;
@@ -236,6 +273,7 @@ public:
         revision_headers_.clear();
         revision_overflow_.clear();
         revision_values_.clear();
+        reset_preallocated_trace_frames();
         free_rows_.clear();
         committed_count_ = 0;
     }
@@ -273,7 +311,7 @@ public:
                              const void* initial_value,
                              bool has_initial_value,
                              bool preserve_previous_value = false) {
-        if (mode_ == ComponentStorageMode::classic) {
+        if (is_direct_write_storage_mode(mode_)) {
             const std::size_t existing = dense_index_of(entity);
             const bool had_value_before = existing != npos;
             const std::size_t dense_index = had_value_before ? existing : assure_row(entity);
@@ -297,13 +335,13 @@ public:
         }
 
         const std::uint32_t value_index = append_value(has_initial_value ? initial_value : nullptr);
-        append_ref(dense_index, RevisionRef{tsn, value_index, 0, true, false, false});
+        append_ref(dense_index, RevisionRef{tsn, value_index, 0, 0, true, false, false});
         std::memcpy(element_ptr(dense_index), revision_value_ptr(value_index), component_size_);
         return PendingWrite{dense_index, npos32, false};
     }
 
     const void* staged_ptr(const PendingWrite& pending, Timestamp tsn) const {
-        if (mode_ == ComponentStorageMode::classic) {
+        if (is_direct_write_storage_mode(mode_)) {
             return pending.dense_index == npos ? nullptr : element_ptr(pending.dense_index);
         }
 
@@ -312,7 +350,7 @@ public:
     }
 
     void rollback_staged(Entity entity, const PendingWrite& pending, Timestamp tsn) {
-        if (mode_ == ComponentStorageMode::classic) {
+        if (is_direct_write_storage_mode(mode_)) {
             (void)entity;
             (void)pending;
             (void)tsn;
@@ -409,7 +447,7 @@ protected:
         Timestamp tsn,
         TraceCommitContext trace_context = {}) {
 
-        if (mode_ == ComponentStorageMode::classic) {
+        if (is_direct_write_storage_mode(mode_)) {
             (void)entity;
             (void)pending;
             (void)tsn;
@@ -429,7 +467,10 @@ protected:
             RevisionRef{
                 tsn,
                 isolated_copy.value_index,
-                mode_ == ComponentStorageMode::trace ? pack_trace_tag(trace_context) : 0,
+                mode_ == ComponentStorageMode::trace_ondemand ? trace_context.timestamp : 0,
+                mode_ == ComponentStorageMode::trace_ondemand
+                    ? trace_context.writer_id
+                    : static_cast<std::uint16_t>(0),
                 false,
                 isolated_copy.tombstone,
                 false});
@@ -439,7 +480,12 @@ protected:
 
     template <typename Func>
     void for_each_trace_change(Entity entity, Func&& func) const {
-        if (mode_ != ComponentStorageMode::trace) {
+        if (mode_ == ComponentStorageMode::trace_preallocate) {
+            for_each_preallocated_trace_change(entity, std::forward<Func>(func));
+            return;
+        }
+
+        if (mode_ != ComponentStorageMode::trace_ondemand) {
             return;
         }
 
@@ -459,8 +505,12 @@ protected:
         });
     }
 
-    bool rollback_to_trace_timestamp(Entity entity, std::uint32_t timestamp, TraceCommitContext trace_context) {
-        if (mode_ != ComponentStorageMode::trace) {
+    bool rollback_to_trace_timestamp(Entity entity, Timestamp timestamp, TraceCommitContext trace_context) {
+        if (mode_ == ComponentStorageMode::trace_preallocate) {
+            return rollback_to_preallocated_trace_timestamp(entity, timestamp);
+        }
+
+        if (mode_ != ComponentStorageMode::trace_ondemand) {
             throw std::logic_error("trace rollback is only supported for trace component storage");
         }
 
@@ -477,8 +527,7 @@ protected:
             }
 
             latest = &ref;
-            const TraceCommitContext candidate = unpack_trace_context(ref.trace_tag);
-            if (candidate.timestamp <= timestamp) {
+            if (ref.trace_timestamp <= timestamp) {
                 target = &ref;
             }
             return false;
@@ -506,7 +555,8 @@ protected:
             RevisionRef{
                 0,
                 target_present ? append_value(revision_value_ptr(target->value_index)) : npos32,
-                pack_trace_tag(trace_context),
+                trace_context.timestamp,
+                trace_context.writer_id,
                 false,
                 !target_present,
                 false});
@@ -525,12 +575,12 @@ protected:
         return true;
     }
 
-    void compact_trace_history(std::uint32_t current_time, std::uint32_t max_history) {
-        if (mode_ != ComponentStorageMode::trace) {
+    void compact_trace_history(Timestamp current_time, Timestamp max_history) {
+        if (mode_ != ComponentStorageMode::trace_ondemand) {
             return;
         }
 
-        const std::uint32_t cutoff = current_time > max_history ? current_time - max_history : 0;
+        const Timestamp cutoff = current_time > max_history ? current_time - max_history : 0;
         std::vector<RevisionOverflow> new_overflow;
         std::vector<unsigned char> new_values;
 
@@ -557,12 +607,11 @@ protected:
             std::size_t keep_from = 0;
             bool found_baseline = false;
             for (std::size_t i = 0; i < refs.size(); ++i) {
-                const TraceCommitContext context = unpack_trace_context(refs[i].trace_tag);
-                if (context.timestamp >= cutoff) {
+                if (refs[i].trace_timestamp >= cutoff) {
                     keep_from = i;
                     if (i > 0 &&
-                        context.timestamp > cutoff &&
-                        unpack_trace_context(refs[i - 1].trace_tag).timestamp < cutoff) {
+                        refs[i].trace_timestamp > cutoff &&
+                        refs[i - 1].trace_timestamp < cutoff) {
                         keep_from = i - 1;
                     }
                     found_baseline = true;
@@ -611,8 +660,45 @@ protected:
         ++committed_count_;
     }
 
+    void capture_preallocated_trace_frame(Timestamp timestamp) {
+        if (mode_ != ComponentStorageMode::trace_preallocate || timestamp == 0) {
+            return;
+        }
+
+        PreallocatedTraceFrame& slot = preallocated_trace_frames_[preallocated_trace_next_frame_];
+        slot.timestamp = timestamp;
+        slot.valid = true;
+        slot.dense_entities = dense_entities_;
+
+        const std::size_t byte_count = dense_entities_.size() * component_size_;
+        const std::size_t capacity_bytes = dense_capacity_ * component_size_;
+        if (slot.dense_data.size() < capacity_bytes) {
+            slot.dense_data.resize(capacity_bytes);
+        }
+        if (byte_count != 0) {
+            std::memcpy(slot.dense_data.data(), dense_data_, byte_count);
+        }
+
+        preallocated_trace_next_frame_ = (preallocated_trace_next_frame_ + 1) % preallocated_trace_capacity_;
+    }
+
+    void compact_preallocated_trace_history(Timestamp current_time, Timestamp max_history) {
+        if (mode_ != ComponentStorageMode::trace_preallocate) {
+            return;
+        }
+
+        const Timestamp cutoff = current_time > max_history ? current_time - max_history : 0;
+        for (PreallocatedTraceFrame& frame : preallocated_trace_frames_) {
+            if (frame.valid && frame.timestamp < cutoff) {
+                frame.valid = false;
+                frame.timestamp = 0;
+                frame.dense_entities.clear();
+            }
+        }
+    }
+
     const void* pending_previous_ptr(const PendingWrite& pending) const {
-        if (mode_ != ComponentStorageMode::classic || !pending.had_value_before || pending.value_index == npos32) {
+        if (!is_direct_write_storage_mode(mode_) || !pending.had_value_before || pending.value_index == npos32) {
             return nullptr;
         }
         return revision_value_ptr(pending.value_index);
@@ -658,26 +744,8 @@ private:
         }
     }
 
-    static std::uint32_t pack_trace_tag(TraceCommitContext context) {
-        if (context.timestamp > max_trace_timestamp) {
-            throw std::out_of_range("trace timestamp exceeds 22-bit range");
-        }
-        if (context.writer_id > max_trace_writer_id) {
-            throw std::out_of_range("trace writer id exceeds 10-bit range");
-        }
-        return (context.timestamp << trace_writer_id_bits) | static_cast<std::uint32_t>(context.writer_id);
-    }
-
-    static TraceCommitContext unpack_trace_context(std::uint32_t trace_tag) {
-        return TraceCommitContext{
-            trace_tag >> trace_writer_id_bits,
-            static_cast<std::uint16_t>(trace_tag & max_trace_writer_id),
-        };
-    }
-
     static TraceChangeInfo unpack_trace_change(const RevisionRef& ref) {
-        const TraceCommitContext context = unpack_trace_context(ref.trace_tag);
-        return TraceChangeInfo{context.timestamp, context.writer_id, ref.tombstone};
+        return TraceChangeInfo{ref.trace_timestamp, ref.trace_writer_id, ref.tombstone};
     }
 
     template <typename Func>
@@ -835,7 +903,7 @@ private:
             std::memcpy(element_ptr(dense_index), revision_value_ptr(newest_non_void->value_index), component_size_);
         } else {
             std::memset(element_ptr(dense_index), 0, component_size_);
-            if (mode_ != ComponentStorageMode::trace) {
+            if (mode_ != ComponentStorageMode::trace_ondemand) {
                 clear_row(dense_index);
                 return;
             }
@@ -875,6 +943,7 @@ private:
 
         dense_data_ = new_data;
         dense_capacity_ = new_capacity;
+        ensure_preallocated_trace_frame_capacity();
     }
 
     void release_storage() {
@@ -883,6 +952,127 @@ private:
             dense_data_ = nullptr;
         }
         dense_capacity_ = 0;
+    }
+
+    void ensure_preallocated_trace_frame_capacity() {
+        if (mode_ != ComponentStorageMode::trace_preallocate) {
+            return;
+        }
+
+        const std::size_t capacity_bytes = dense_capacity_ * component_size_;
+        for (PreallocatedTraceFrame& frame : preallocated_trace_frames_) {
+            frame.dense_entities.reserve(dense_capacity_);
+            frame.dense_data.resize(capacity_bytes);
+        }
+    }
+
+    void reset_preallocated_trace_frames() {
+        if (mode_ != ComponentStorageMode::trace_preallocate) {
+            preallocated_trace_frames_.clear();
+            preallocated_trace_next_frame_ = 0;
+            return;
+        }
+
+        preallocated_trace_frames_.clear();
+        preallocated_trace_frames_.resize(preallocated_trace_capacity_);
+        preallocated_trace_next_frame_ = 0;
+        ensure_preallocated_trace_frame_capacity();
+    }
+
+    const PreallocatedTraceFrame* find_preallocated_trace_frame(Timestamp timestamp) const {
+        const PreallocatedTraceFrame* result = nullptr;
+        for (const PreallocatedTraceFrame& frame : preallocated_trace_frames_) {
+            if (frame.valid && frame.timestamp == timestamp) {
+                result = &frame;
+                break;
+            }
+        }
+        return result;
+    }
+
+    std::size_t dense_index_in_frame(const PreallocatedTraceFrame& frame, Entity entity) const {
+        for (std::size_t i = 0; i < frame.dense_entities.size(); ++i) {
+            if (frame.dense_entities[i] == entity) {
+                return i;
+            }
+        }
+        return npos;
+    }
+
+    const unsigned char* frame_element_ptr(const PreallocatedTraceFrame& frame, std::size_t index) const {
+        return frame.dense_data.data() + (index * component_size_);
+    }
+
+    template <typename Func>
+    void for_each_preallocated_trace_change(Entity entity, Func&& func) const {
+        std::vector<const PreallocatedTraceFrame*> ordered;
+        ordered.reserve(preallocated_trace_frames_.size());
+        for (const PreallocatedTraceFrame& frame : preallocated_trace_frames_) {
+            if (frame.valid) {
+                ordered.push_back(&frame);
+            }
+        }
+        std::sort(ordered.begin(), ordered.end(), [](const auto* lhs, const auto* rhs) {
+            return lhs->timestamp < rhs->timestamp;
+        });
+
+        bool seen = false;
+        bool last_tombstone = false;
+        for (std::size_t i = 0; i < ordered.size(); ++i) {
+            const PreallocatedTraceFrame* frame = ordered[i];
+            const std::size_t frame_index = dense_index_in_frame(*frame, entity);
+            if (frame_index != npos) {
+                seen = true;
+                last_tombstone = false;
+                func(TraceChangeInfo{frame->timestamp, 0, false}, frame_element_ptr(*frame, frame_index));
+                continue;
+            }
+
+            bool appears_later = false;
+            for (std::size_t next = i + 1; next < ordered.size(); ++next) {
+                if (dense_index_in_frame(*ordered[next], entity) != npos) {
+                    appears_later = true;
+                    break;
+                }
+            }
+
+            if ((seen || appears_later) && !last_tombstone) {
+                last_tombstone = true;
+                func(TraceChangeInfo{frame->timestamp, 0, true}, nullptr);
+            }
+        }
+    }
+
+    bool rollback_to_preallocated_trace_timestamp(Entity entity, Timestamp timestamp) {
+        const PreallocatedTraceFrame* frame = find_preallocated_trace_frame(timestamp);
+        if (frame == nullptr) {
+            throw std::out_of_range("trace timestamp is not retained by preallocated trace storage");
+        }
+
+        const std::size_t current_index = dense_index_of(entity);
+        const bool current_present = current_index != npos;
+        const std::size_t frame_index = dense_index_in_frame(*frame, entity);
+        const bool frame_present = frame_index != npos;
+        if (!current_present && !frame_present) {
+            return false;
+        }
+
+        if (current_present && frame_present &&
+            std::memcmp(element_ptr(current_index), frame_element_ptr(*frame, frame_index), component_size_) == 0) {
+            return false;
+        }
+
+        if (frame_present) {
+            const std::size_t dense_index = current_present ? current_index : assure_row(entity);
+            std::memcpy(element_ptr(dense_index), frame_element_ptr(*frame, frame_index), component_size_);
+            if (!current_present) {
+                ++committed_count_;
+            }
+        } else {
+            clear_row(current_index);
+            --committed_count_;
+        }
+        return true;
     }
 
     std::size_t component_size_;
@@ -896,14 +1086,19 @@ private:
     std::vector<RevisionInfo> revision_headers_;
     std::vector<RevisionOverflow> revision_overflow_;
     std::vector<unsigned char> revision_values_;
+    std::vector<PreallocatedTraceFrame> preallocated_trace_frames_;
+    std::size_t preallocated_trace_next_frame_ = 0;
+    std::size_t preallocated_trace_capacity_ = 0;
     std::vector<std::size_t> free_rows_;
 };
 
 template <typename T>
 class ComponentStorage final : public RawPagedSparseArray {
 public:
-    explicit ComponentStorage(ComponentStorageMode mode = ComponentStorageMode::mvcc, std::size_t page_size = 1024)
-        : RawPagedSparseArray(sizeof(T), alignof(T), mode, page_size) {}
+    explicit ComponentStorage(ComponentStorageMode mode = ComponentStorageMode::mvcc,
+                              std::size_t page_size = 1024,
+                              std::size_t preallocated_trace_capacity = 0)
+        : RawPagedSparseArray(sizeof(T), alignof(T), mode, page_size, preallocated_trace_capacity) {}
 
     using PendingWrite = RawPagedSparseArray::PendingWrite;
 
@@ -952,15 +1147,17 @@ public:
         Timestamp tsn,
         TraceCommitContext trace_context = {}) {
 
-        if (this->storage_mode() == ComponentStorageMode::classic) {
+        if (is_direct_write_storage_mode(this->storage_mode())) {
             const T* staged = staged_ptr(pending, tsn);
             if (staged == nullptr) {
                 return false;
             }
 
             if (pending.had_value_before) {
-                const T* previous = static_cast<const T*>(this->pending_previous_ptr(pending));
-                indexes_.replace(entity, *previous, *staged);
+                if constexpr (std::tuple_size_v<typename ComponentIndices<T>::type> != 0) {
+                    const T* previous = static_cast<const T*>(this->pending_previous_ptr(pending));
+                    indexes_.replace(entity, *previous, *staged);
+                }
                 return false;
             }
 
@@ -1105,7 +1302,7 @@ public:
         });
     }
 
-    bool rollback_to_trace_timestamp(Entity entity, std::uint32_t timestamp, TraceCommitContext trace_context) {
+    bool rollback_to_trace_timestamp(Entity entity, Timestamp timestamp, TraceCommitContext trace_context) {
         const T* previous = try_get(entity);
         const bool had_previous = previous != nullptr;
         const T previous_value = had_previous ? *previous : T{};
@@ -1125,8 +1322,16 @@ public:
         return true;
     }
 
-    void compact_trace_history(std::uint32_t current_time, std::uint32_t max_history) {
+    void compact_trace_history(Timestamp current_time, Timestamp max_history) {
         RawPagedSparseArray::compact_trace_history(current_time, max_history);
+    }
+
+    void capture_preallocated_trace_frame(Timestamp timestamp) {
+        RawPagedSparseArray::capture_preallocated_trace_frame(timestamp);
+    }
+
+    void compact_preallocated_trace_history(Timestamp current_time, Timestamp max_history) {
+        RawPagedSparseArray::compact_preallocated_trace_history(current_time, max_history);
     }
 
 private:

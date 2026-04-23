@@ -81,31 +81,32 @@ public:
         recompute_classic_mode_flag();
     }
 
-    void set_trace_max_history(std::uint32_t max_history) {
-        if (max_history > RawPagedSparseArray::max_trace_time()) {
-            throw std::out_of_range("trace max history exceeds 22-bit timestamp range");
+    void set_trace_max_history(Timestamp max_history) {
+        if (max_history == 0) {
+            throw std::out_of_range("trace max history must be greater than zero");
         }
         trace_max_history_ = max_history;
+        trace_max_history_configured_ = true;
     }
 
-    std::uint32_t trace_max_history() const {
+    Timestamp trace_max_history() const {
         return trace_max_history_;
     }
 
-    void set_current_trace_time(std::uint32_t timestamp) {
-        if (timestamp > RawPagedSparseArray::max_trace_time()) {
-            throw std::out_of_range("trace timestamp exceeds 22-bit range");
-        }
+    void set_current_trace_time(Timestamp timestamp) {
         if (timestamp < trace_commit_context_.timestamp) {
             throw std::logic_error("trace time must be monotonic");
         }
 
         require_no_readers();
+        if (timestamp > trace_commit_context_.timestamp) {
+            capture_preallocated_trace_frames();
+        }
         trace_commit_context_.timestamp = timestamp;
         compact_trace_history();
     }
 
-    std::uint32_t current_trace_time() const {
+    Timestamp current_trace_time() const {
         return trace_commit_context_.timestamp;
     }
 
@@ -132,10 +133,10 @@ public:
     }
 
     template <typename T>
-    bool rollback_to_timestamp(Entity entity, std::uint32_t timestamp) {
+    bool rollback_to_timestamp(Entity entity, Timestamp timestamp) {
         require_no_readers();
         const ComponentId id = component_id<T>();
-        if (storage_mode<T>() != ComponentStorageMode::trace) {
+        if (!is_trace_storage_mode(storage_mode<T>())) {
             throw std::logic_error("trace rollback requires trace component storage mode");
         }
         if (id >= components_.size() || components_[id].storage == nullptr) {
@@ -180,6 +181,7 @@ private:
     ComponentStorageMode resolved_storage_mode(ComponentId componentId) const;
     void recompute_classic_mode_flag();
     void compact_trace_history();
+    void capture_preallocated_trace_frames();
     RawPagedSparseArray& assure_storage(ComponentId componentId, std::size_t component_size, std::size_t component_alignment);
 
     Timestamp acquire_tsn();
@@ -202,7 +204,7 @@ private:
             using Declared = typename decltype(component_constant)::type;
             using Base = detail::component_base_t<Declared>;
             const ComponentId component = component_id<Base>();
-            if (storage_mode<Base>() != ComponentStorageMode::classic) {
+            if (!is_direct_write_storage_mode(storage_mode<Base>())) {
                 return;
             }
 
@@ -215,12 +217,12 @@ private:
             const bool writer = !std::is_const_v<Declared>;
             if (writer) {
                 if (state.readers != 0 || state.writers != 0) {
-                    throw std::logic_error("classic component storage mode requires exclusive writer access per component");
+                    throw std::logic_error("direct-write component storage mode requires exclusive writer access per component");
                 }
                 ++state.writers;
             } else {
                 if (state.writers != 0) {
-                    throw std::logic_error("classic component storage mode does not allow readers while a writer is active");
+                    throw std::logic_error("direct-write component storage mode does not allow readers while a writer is active");
                 }
                 ++state.readers;
             }
@@ -252,9 +254,13 @@ private:
             recompute_classic_mode_flag();
         }
 
+        if (slot.mode == ComponentStorageMode::trace_preallocate && !trace_max_history_configured_) {
+            throw std::logic_error("trace_preallocate storage requires set_trace_max_history before storage creation");
+        }
+
         RawPagedSparseArray* component = slot.storage;
         if (component == nullptr) {
-            component = new ComponentStorage<T>(slot.mode, page_size_);
+            component = new ComponentStorage<T>(slot.mode, page_size_, trace_max_history_);
             slot.storage = component;
         }
 
@@ -279,7 +285,8 @@ private:
     std::vector<ClassicAccessState> classic_access_;
     std::size_t snapshot_classic_readers_ = 0;
     TraceCommitContext trace_commit_context_{};
-    std::uint32_t trace_max_history_ = RawPagedSparseArray::max_trace_time();
+    Timestamp trace_max_history_ = RawPagedSparseArray::max_trace_time();
+    bool trace_max_history_configured_ = false;
 };
 
 }  // namespace ecs
