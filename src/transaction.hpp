@@ -17,14 +17,17 @@
 
 namespace ecs {
 
-template <typename T>
+template <typename T, typename TransactionType>
 class TransactionStorageView;
 
-template <typename Expression, typename... Components>
+template <typename TransactionType, typename Expression, typename... Components>
 class FilteredTransactionView;
 
-template <typename... Components>
+template <typename TransactionType, typename... Components>
 class TransactionView;
+
+template <typename... DeclaredComponents>
+class Transaction;
 
 enum class QueryAccessKind {
     anchor_scan,
@@ -126,11 +129,7 @@ struct is_or_predicate<OrPredicate<Left, Right>> : std::true_type {};
 class Snapshot {
 public:
     explicit Snapshot(Registry& registry)
-        : registry_(&registry),
-          max_visible_tsn_(registry.next_tsn_ - 1),
-          active_at_open_(registry.active_transactions_snapshot()) {
-        registry_->register_reader();
-    }
+        : Snapshot(registry, true) {}
 
     ~Snapshot() {
         close();
@@ -139,9 +138,11 @@ public:
     Snapshot(Snapshot&& other) noexcept
         : registry_(other.registry_),
           max_visible_tsn_(other.max_visible_tsn_),
-          active_at_open_(std::move(other.active_at_open_)) {
+          active_at_open_(std::move(other.active_at_open_)),
+          holds_snapshot_classic_access_(other.holds_snapshot_classic_access_) {
         other.registry_ = nullptr;
         other.max_visible_tsn_ = 0;
+        other.holds_snapshot_classic_access_ = false;
     }
 
     Snapshot& operator=(Snapshot&& other) noexcept {
@@ -150,8 +151,10 @@ public:
             registry_ = other.registry_;
             max_visible_tsn_ = other.max_visible_tsn_;
             active_at_open_ = std::move(other.active_at_open_);
+            holds_snapshot_classic_access_ = other.holds_snapshot_classic_access_;
             other.registry_ = nullptr;
             other.max_visible_tsn_ = 0;
+            other.holds_snapshot_classic_access_ = false;
         }
         return *this;
     }
@@ -208,6 +211,26 @@ public:
     }
 
 protected:
+    Snapshot(Registry& registry, bool register_snapshot_classic_access)
+        : registry_(&registry),
+          max_visible_tsn_(registry.next_tsn_ - 1),
+          active_at_open_(registry.active_transactions_snapshot()) {
+        registry_->register_reader();
+        try {
+            if (register_snapshot_classic_access) {
+                registry_->register_snapshot_classic_access();
+                holds_snapshot_classic_access_ = true;
+            }
+        } catch (...) {
+            registry_->unregister_reader();
+            registry_ = nullptr;
+            max_visible_tsn_ = 0;
+            active_at_open_.clear();
+            holds_snapshot_classic_access_ = false;
+            throw;
+        }
+    }
+
     void require_open() const {
         if (registry_ == nullptr) {
             throw std::logic_error("snapshot is no longer open");
@@ -216,6 +239,10 @@ protected:
 
     void close() {
         if (registry_ != nullptr) {
+            if (holds_snapshot_classic_access_) {
+                registry_->unregister_snapshot_classic_access();
+                holds_snapshot_classic_access_ = false;
+            }
             registry_->unregister_reader();
             registry_ = nullptr;
             max_visible_tsn_ = 0;
@@ -226,35 +253,66 @@ protected:
     Registry* registry_ = nullptr;
     std::uint64_t max_visible_tsn_ = 0;
     std::vector<std::uint64_t> active_at_open_;
+    bool holds_snapshot_classic_access_ = false;
 };
 
+template <typename... DeclaredComponents>
 class Transaction : public Snapshot {
+    static_assert(sizeof...(DeclaredComponents) > 0,
+                  "transactions must declare at least one component access");
+    static_assert(detail::unique_component_types<DeclaredComponents...>::value,
+                  "transactions cannot declare duplicate component types");
+
 public:
     explicit Transaction(Registry& registry)
-        : Snapshot(registry),
+        : Snapshot(registry, false),
           tsn_(registry.acquire_tsn()) {
         max_visible_tsn_ = tsn_ - 1;
         active_at_open_ = registry.active_transactions_snapshot();
         registry_->register_transaction(tsn_);
+        try {
+            classic_accesses_ = registry_->template register_transaction_classic_access<DeclaredComponents...>();
+        } catch (...) {
+            registry_->unregister_transaction(tsn_);
+            tsn_ = 0;
+            close();
+            throw;
+        }
     }
 
     ~Transaction() {
-        rollback();
+        if (registry_ == nullptr) {
+            return;
+        }
+
+        if (rollback_supported()) {
+            finalize_writes(false);
+        } else {
+            finalize_writes(true);
+        }
     }
 
     Transaction(Transaction&& other) noexcept
         : Snapshot(std::move(other)),
           tsn_(other.tsn_),
-          writes_(std::move(other.writes_)) {
+          writes_(std::move(other.writes_)),
+          classic_accesses_(std::move(other.classic_accesses_)) {
         other.tsn_ = 0;
     }
 
     Transaction& operator=(Transaction&& other) noexcept {
         if (this != &other) {
-            rollback();
+            if (registry_ != nullptr) {
+                if (rollback_supported()) {
+                    finalize_writes(false);
+                } else {
+                    finalize_writes(true);
+                }
+            }
             Snapshot::operator=(std::move(other));
             tsn_ = other.tsn_;
             writes_ = std::move(other.writes_);
+            classic_accesses_ = std::move(other.classic_accesses_);
             other.tsn_ = 0;
         }
         return *this;
@@ -267,7 +325,7 @@ public:
         return try_get(entity, component) != nullptr;
     }
 
-    template <typename T>
+    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...>>>
     bool has(Entity entity) const {
         return try_get<T>(entity) != nullptr;
     }
@@ -282,12 +340,12 @@ public:
         return raw == nullptr ? nullptr : raw->try_get_visible_raw(entity, max_visible_tsn_, active_at_open_, tsn_);
     }
 
-    template <typename T>
+    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...>>>
     const T* try_get(Entity entity) const {
         return static_cast<const T*>(try_get(entity, component_id<T>()));
     }
 
-    template <typename T>
+    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...>>>
     const T& get(Entity entity) const {
         const T* component = try_get<T>(entity);
         if (component == nullptr) {
@@ -296,17 +354,18 @@ public:
         return *component;
     }
 
-    template <typename T>
-    TransactionStorageView<T> storage() {
-        return TransactionStorageView<T>(*this);
+    template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...>>>
+    TransactionStorageView<T, Transaction<DeclaredComponents...>> storage() {
+        return TransactionStorageView<T, Transaction<DeclaredComponents...>>(*this);
     }
 
-    template <typename... Components>
-    TransactionView<Components...> view() {
-        return TransactionView<Components...>(*this);
+    template <typename... Components,
+              typename = std::enable_if_t<((detail::readable_component_v<detail::component_base_t<Components>, DeclaredComponents...>) && ...)>>
+    TransactionView<Transaction<DeclaredComponents...>, Components...> view() {
+        return TransactionView<Transaction<DeclaredComponents...>, Components...>(*this);
     }
 
-    template <typename T>
+    template <typename T, typename = std::enable_if_t<detail::writable_component_v<T, DeclaredComponents...>>>
     T* write(Entity entity) {
         static_assert(std::is_trivially_copyable_v<T>, "Registry components must be trivially copyable");
         require_open();
@@ -323,7 +382,9 @@ public:
         return staged;
     }
 
-    template <typename T, typename... Args>
+    template <typename T,
+              typename... Args,
+              typename = std::enable_if_t<detail::writable_component_v<T, DeclaredComponents...>>>
     T* write(Entity entity, Args&&... args) {
         static_assert(std::is_trivially_copyable_v<T>, "Registry components must be trivially copyable");
         require_open();
@@ -345,19 +406,7 @@ public:
 
     void commit() {
         require_open();
-
-        for (const auto& write : writes_) {
-            registry_->require_alive(write->entity);
-        }
-
-        for (auto& write : writes_) {
-            write->commit(tsn_);
-        }
-
-        writes_.clear();
-        registry_->unregister_transaction(tsn_);
-        tsn_ = 0;
-        close();
+        finalize_writes(true);
     }
 
     void rollback() {
@@ -365,16 +414,11 @@ public:
             return;
         }
 
-        for (auto& write : writes_) {
-            write->rollback(tsn_);
+        if (!rollback_supported()) {
+            throw std::logic_error("classic component storage does not support transaction rollback");
         }
 
-        writes_.clear();
-        if (tsn_ != 0) {
-            registry_->unregister_transaction(tsn_);
-        }
-        tsn_ = 0;
-        close();
+        finalize_writes(false);
     }
 
 private:
@@ -384,8 +428,9 @@ private:
               component(pending_component) {}
 
         virtual ~PendingWriteBase() = default;
-        virtual void commit(std::uint64_t tsn) = 0;
+        virtual void commit(std::uint64_t tsn, TraceCommitContext trace_context) = 0;
         virtual void rollback(std::uint64_t tsn) = 0;
+        virtual bool rollback_supported() const = 0;
 
         Entity entity;
         ComponentId component;
@@ -400,12 +445,16 @@ private:
               storage(pending_storage),
               pending(pending_write) {}
 
-        void commit(std::uint64_t tsn) override {
-            storage->commit_staged(this->entity, pending, tsn);
+        void commit(std::uint64_t tsn, TraceCommitContext trace_context) override {
+            storage->commit_staged(this->entity, pending, tsn, trace_context);
         }
 
         void rollback(std::uint64_t tsn) override {
             storage->rollback_staged(this->entity, pending, tsn);
+        }
+
+        bool rollback_supported() const override {
+            return storage->storage_mode() != ComponentStorageMode::classic;
         }
 
         ComponentStorage<T>* storage;
@@ -421,6 +470,40 @@ private:
             }
         }
         return nullptr;
+    }
+
+    bool rollback_supported() const {
+        for (const auto& write : writes_) {
+            if (!write->rollback_supported()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void finalize_writes(bool commit_writes) {
+        require_open();
+
+        for (const auto& write : writes_) {
+            registry_->require_alive(write->entity);
+        }
+
+        for (auto& write : writes_) {
+            if (commit_writes) {
+                write->commit(tsn_, registry_->trace_commit_context_);
+            } else {
+                write->rollback(tsn_);
+            }
+        }
+
+        writes_.clear();
+        registry_->unregister_classic_access(classic_accesses_);
+        classic_accesses_.clear();
+        if (tsn_ != 0) {
+            registry_->unregister_transaction(tsn_);
+        }
+        tsn_ = 0;
+        close();
     }
 
 public:
@@ -444,12 +527,13 @@ public:
 
     std::uint64_t tsn_ = 0;
     std::vector<std::unique_ptr<PendingWriteBase>> writes_;
+    std::vector<typename Registry::ClassicAccessRegistration> classic_accesses_;
 };
 
-template <typename T>
+template <typename T, typename TransactionType>
 class TransactionStorageView {
 public:
-    explicit TransactionStorageView(Transaction& transaction)
+    explicit TransactionStorageView(TransactionType& transaction)
         : transaction_(&transaction) {}
 
     const T* try_get(Entity entity) const {
@@ -483,9 +567,12 @@ public:
         return plan;
     }
 
-    template <typename IndexSpec, typename... KeyParts>
+    template <auto... Members, typename... KeyParts>
     QueryExplain explain_find(KeyParts&&... key_parts) const {
-        const std::size_t matches = find<IndexSpec>(std::forward<KeyParts>(key_parts)...).size();
+        using index_spec = typename detail::tuple_member_pack_index_spec<typename ComponentIndices<T>::type, Members...>::type;
+        const std::size_t matches = find_all<Members...>(std::forward<KeyParts>(key_parts)...).size();
+        const std::size_t visible = size();
+        const bool use_index = !std::is_void_v<index_spec> && matches < visible;
         QueryExplain plan{};
         plan.empty = matches == 0;
         plan.anchor_component = component_id<T>();
@@ -493,13 +580,13 @@ public:
         plan.anchor_component_index = 0;
         plan.candidate_rows = matches;
         plan.estimated_entity_lookups = 0;
-        plan.uses_component_indexes = true;
+        plan.uses_component_indexes = use_index;
         plan.steps.push_back(QueryAccessStep{
             component_id<T>(),
             0,
-            size(),
-            QueryAccessKind::index_seek,
-            true,
+            visible,
+            use_index ? QueryAccessKind::index_seek : QueryAccessKind::anchor_scan,
+            use_index,
             detail::type_name<T>(),
         });
         return plan;
@@ -543,23 +630,37 @@ public:
         return count;
     }
 
-    template <typename IndexSpec, typename... KeyParts>
-    std::vector<Entity> find(KeyParts&&... key_parts) const {
-        const auto key = detail::make_index_key<IndexSpec>(std::forward<KeyParts>(key_parts)...);
+    template <auto... Members, typename... KeyParts>
+    std::vector<Entity> find_all(KeyParts&&... key_parts) const {
+        using query_spec = detail::ComponentIndexSpec<false, Members...>;
+        using index_spec = typename detail::tuple_member_pack_index_spec<typename ComponentIndices<T>::type, Members...>::type;
+        static_assert(std::is_same_v<typename query_spec::component_type, T>, "find field must belong to the storage component");
+
+        const auto key = detail::make_index_key<query_spec>(std::forward<KeyParts>(key_parts)...);
         std::vector<Entity> matches;
-        if (const auto* storage = transaction_->template typed_raw_storage<T>()) {
-            const auto indexed = storage->template find<IndexSpec>(key);
-            matches.reserve(indexed.size());
-            for (const Entity entity : indexed) {
-                if (const T* component = transaction_->template try_get<T>(entity);
-                    component != nullptr && IndexSpec::key(*component) == key) {
-                    matches.push_back(entity);
+
+        if constexpr (!std::is_void_v<index_spec>) {
+            if (const auto* storage = transaction_->template typed_raw_storage<T>()) {
+                const auto indexed = storage->template find_index<index_spec>(key);
+                matches.reserve(indexed.size());
+                for (const Entity entity : indexed) {
+                    if (const T* component = transaction_->template try_get<T>(entity);
+                        component != nullptr && query_spec::key(*component) == key) {
+                        matches.push_back(entity);
+                    }
                 }
             }
+        } else {
+            each([&](Entity entity, const T& component) {
+                if (query_spec::key(component) == key) {
+                    matches.push_back(entity);
+                }
+            });
+            return matches;
         }
 
         transaction_->template each_pending_write<T>([&](Entity entity, const T* staged) {
-            if (staged != nullptr && IndexSpec::key(*staged) == key &&
+            if (staged != nullptr && query_spec::key(*staged) == key &&
                 std::find(matches.begin(), matches.end(), entity) == matches.end()) {
                 matches.push_back(entity);
             }
@@ -567,26 +668,10 @@ public:
         return matches;
     }
 
-    template <typename IndexSpec, typename... KeyParts>
+    template <auto... Members, typename... KeyParts>
     Entity find_one(KeyParts&&... key_parts) const {
-        const auto key = detail::make_index_key<IndexSpec>(std::forward<KeyParts>(key_parts)...);
-        if (const auto* storage = transaction_->template typed_raw_storage<T>()) {
-            const Entity indexed = storage->template find_one<IndexSpec>(key);
-            if (indexed != null_entity) {
-                if (const T* component = transaction_->template try_get<T>(indexed);
-                    component != nullptr && IndexSpec::key(*component) == key) {
-                    return indexed;
-                }
-            }
-        }
-
-        Entity match = null_entity;
-        transaction_->template each_pending_write<T>([&](Entity entity, const T* staged) {
-            if (match == null_entity && staged != nullptr && IndexSpec::key(*staged) == key) {
-                match = entity;
-            }
-        });
-        return match;
+        const std::vector<Entity> matches = find_all<Members...>(std::forward<KeyParts>(key_parts)...);
+        return matches.empty() ? null_entity : matches.front();
     }
 
     template <typename Func>
@@ -614,7 +699,7 @@ public:
             if (op != PredicateOperator::ne) {
                 used_index = true;
                 if (const auto* storage = transaction_->template typed_raw_storage<T>()) {
-                    const auto indexed = storage->template find_compare<index_spec>(op, value);
+                    const auto indexed = storage->template find_compare_index<index_spec>(op, value);
                     matches.reserve(indexed.size());
                     for (const Entity entity : indexed) {
                         if (const T* component = transaction_->template try_get<T>(entity);
@@ -627,6 +712,7 @@ public:
         }
 
         if (!used_index || matches.size() >= size()) {
+            matches.clear();
             each([&](Entity entity, const T& component) {
                 if (compare_values(component.*Member, op, value)) {
                     matches.push_back(entity);
@@ -650,7 +736,7 @@ private:
         return !std::is_void_v<typename detail::tuple_member_index_spec<Member, typename ComponentIndices<T>::type>::type>;
     }
 
-    Transaction* transaction_;
+    TransactionType* transaction_;
 };
 
 struct QuerySeedPlan {
@@ -681,14 +767,14 @@ inline std::vector<Entity> union_entities(std::vector<Entity> lhs, std::vector<E
     return result;
 }
 
-template <typename... Components>
+template <typename TransactionType, typename... Components>
 class TransactionView {
     static_assert(sizeof...(Components) > 0, "views require at least one component type");
     static_assert(detail::unique_component_types<Components...>::value,
                   "views cannot contain duplicate component types");
 
 public:
-    explicit TransactionView(Transaction& transaction)
+    explicit TransactionView(TransactionType& transaction)
         : transaction_(&transaction) {}
 
     QueryExplain explain() const {
@@ -705,7 +791,7 @@ public:
         static_assert(detail::contains_component_v<component_type, Components...>,
                       "predicate member must belong to a component in the view");
         using predicate_type = ViewPredicate<Member, std::decay_t<Value>>;
-        return FilteredTransactionView<predicate_type, Components...>(
+        return FilteredTransactionView<TransactionType, predicate_type, Components...>(
             *transaction_,
             predicate_type{op, std::forward<Value>(value)});
     }
@@ -725,12 +811,12 @@ public:
 
     template <typename Builder>
     auto and_group(Builder&& builder) const {
-        return std::forward<Builder>(builder)(TransactionView<Components...>(*transaction_));
+        return std::forward<Builder>(builder)(TransactionView<TransactionType, Components...>(*transaction_));
     }
 
     template <typename Builder>
     auto or_group(Builder&& builder) const {
-        return std::forward<Builder>(builder)(TransactionView<Components...>(*transaction_));
+        return std::forward<Builder>(builder)(TransactionView<TransactionType, Components...>(*transaction_));
     }
 
     template <typename Func>
@@ -752,7 +838,7 @@ private:
     };
 
     template <typename Component>
-    detail::component_pointer_t<Transaction, Component> fetch(Entity entity) const {
+    detail::component_pointer_t<TransactionType, Component> fetch(Entity entity) const {
         using Base = detail::component_base_t<Component>;
         return transaction_->template try_get<Base>(entity);
     }
@@ -775,7 +861,7 @@ private:
                 continue;
             }
 
-            auto components = std::tuple<detail::component_pointer_t<Transaction, Components>...>{
+            auto components = std::tuple<detail::component_pointer_t<TransactionType, Components>...>{
                 fetch<Components>(entity)...};
 
             if (all_present(components, std::index_sequence_for<Components...>{})) {
@@ -905,20 +991,20 @@ private:
         }
     }
 
-    Transaction* transaction_;
+    TransactionType* transaction_;
 
-    template <typename Expression, typename... ViewComponents>
+    template <typename, typename, typename...>
     friend class FilteredTransactionView;
 };
 
-template <typename Expression, typename... Components>
+template <typename TransactionType, typename Expression, typename... Components>
 class FilteredTransactionView {
     static_assert(sizeof...(Components) > 0, "views require at least one component type");
     static_assert(detail::unique_component_types<Components...>::value,
                   "views cannot contain duplicate component types");
 
 public:
-    explicit FilteredTransactionView(Transaction& transaction, Expression expression)
+    explicit FilteredTransactionView(TransactionType& transaction, Expression expression)
         : transaction_(&transaction),
           expression_(std::move(expression)) {}
 
@@ -927,7 +1013,7 @@ public:
     }
 
     std::string explain_text() const {
-        return TransactionView<Components...>::format_explain(explain());
+        return TransactionView<TransactionType, Components...>::format_explain(explain());
     }
 
     template <auto Member, typename Value>
@@ -936,7 +1022,7 @@ public:
         static_assert(detail::contains_component_v<component_type, Components...>,
                       "predicate member must belong to a component in the view");
         using predicate_type = ViewPredicate<Member, std::decay_t<Value>>;
-        return FilteredTransactionView<AndPredicate<Expression, predicate_type>, Components...>(
+        return FilteredTransactionView<TransactionType, AndPredicate<Expression, predicate_type>, Components...>(
             *transaction_,
             AndPredicate<Expression, predicate_type>{expression_, predicate_type{op, std::forward<Value>(value)}});
     }
@@ -959,7 +1045,7 @@ public:
         static_assert(detail::contains_component_v<component_type, Components...>,
                       "predicate member must belong to a component in the view");
         using predicate_type = ViewPredicate<Member, std::decay_t<Value>>;
-        return FilteredTransactionView<OrPredicate<Expression, predicate_type>, Components...>(
+        return FilteredTransactionView<TransactionType, OrPredicate<Expression, predicate_type>, Components...>(
             *transaction_,
             OrPredicate<Expression, predicate_type>{expression_, predicate_type{op, std::forward<Value>(value)}});
     }
@@ -978,16 +1064,16 @@ public:
 
     template <typename Builder>
     auto and_group(Builder&& builder) const {
-        auto grouped = std::forward<Builder>(builder)(TransactionView<Components...>(*transaction_));
-        return FilteredTransactionView<AndPredicate<Expression, typename decltype(grouped)::expression_type>, Components...>(
+        auto grouped = std::forward<Builder>(builder)(TransactionView<TransactionType, Components...>(*transaction_));
+        return FilteredTransactionView<TransactionType, AndPredicate<Expression, typename decltype(grouped)::expression_type>, Components...>(
             *transaction_,
             AndPredicate<Expression, typename decltype(grouped)::expression_type>{expression_, grouped.expression_});
     }
 
     template <typename Builder>
     auto or_group(Builder&& builder) const {
-        auto grouped = std::forward<Builder>(builder)(TransactionView<Components...>(*transaction_));
-        return FilteredTransactionView<OrPredicate<Expression, typename decltype(grouped)::expression_type>, Components...>(
+        auto grouped = std::forward<Builder>(builder)(TransactionView<TransactionType, Components...>(*transaction_));
+        return FilteredTransactionView<TransactionType, OrPredicate<Expression, typename decltype(grouped)::expression_type>, Components...>(
             *transaction_,
             OrPredicate<Expression, typename decltype(grouped)::expression_type>{expression_, grouped.expression_});
     }
@@ -1027,7 +1113,7 @@ private:
     };
 
     template <typename Component>
-    detail::component_pointer_t<Transaction, Component> fetch(Entity entity) const {
+    detail::component_pointer_t<TransactionType, Component> fetch(Entity entity) const {
         using Base = detail::component_base_t<Component>;
         return transaction_->template try_get<Base>(entity);
     }
@@ -1044,8 +1130,8 @@ private:
 
     template <typename Func>
     void visit_entity(Func& func, Entity entity) const {
-        auto components = std::tuple<detail::component_pointer_t<Transaction, Components>...>{
-            fetch<Components>(entity)...};
+            auto components = std::tuple<detail::component_pointer_t<TransactionType, Components>...>{
+                fetch<Components>(entity)...};
 
         if (all_present(components, std::index_sequence_for<Components...>{}) &&
             expression_matches(expression_, entity)) {
@@ -1087,7 +1173,7 @@ private:
 
     PlannedView build_plan() const {
         PlannedView planned{};
-        planned.explain = TransactionView<Components...>(*transaction_).explain();
+        planned.explain = TransactionView<TransactionType, Components...>(*transaction_).explain();
         planned.anchor_storage = transaction_->raw_storage(planned.explain.anchor_component);
         planned.anchor_index = planned.explain.anchor_component_index;
 
@@ -1187,10 +1273,10 @@ private:
         }
     }
 
-    Transaction* transaction_;
+    TransactionType* transaction_;
     Expression expression_;
 
-    template <typename OtherExpression, typename... OtherComponents>
+    template <typename, typename, typename...>
     friend class FilteredTransactionView;
 };
 

@@ -20,6 +20,13 @@ struct Velocity {
 using XIndex = ecs::Index<&IndexedPosition::x>;
 using XYUniqueIndex = ecs::UniqueIndex<&IndexedPosition::x, &IndexedPosition::y>;
 
+ecs::Registry make_index_mvcc_registry() {
+    ecs::Registry registry(4);
+    registry.set_storage_mode<IndexedPosition>(ecs::ComponentStorageMode::mvcc);
+    registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::mvcc);
+    return registry;
+}
+
 }  // namespace
 
 namespace ecs {
@@ -38,33 +45,55 @@ TEST_CASE("transaction storage supports indexed lookup on single and compound ke
     const ecs::Entity second = registry.create();
     const ecs::Entity third = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{10, 2});
         tx.write<IndexedPosition>(third, IndexedPosition{30, 3});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     auto positions = tx.storage<IndexedPosition>();
-    REQUIRE(positions.find<XIndex>(10) == std::vector<ecs::Entity>{first, second});
-    REQUIRE(positions.find<XYUniqueIndex>(10, 2) == std::vector<ecs::Entity>{second});
-    REQUIRE(positions.find_one<XYUniqueIndex>(30, 3) == third);
-    REQUIRE(positions.find_one<XYUniqueIndex>(99, 99) == ecs::null_entity);
+    REQUIRE(positions.find_all<&IndexedPosition::x>(10) == std::vector<ecs::Entity>{first, second});
+    REQUIRE(positions.find_all<&IndexedPosition::x, &IndexedPosition::y>(10, 2) == std::vector<ecs::Entity>{second});
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(30, 3) == third);
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(99, 99) == ecs::null_entity);
 }
 
-TEST_CASE("component indexes enforce uniqueness constraints") {
+TEST_CASE("transaction storage lookup can scan non indexed fields and return first matches") {
     ecs::Registry registry(4);
 
     const ecs::Entity first = registry.create();
+    const ecs::Entity second = registry.create();
+    const ecs::Entity third = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
+        tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
+        tx.write<IndexedPosition>(second, IndexedPosition{10, 2});
+        tx.write<IndexedPosition>(third, IndexedPosition{30, 2});
+        tx.commit();
+    }
+
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
+    auto positions = tx.storage<IndexedPosition>();
+    REQUIRE(positions.find_all<&IndexedPosition::y>(2) == std::vector<ecs::Entity>{second, third});
+    REQUIRE(positions.find_one<&IndexedPosition::x>(10) == first);
+    REQUIRE(positions.find_one<&IndexedPosition::y>(2) == second);
+    REQUIRE(positions.find_one<&IndexedPosition::y>(99) == ecs::null_entity);
+}
+
+TEST_CASE("component indexes enforce uniqueness constraints") {
+    auto registry = make_index_mvcc_registry();
+
+    const ecs::Entity first = registry.create();
+    {
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{5, 7});
         tx.commit();
     }
 
     const ecs::Entity second = registry.create();
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     tx.write<IndexedPosition>(second, IndexedPosition{5, 7});
     REQUIRE_THROWS_AS(tx.commit(), std::invalid_argument);
 }
@@ -74,35 +103,35 @@ TEST_CASE("component indexes stay in sync for remove and replace") {
 
     const ecs::Entity entity = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(entity, IndexedPosition{1, 2});
         tx.commit();
     }
 
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         auto positions = tx.storage<IndexedPosition>();
-        REQUIRE(positions.find_one<XYUniqueIndex>(1, 2) == entity);
+        REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(1, 2) == entity);
     }
 
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(entity, IndexedPosition{8, 9});
         tx.commit();
     }
 
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         auto positions = tx.storage<IndexedPosition>();
-        REQUIRE(positions.find_one<XYUniqueIndex>(1, 2) == ecs::null_entity);
-        REQUIRE(positions.find_one<XYUniqueIndex>(8, 9) == entity);
+        REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(1, 2) == ecs::null_entity);
+        REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(8, 9) == entity);
     }
 
     REQUIRE(registry.remove<IndexedPosition>(entity));
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     auto positions = tx.storage<IndexedPosition>();
-    REQUIRE(positions.find_one<XYUniqueIndex>(8, 9) == ecs::null_entity);
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(8, 9) == ecs::null_entity);
 }
 
 TEST_CASE("transaction storage exposes staged indexed inserts before commit") {
@@ -110,20 +139,20 @@ TEST_CASE("transaction storage exposes staged indexed inserts before commit") {
 
     const ecs::Entity entity = registry.create();
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     IndexedPosition* staged = tx.write<IndexedPosition>(entity, IndexedPosition{11, 22});
     REQUIRE(staged != nullptr);
 
     auto positions = tx.storage<IndexedPosition>();
-    REQUIRE(positions.find<XIndex>(11) == std::vector<ecs::Entity>{entity});
-    REQUIRE(positions.find_one<XYUniqueIndex>(11, 22) == entity);
+    REQUIRE(positions.find_all<&IndexedPosition::x>(11) == std::vector<ecs::Entity>{entity});
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(11, 22) == entity);
 
     tx.commit();
 
-    auto read_tx = registry.transaction();
+    auto read_tx = registry.transaction<IndexedPosition, Velocity>();
     auto committed_positions = read_tx.storage<IndexedPosition>();
-    REQUIRE(committed_positions.find<XIndex>(11) == std::vector<ecs::Entity>{entity});
-    REQUIRE(committed_positions.find_one<XYUniqueIndex>(11, 22) == entity);
+    REQUIRE(committed_positions.find_all<&IndexedPosition::x>(11) == std::vector<ecs::Entity>{entity});
+    REQUIRE(committed_positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(11, 22) == entity);
 }
 
 TEST_CASE("transaction storage switches indexed keys immediately within the transaction") {
@@ -131,31 +160,31 @@ TEST_CASE("transaction storage switches indexed keys immediately within the tran
 
     const ecs::Entity entity = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(entity, IndexedPosition{3, 4});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     IndexedPosition* staged = tx.write<IndexedPosition>(entity);
     REQUIRE(staged != nullptr);
     staged->x = 30;
     staged->y = 40;
 
     auto positions = tx.storage<IndexedPosition>();
-    REQUIRE(positions.find<XIndex>(3).empty());
-    REQUIRE(positions.find<XIndex>(30) == std::vector<ecs::Entity>{entity});
-    REQUIRE(positions.find_one<XYUniqueIndex>(3, 4) == ecs::null_entity);
-    REQUIRE(positions.find_one<XYUniqueIndex>(30, 40) == entity);
+    REQUIRE(positions.find_all<&IndexedPosition::x>(3).empty());
+    REQUIRE(positions.find_all<&IndexedPosition::x>(30) == std::vector<ecs::Entity>{entity});
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(3, 4) == ecs::null_entity);
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(30, 40) == entity);
 
     tx.commit();
 
-    auto read_tx = registry.transaction();
+    auto read_tx = registry.transaction<IndexedPosition, Velocity>();
     auto committed_positions = read_tx.storage<IndexedPosition>();
-    REQUIRE(committed_positions.find<XIndex>(3).empty());
-    REQUIRE(committed_positions.find<XIndex>(30) == std::vector<ecs::Entity>{entity});
-    REQUIRE(committed_positions.find_one<XYUniqueIndex>(3, 4) == ecs::null_entity);
-    REQUIRE(committed_positions.find_one<XYUniqueIndex>(30, 40) == entity);
+    REQUIRE(committed_positions.find_all<&IndexedPosition::x>(3).empty());
+    REQUIRE(committed_positions.find_all<&IndexedPosition::x>(30) == std::vector<ecs::Entity>{entity});
+    REQUIRE(committed_positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(3, 4) == ecs::null_entity);
+    REQUIRE(committed_positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(30, 40) == entity);
 }
 
 TEST_CASE("component row reuse after remove does not leak stale index state") {
@@ -165,7 +194,7 @@ TEST_CASE("component row reuse after remove does not leak stale index state") {
     const ecs::Entity second = registry.create();
 
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{12, 34});
         tx.commit();
     }
@@ -173,26 +202,26 @@ TEST_CASE("component row reuse after remove does not leak stale index state") {
     REQUIRE(registry.remove<IndexedPosition>(first));
 
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(second, IndexedPosition{56, 78});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     auto positions = tx.storage<IndexedPosition>();
     REQUIRE_FALSE(tx.has<IndexedPosition>(first));
-    REQUIRE(positions.find_one<XYUniqueIndex>(12, 34) == ecs::null_entity);
-    REQUIRE(positions.find_one<XYUniqueIndex>(56, 78) == second);
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(12, 34) == ecs::null_entity);
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(56, 78) == second);
 }
 
 TEST_CASE("concurrent transactions enforce unique indexes against newly committed rows") {
-    ecs::Registry registry(4);
+    auto registry = make_index_mvcc_registry();
 
     const ecs::Entity first = registry.create();
     const ecs::Entity second = registry.create();
 
-    auto older = registry.transaction();
-    auto newer = registry.transaction();
+    auto older = registry.transaction<IndexedPosition, Velocity>();
+    auto newer = registry.transaction<IndexedPosition, Velocity>();
 
     older.write<IndexedPosition>(first, IndexedPosition{90, 91});
     newer.write<IndexedPosition>(second, IndexedPosition{90, 91});
@@ -200,9 +229,106 @@ TEST_CASE("concurrent transactions enforce unique indexes against newly committe
     newer.commit();
     REQUIRE_THROWS_AS(older.commit(), std::invalid_argument);
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     auto positions = tx.storage<IndexedPosition>();
-    REQUIRE(positions.find_one<XYUniqueIndex>(90, 91) == second);
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(90, 91) == second);
+}
+
+TEST_CASE("trace indexed components keep indexes in sync across rollback tombstones and compaction") {
+    ecs::Registry registry(4);
+    registry.set_storage_mode<IndexedPosition>(ecs::ComponentStorageMode::trace);
+    registry.set_trace_max_history(5);
+
+    const ecs::Entity entity = registry.create();
+
+    registry.set_current_trace_time(1);
+    {
+        auto tx = registry.transaction<IndexedPosition>();
+        tx.write<IndexedPosition>(entity, IndexedPosition{10, 11});
+        tx.commit();
+    }
+
+    registry.set_current_trace_time(2);
+    {
+        auto tx = registry.transaction<IndexedPosition>();
+        tx.write<IndexedPosition>(entity, IndexedPosition{20, 21});
+        tx.commit();
+    }
+
+    {
+        auto tx = registry.transaction<IndexedPosition>();
+        auto positions = tx.storage<IndexedPosition>();
+        REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(10, 11) == ecs::null_entity);
+        REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(20, 21) == entity);
+    }
+
+    registry.set_current_trace_time(3);
+    REQUIRE(registry.rollback_to_timestamp<IndexedPosition>(entity, 1));
+
+    {
+        auto tx = registry.transaction<IndexedPosition>();
+        auto positions = tx.storage<IndexedPosition>();
+        REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(10, 11) == entity);
+        REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(20, 21) == ecs::null_entity);
+    }
+
+    registry.set_current_trace_time(4);
+    REQUIRE(registry.remove<IndexedPosition>(entity));
+
+    {
+        auto tx = registry.transaction<IndexedPosition>();
+        auto positions = tx.storage<IndexedPosition>();
+        REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(10, 11) == ecs::null_entity);
+        REQUIRE(positions.find_all<&IndexedPosition::x>(10).empty());
+    }
+
+    registry.set_current_trace_time(7);
+    {
+        auto tx = registry.transaction<IndexedPosition>();
+        auto positions = tx.storage<IndexedPosition>();
+        REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(10, 11) == ecs::null_entity);
+        REQUIRE(positions.find_all<&IndexedPosition::x>(10).empty());
+    }
+
+    registry.set_current_trace_time(8);
+    REQUIRE(registry.rollback_to_timestamp<IndexedPosition>(entity, 3));
+
+    auto tx = registry.transaction<IndexedPosition>();
+    auto positions = tx.storage<IndexedPosition>();
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(10, 11) == entity);
+    REQUIRE(positions.find_all<&IndexedPosition::x>(10) == std::vector<ecs::Entity>{entity});
+}
+
+TEST_CASE("trace indexed components compact history independently per entity") {
+    ecs::Registry registry(4);
+    registry.set_storage_mode<IndexedPosition>(ecs::ComponentStorageMode::trace);
+    registry.set_trace_max_history(2);
+
+    const ecs::Entity first = registry.create();
+    const ecs::Entity second = registry.create();
+
+    registry.set_current_trace_time(1);
+    {
+        auto tx = registry.transaction<IndexedPosition>();
+        tx.write<IndexedPosition>(first, IndexedPosition{1, 1});
+        tx.write<IndexedPosition>(second, IndexedPosition{2, 2});
+        tx.commit();
+    }
+
+    registry.set_current_trace_time(4);
+    {
+        auto tx = registry.transaction<IndexedPosition>();
+        tx.write<IndexedPosition>(first, IndexedPosition{4, 4});
+        tx.write<IndexedPosition>(second, IndexedPosition{5, 5});
+        tx.commit();
+    }
+
+    auto tx = registry.transaction<IndexedPosition>();
+    auto positions = tx.storage<IndexedPosition>();
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(4, 4) == first);
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(5, 5) == second);
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(1, 1) == ecs::null_entity);
+    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(2, 2) == ecs::null_entity);
 }
 
 TEST_CASE("transaction storage explain prefers an index seek for keyed lookups") {
@@ -212,16 +338,16 @@ TEST_CASE("transaction storage explain prefers an index seek for keyed lookups")
     const ecs::Entity second = registry.create();
     const ecs::Entity third = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{10, 2});
         tx.write<IndexedPosition>(third, IndexedPosition{30, 3});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     auto positions = tx.storage<IndexedPosition>();
-    const ecs::QueryExplain explain = positions.explain_find<XIndex>(10);
+    const ecs::QueryExplain explain = positions.explain_find<&IndexedPosition::x>(10);
 
     REQUIRE_FALSE(explain.empty);
     REQUIRE(explain.uses_component_indexes);
@@ -241,13 +367,13 @@ TEST_CASE("transaction storage explain prefers a scan for full iteration even wi
     const ecs::Entity first = registry.create();
     const ecs::Entity second = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{20, 2});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     auto positions = tx.storage<IndexedPosition>();
     const ecs::QueryExplain explain = positions.explain();
 
@@ -263,6 +389,30 @@ TEST_CASE("transaction storage explain prefers a scan for full iteration even wi
     REQUIRE(explain.steps[0].visible_rows == 2);
 }
 
+TEST_CASE("transaction storage explain scans when a field lookup is not selective") {
+    ecs::Registry registry(4);
+
+    const ecs::Entity first = registry.create();
+    const ecs::Entity second = registry.create();
+    {
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
+        tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
+        tx.write<IndexedPosition>(second, IndexedPosition{10, 2});
+        tx.commit();
+    }
+
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
+    auto positions = tx.storage<IndexedPosition>();
+    const ecs::QueryExplain explain = positions.explain_find<&IndexedPosition::x>(10);
+
+    REQUIRE_FALSE(explain.empty);
+    REQUIRE_FALSE(explain.uses_component_indexes);
+    REQUIRE(explain.candidate_rows == 2);
+    REQUIRE(explain.steps.size() == 1);
+    REQUIRE(explain.steps[0].access == ecs::QueryAccessKind::anchor_scan);
+    REQUIRE_FALSE(explain.steps[0].uses_component_index);
+}
+
 TEST_CASE("plain view explain stays on scans without a selective predicate even if indexes exist") {
     ecs::Registry registry(4);
 
@@ -270,14 +420,14 @@ TEST_CASE("plain view explain stays on scans without a selective predicate even 
     const ecs::Entity second = registry.create();
     const ecs::Entity third = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{10, 2});
         tx.write<IndexedPosition>(third, IndexedPosition{30, 3});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     const ecs::QueryExplain explain = tx.view<const IndexedPosition>().explain();
 
     REQUIRE_FALSE(explain.empty);
@@ -297,14 +447,14 @@ TEST_CASE("predicate view explain uses an index for selective equality") {
     const ecs::Entity second = registry.create();
     const ecs::Entity third = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{10, 2});
         tx.write<IndexedPosition>(third, IndexedPosition{30, 3});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     const ecs::QueryExplain explain = tx.view<const IndexedPosition>().where_eq<&IndexedPosition::x>(10).explain();
 
     REQUIRE_FALSE(explain.empty);
@@ -323,13 +473,13 @@ TEST_CASE("predicate view explain keeps a scan for unselective equality") {
     const ecs::Entity first = registry.create();
     const ecs::Entity second = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{10, 2});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     const ecs::QueryExplain explain = tx.view<const IndexedPosition>().where_eq<&IndexedPosition::x>(10).explain();
 
     REQUIRE_FALSE(explain.empty);
@@ -347,7 +497,7 @@ TEST_CASE("predicate view explain uses an index for selective ranges and scans f
     const ecs::Entity third = registry.create();
     const ecs::Entity fourth = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{1, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{2, 2});
         tx.write<IndexedPosition>(third, IndexedPosition{3, 3});
@@ -355,7 +505,7 @@ TEST_CASE("predicate view explain uses an index for selective ranges and scans f
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     const ecs::QueryExplain gt_explain = tx.view<const IndexedPosition>().where_gt<&IndexedPosition::x>(50).explain();
     REQUIRE_FALSE(gt_explain.empty);
     REQUIRE(gt_explain.uses_component_indexes);
@@ -375,13 +525,13 @@ TEST_CASE("predicate views filter correctly and include staged rows") {
     const ecs::Entity second = registry.create();
     const ecs::Entity third = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{20, 2});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     tx.write<IndexedPosition>(third, IndexedPosition{30, 3});
 
     std::vector<ecs::Entity> seen;
@@ -403,7 +553,7 @@ TEST_CASE("predicate views support OR across indexed predicates") {
     const ecs::Entity third = registry.create();
     const ecs::Entity fourth = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{20, 2});
         tx.write<IndexedPosition>(third, IndexedPosition{30, 3});
@@ -411,7 +561,7 @@ TEST_CASE("predicate views support OR across indexed predicates") {
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     std::vector<ecs::Entity> seen;
     tx.view<const IndexedPosition>()
         .where_eq<&IndexedPosition::x>(10)
@@ -438,7 +588,7 @@ TEST_CASE("predicate views support arbitrary nested boolean groups") {
     const ecs::Entity fourth = registry.create();
     const ecs::Entity fifth = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{20, 2});
         tx.write<IndexedPosition>(third, IndexedPosition{30, 3});
@@ -447,7 +597,7 @@ TEST_CASE("predicate views support arbitrary nested boolean groups") {
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     std::vector<ecs::Entity> seen;
     tx.view<const IndexedPosition>()
         .and_group([&](auto q) {
@@ -474,7 +624,7 @@ TEST_CASE("predicate view explain uses indexes for selective lt lte and gte rang
     const ecs::Entity fourth = registry.create();
     const ecs::Entity fifth = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{20, 2});
         tx.write<IndexedPosition>(third, IndexedPosition{30, 3});
@@ -483,7 +633,7 @@ TEST_CASE("predicate view explain uses indexes for selective lt lte and gte rang
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
 
     const ecs::QueryExplain lt_explain = tx.view<const IndexedPosition>().where_lt<&IndexedPosition::x>(15).explain();
     REQUIRE_FALSE(lt_explain.empty);
@@ -511,14 +661,14 @@ TEST_CASE("predicate view explain keeps scans for non indexed members and not eq
     const ecs::Entity second = registry.create();
     const ecs::Entity third = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 100});
         tx.write<IndexedPosition>(second, IndexedPosition{20, 200});
         tx.write<IndexedPosition>(third, IndexedPosition{30, 300});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
 
     const ecs::QueryExplain y_eq_explain = tx.view<const IndexedPosition>().where_eq<&IndexedPosition::y>(200).explain();
     REQUIRE_FALSE(y_eq_explain.empty);
@@ -548,7 +698,7 @@ TEST_CASE("predicate planner uses indexed seeds for mixed AND but scans for mixe
     const ecs::Entity third = registry.create();
     const ecs::Entity fourth = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{10, 2});
         tx.write<IndexedPosition>(third, IndexedPosition{20, 2});
@@ -556,7 +706,7 @@ TEST_CASE("predicate planner uses indexed seeds for mixed AND but scans for mixe
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
 
     const ecs::QueryExplain and_explain =
         tx.view<const IndexedPosition>().where_eq<&IndexedPosition::x>(10).where_eq<&IndexedPosition::y>(2).explain();
@@ -600,7 +750,7 @@ TEST_CASE("predicate planner unions overlapping OR seeds without duplicates and 
     const ecs::Entity fourth = registry.create();
     const ecs::Entity fifth = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{20, 2});
         tx.write<IndexedPosition>(third, IndexedPosition{30, 3});
@@ -609,7 +759,7 @@ TEST_CASE("predicate planner unions overlapping OR seeds without duplicates and 
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
 
     std::vector<ecs::Entity> or_seen;
     tx.view<const IndexedPosition>()
@@ -650,13 +800,13 @@ TEST_CASE("predicate planner uses index seeks for selective empty results") {
     const ecs::Entity first = registry.create();
     const ecs::Entity second = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{20, 2});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     const ecs::QueryExplain explain = tx.view<const IndexedPosition>().where_eq<&IndexedPosition::x>(999).explain();
 
     REQUIRE(explain.empty);
@@ -676,7 +826,7 @@ TEST_CASE("predicate view explain marks index seek and sparse probes for multi c
     const ecs::Entity third = registry.create();
     const ecs::Entity fourth = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<Velocity>(first, Velocity{1, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{10, 2});
@@ -687,7 +837,7 @@ TEST_CASE("predicate view explain marks index seek and sparse probes for multi c
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
     const ecs::QueryExplain explain =
         tx.view<const IndexedPosition, const Velocity>().where_eq<&IndexedPosition::x>(40).explain();
 
@@ -718,13 +868,13 @@ TEST_CASE("predicate views keep staged updates consistent across predicate trans
     const ecs::Entity first = registry.create();
     const ecs::Entity second = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
         tx.write<IndexedPosition>(first, IndexedPosition{10, 1});
         tx.write<IndexedPosition>(second, IndexedPosition{20, 2});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
 
     IndexedPosition* first_update = tx.write<IndexedPosition>(first);
     REQUIRE(first_update != nullptr);

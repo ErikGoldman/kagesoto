@@ -26,14 +26,14 @@ TEST_CASE("transaction views iterate matching entities with const component refe
     const ecs::Entity mover = registry.create();
     const ecs::Entity stationary = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<Position, Velocity>();
         tx.write<Position>(mover, Position{10, 20});
         tx.write<Velocity>(mover, Velocity{3, 4});
         tx.write<Position>(stationary, Position{30, 40});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<Position, Velocity>();
     std::vector<ecs::Entity> seen;
     tx.view<Position, const Velocity>().forEach([&](ecs::Entity entity, auto& position, auto& velocity) {
         static_assert(std::is_same_v<decltype(position), const Position&>);
@@ -54,14 +54,14 @@ TEST_CASE("transaction views include staged component writes before commit") {
     const ecs::Entity mover = registry.create();
     const ecs::Entity staged = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<Position, Velocity>();
         tx.write<Position>(mover, Position{1, 2});
         tx.write<Velocity>(mover, Velocity{3, 4});
         tx.write<Position>(staged, Position{5, 6});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<Position, Velocity>();
     tx.write<Velocity>(staged, Velocity{7, 8});
 
     std::vector<ecs::Entity> seen;
@@ -80,13 +80,13 @@ TEST_CASE("transaction views observe staged updates through the same transaction
 
     const ecs::Entity entity = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<Position, Velocity>();
         tx.write<Position>(entity, Position{1, 2});
         tx.write<Velocity>(entity, Velocity{3, 4});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<Position, Velocity>();
     Velocity* velocity = tx.write<Velocity>(entity);
     REQUIRE(velocity != nullptr);
     velocity->dx = 30;
@@ -111,7 +111,7 @@ TEST_CASE("transaction view explain reports the smallest visible component as th
     const ecs::Entity second = registry.create();
     const ecs::Entity third = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<Position, Velocity>();
         tx.write<Position>(first, Position{1, 1});
         tx.write<Velocity>(first, Velocity{10, 10});
         tx.write<Position>(second, Position{2, 2});
@@ -120,7 +120,7 @@ TEST_CASE("transaction view explain reports the smallest visible component as th
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<Position, Velocity>();
     const ecs::QueryExplain explain = tx.view<const Position, const Velocity>().explain();
 
     REQUIRE_FALSE(explain.empty);
@@ -142,12 +142,12 @@ TEST_CASE("transaction view explain accounts for staged writes and empty inputs"
 
     const ecs::Entity entity = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<Position, Velocity>();
         tx.write<Position>(entity, Position{7, 8});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<Position, Velocity>();
     tx.write<Velocity>(entity, Velocity{9, 10});
 
     const ecs::QueryExplain explain = tx.view<const Position, const Velocity>().explain();
@@ -159,7 +159,7 @@ TEST_CASE("transaction view explain accounts for staged writes and empty inputs"
 
     ecs::Registry empty_registry(4);
     const ecs::Entity other = empty_registry.create();
-    auto empty_tx = empty_registry.transaction();
+    auto empty_tx = empty_registry.transaction<Position, Velocity>();
     empty_tx.write<Position>(other, Position{1, 2});
     const ecs::QueryExplain empty_explain = empty_tx.view<const Position, const Velocity>().explain();
     REQUIRE(empty_explain.empty);
@@ -173,14 +173,14 @@ TEST_CASE("transaction view explain text describes scans and lack of component i
     const ecs::Entity first = registry.create();
     const ecs::Entity second = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<Position, Velocity>();
         tx.write<Position>(first, Position{1, 2});
         tx.write<Velocity>(first, Velocity{3, 4});
         tx.write<Velocity>(second, Velocity{5, 6});
         tx.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<Position, Velocity>();
     const std::string explain = tx.view<const Position, const Velocity>().explain_text();
 
     REQUIRE(explain.find("EXPLAIN VIEW") != std::string::npos);
@@ -195,7 +195,7 @@ TEST_CASE("transaction view explain text marks empty results") {
     ecs::Registry registry(4);
     const ecs::Entity entity = registry.create();
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<Position, Velocity>();
     tx.write<Position>(entity, Position{1, 2});
 
     const std::string explain = tx.view<const Position, const Velocity>().explain_text();

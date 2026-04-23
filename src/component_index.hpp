@@ -72,6 +72,15 @@ struct ComponentIndexSpec<Unique, FirstMember, RestMembers...> {
     }
 };
 
+template <typename IndexSpec, auto... Members>
+struct index_matches_members : std::false_type {};
+
+template <bool Unique, auto... IndexedMembers, auto... Members>
+struct index_matches_members<ComponentIndexSpec<Unique, IndexedMembers...>, Members...>
+    : std::is_same<
+          std::tuple<std::integral_constant<decltype(IndexedMembers), IndexedMembers>...>,
+          std::tuple<std::integral_constant<decltype(Members), Members>...>> {};
+
 template <typename IndexSpec, typename... Parts>
 typename IndexSpec::key_type make_index_key(Parts&&... parts) {
     if constexpr (sizeof...(Parts) == 1 &&
@@ -154,6 +163,9 @@ inline constexpr bool tuple_contains_v = (std::is_same_v<Query, Declared> || ...
 template <auto Member, typename... Declared>
 struct member_index_spec;
 
+template <typename Tuple, auto... Members>
+struct tuple_member_pack_index_spec;
+
 template <auto Member, typename Tuple>
 struct tuple_member_index_spec;
 
@@ -180,6 +192,19 @@ struct member_index_spec<Member, First, Rest...> {
 template <auto Member, typename... Declared>
 struct tuple_member_index_spec<Member, std::tuple<Declared...>> {
     using type = typename member_index_spec<Member, Declared...>::type;
+};
+
+template <auto... Members>
+struct tuple_member_pack_index_spec<std::tuple<>, Members...> {
+    using type = void;
+};
+
+template <typename First, typename... Rest, auto... Members>
+struct tuple_member_pack_index_spec<std::tuple<First, Rest...>, Members...> {
+    using type = std::conditional_t<
+        index_matches_members<First, Members...>::value,
+        First,
+        typename tuple_member_pack_index_spec<std::tuple<Rest...>, Members...>::type>;
 };
 
 template <typename Component, typename Tuple>
@@ -219,7 +244,6 @@ public:
     template <typename IndexSpec>
     Entity find_one(const typename IndexSpec::key_type& key) const {
         static_assert(tuple_contains_v<IndexSpec, IndexSpecs...>, "component does not declare this index");
-        static_assert(IndexSpec::unique, "find_one requires a unique index");
         return std::get<IndexRuntime<IndexSpec>>(indexes_).find_one(key);
     }
 

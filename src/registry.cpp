@@ -76,8 +76,8 @@ bool Registry::destroy(Entity entity) {
     entity_dense_indices_[index] = npos;
 
     for (auto& slot : components_) {
-        if (slot != nullptr) {
-            slot->erase(entity);
+        if (slot.storage != nullptr) {
+            slot.storage->erase(entity, trace_commit_context_);
         }
     }
 
@@ -90,17 +90,19 @@ void Registry::clear() {
     require_no_readers();
 
     for (auto& slot : components_) {
-        delete slot;
-        slot = nullptr;
+        delete slot.storage;
+        slot.storage = nullptr;
     }
 
-    components_.clear();
     current_versions_.clear();
     entity_dense_indices_.clear();
     alive_entities_.clear();
     free_entities_.clear();
     active_transactions_.clear();
     active_readers_ = 0;
+    classic_access_.clear();
+    snapshot_classic_readers_ = 0;
+    recompute_classic_mode_flag();
     next_entity_index_ = 0;
     next_tsn_ = 1;
 }
@@ -133,7 +135,7 @@ const void* Registry::try_get(Entity entity, ComponentId component) const {
         return nullptr;
     }
 
-    const RawPagedSparseArray* slot = components_[component];
+    const RawPagedSparseArray* slot = components_[component].storage;
     return slot != nullptr ? slot->try_get_raw(entity) : nullptr;
 }
 
@@ -144,22 +146,22 @@ bool Registry::remove(Entity entity, ComponentId component) {
         return false;
     }
 
-    RawPagedSparseArray* slot = components_[component];
-    return slot != nullptr && slot->erase(entity);
+    RawPagedSparseArray* slot = components_[component].storage;
+    return slot != nullptr && slot->erase(entity, trace_commit_context_);
 }
 
 RawPagedSparseArray* Registry::storage(ComponentId component) {
     if (component >= components_.size()) {
         return nullptr;
     }
-    return components_[component];
+    return components_[component].storage;
 }
 
 const RawPagedSparseArray* Registry::storage(ComponentId component) const {
     if (component >= components_.size()) {
         return nullptr;
     }
-    return components_[component];
+    return components_[component].storage;
 }
 
 RawPagedSparseArray& Registry::assure_storage(
@@ -167,14 +169,19 @@ RawPagedSparseArray& Registry::assure_storage(
     std::size_t component_size,
     std::size_t component_alignment) {
 
-    if (componentId >= components_.size()) {
-        components_.resize(static_cast<std::size_t>(componentId) + 1);
+    ensure_component_slot(componentId);
+
+    ComponentSlot& slot = components_[componentId];
+    if (!slot.mode_configured) {
+        slot.mode = resolved_storage_mode(componentId);
+        slot.mode_configured = true;
+        recompute_classic_mode_flag();
     }
 
-    RawPagedSparseArray* component = components_[componentId];
+    RawPagedSparseArray* component = slot.storage;
     if (component == nullptr) {
-        component = new RawPagedSparseArray(component_size, component_alignment, page_size_);
-        components_[componentId] = component;
+        component = new RawPagedSparseArray(component_size, component_alignment, slot.mode, page_size_);
+        slot.storage = component;
     }
     return *component;
 }
@@ -196,6 +203,38 @@ void Registry::ensure_entity_slot(Entity index) {
     if (required > current_versions_.size()) {
         current_versions_.resize(required, 0);
         entity_dense_indices_.resize(required, npos);
+    }
+}
+
+void Registry::ensure_component_slot(ComponentId componentId) {
+    if (componentId >= components_.size()) {
+        components_.resize(static_cast<std::size_t>(componentId) + 1);
+    }
+}
+
+ComponentStorageMode Registry::resolved_storage_mode(ComponentId componentId) const {
+    if (componentId >= components_.size() || !components_[componentId].mode_configured) {
+        return ComponentStorageMode::mvcc;
+    }
+    return components_[componentId].mode;
+}
+
+void Registry::recompute_classic_mode_flag() {
+    has_classic_storage_mode_ = false;
+    for (const ComponentSlot& slot : components_) {
+        if (slot.mode_configured && slot.mode == ComponentStorageMode::classic) {
+            has_classic_storage_mode_ = true;
+            return;
+        }
+    }
+}
+
+void Registry::compact_trace_history() {
+    for (ComponentSlot& slot : components_) {
+        if (slot.storage == nullptr || slot.mode != ComponentStorageMode::trace) {
+            continue;
+        }
+        slot.storage->compact_trace_history(trace_commit_context_.timestamp, trace_max_history_);
     }
 }
 
@@ -225,6 +264,73 @@ void Registry::register_reader() {
 void Registry::unregister_reader() {
     if (active_readers_ != 0) {
         --active_readers_;
+    }
+}
+
+void Registry::register_snapshot_classic_access() {
+    if (!has_classic_storage_mode_) {
+        return;
+    }
+
+    if (classic_access_.size() < components_.size()) {
+        classic_access_.resize(components_.size());
+    }
+
+    for (std::size_t i = 0; i < components_.size(); ++i) {
+        const ComponentSlot& slot = components_[i];
+        if (!slot.mode_configured || slot.mode != ComponentStorageMode::classic) {
+            continue;
+        }
+
+        ClassicAccessState& state = classic_access_[i];
+        if (state.writers != 0) {
+            throw std::logic_error("classic component storage mode does not allow snapshots while a writer is active");
+        }
+    }
+
+    for (std::size_t i = 0; i < components_.size(); ++i) {
+        const ComponentSlot& slot = components_[i];
+        if (!slot.mode_configured || slot.mode != ComponentStorageMode::classic) {
+            continue;
+        }
+        ++classic_access_[i].readers;
+    }
+
+    ++snapshot_classic_readers_;
+}
+
+void Registry::unregister_snapshot_classic_access() {
+    if (snapshot_classic_readers_ == 0) {
+        return;
+    }
+
+    for (std::size_t i = 0; i < components_.size() && i < classic_access_.size(); ++i) {
+        const ComponentSlot& slot = components_[i];
+        if (!slot.mode_configured || slot.mode != ComponentStorageMode::classic) {
+            continue;
+        }
+        if (classic_access_[i].readers != 0) {
+            --classic_access_[i].readers;
+        }
+    }
+
+    --snapshot_classic_readers_;
+}
+
+void Registry::unregister_classic_access(const std::vector<ClassicAccessRegistration>& registrations) {
+    for (const ClassicAccessRegistration& registration : registrations) {
+        if (registration.component >= classic_access_.size()) {
+            continue;
+        }
+
+        ClassicAccessState& state = classic_access_[registration.component];
+        if (registration.writer) {
+            if (state.writers != 0) {
+                --state.writers;
+            }
+        } else if (state.readers != 0) {
+            --state.readers;
+        }
     }
 }
 

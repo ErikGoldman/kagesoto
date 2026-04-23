@@ -39,7 +39,7 @@ void create_entities_with_stress_components(ecs::Registry& registry,
 
     for (std::size_t i = 0; i < entity_count; ++i) {
         const ecs::Entity entity = registry.create();
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, StressReadComponent, StressWriteComponent>();
         PositionComponent* position = tx.write<PositionComponent>(entity);
         VelocityComponent* velocity = tx.write<VelocityComponent>(entity);
         DataComponent* data = tx.write<DataComponent>(entity);
@@ -69,7 +69,7 @@ void create_entities_for_random_add(ecs::Registry& registry,
 
     for (std::size_t i = 0; i < entity_count; ++i) {
         const ecs::Entity entity = registry.create();
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, StressReadComponent, StressWriteComponent>();
         PositionComponent* position = tx.write<PositionComponent>(entity);
         position->x = static_cast<float>(i);
         position->y = static_cast<float>(entity_count - i);
@@ -114,7 +114,7 @@ void BM_IterateAndWriteComponents(benchmark::State& state) {
     create_entities_with_stress_components(registry, entity_count, entities);
 
     for (auto _ : state) {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, StressReadComponent, StressWriteComponent>();
         auto view = tx.view<PositionComponent, VelocityComponent, DataComponent>();
         view.forEach([&tx](ecs::Entity entity,
                            const PositionComponent&,
@@ -147,7 +147,7 @@ void BM_IterateAndRandomlyAddComponent(benchmark::State& state) {
 
         RandomXoshiro128 rng(kRandomAddSeed);
         std::size_t additions = 0;
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, StressReadComponent, StressWriteComponent>();
         auto positions = tx.storage<PositionComponent>();
         positions.each([&](ecs::Entity entity, const PositionComponent& position) {
             if ((rng() & 3u) == 0u && !tx.has<VelocityComponent>(entity)) {
@@ -175,7 +175,7 @@ void BM_IndexedRandomReadsAndWrites(benchmark::State& state) {
     const std::vector<std::size_t> random_indices = build_random_indices(entity_count, kRandomReadSeed);
 
     for (auto _ : state) {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<PositionComponent, VelocityComponent, DataComponent, StressReadComponent, StressWriteComponent>();
         for (const std::size_t index : random_indices) {
             const ecs::Entity entity = entities[index];
             const StressReadComponent* read = tx.try_get<StressReadComponent>(entity);

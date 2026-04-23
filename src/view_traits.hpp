@@ -62,6 +62,13 @@ template <typename Query, typename... Components>
 inline constexpr bool contains_component_v = (std::is_same_v<Query, component_base_t<Components>> || ...);
 
 template <typename Query, typename... Components>
+inline constexpr bool readable_component_v = contains_component_v<component_base_t<Query>, Components...>;
+
+template <typename Query, typename... Components>
+inline constexpr bool writable_component_v =
+    ((std::is_same_v<component_base_t<Query>, component_base_t<Components>> && !std::is_const_v<Components>) || ...);
+
+template <typename Query, typename... Components>
 struct component_index_of;
 
 template <typename Query, typename... Rest>

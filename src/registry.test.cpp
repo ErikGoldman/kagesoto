@@ -17,7 +17,20 @@ struct Velocity {
     int dy;
 };
 
+struct ClassicByTrait {
+    int value;
+};
+
 }  // namespace
+
+namespace ecs {
+
+template <>
+struct ComponentStorageModeTraits<ClassicByTrait> {
+    static constexpr ComponentStorageMode value = ComponentStorageMode::classic;
+};
+
+}  // namespace ecs
 
 TEST_CASE("component ids are stable and distinct per component type") {
     static_assert(std::is_same_v<ecs::ComponentId, std::uint32_t>);
@@ -32,6 +45,25 @@ TEST_CASE("component ids are stable and distinct per component type") {
     REQUIRE(position_id != velocity_id);
 }
 
+TEST_CASE("component storage modes default to classic and can be configured per component") {
+    ecs::Registry registry(4);
+
+    REQUIRE(registry.storage_mode<Position>() == ecs::ComponentStorageMode::classic);
+    REQUIRE(registry.storage_mode<ClassicByTrait>() == ecs::ComponentStorageMode::classic);
+
+    registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::trace);
+    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::mvcc);
+    REQUIRE(registry.storage_mode<Position>() == ecs::ComponentStorageMode::mvcc);
+    REQUIRE(registry.storage_mode<Velocity>() == ecs::ComponentStorageMode::trace);
+
+    const ecs::Entity entity = registry.create();
+    auto tx = registry.transaction<Position, Velocity>();
+    tx.write<Position>(entity, Position{1, 2});
+    tx.commit();
+
+    REQUIRE_THROWS_AS(registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace), std::logic_error);
+}
+
 TEST_CASE("registry creates recycles and removes entities and components") {
     ecs::Registry registry(4);
 
@@ -42,7 +74,7 @@ TEST_CASE("registry creates recycles and removes entities and components") {
     REQUIRE(registry.alive(entity));
     REQUIRE(registry.entity_count() == 1);
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<Position, Velocity>();
     Position* position = tx.write<Position>(entity, Position{5, 11});
     REQUIRE(position != nullptr);
     REQUIRE(position->x == 5);
@@ -50,7 +82,7 @@ TEST_CASE("registry creates recycles and removes entities and components") {
     tx.commit();
 
     {
-        auto read_tx = registry.transaction();
+        auto read_tx = registry.transaction<Position, Velocity>();
         REQUIRE(read_tx.has<Position>(entity));
 
         std::vector<ecs::Entity> seen;
@@ -63,7 +95,7 @@ TEST_CASE("registry creates recycles and removes entities and components") {
 
     REQUIRE(registry.remove<Position>(entity));
     {
-        auto after_remove_tx = registry.transaction();
+        auto after_remove_tx = registry.transaction<Position, Velocity>();
         REQUIRE_FALSE(after_remove_tx.has<Position>(entity));
     }
 
@@ -83,7 +115,7 @@ TEST_CASE("registry stale entities fail liveness and component lookups after ind
 
     const ecs::Entity first = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<Position, Velocity>();
         tx.write<Position>(first, Position{1, 2});
         tx.commit();
     }
@@ -92,12 +124,12 @@ TEST_CASE("registry stale entities fail liveness and component lookups after ind
 
     const ecs::Entity second = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<Position, Velocity>();
         tx.write<Position>(second, Position{3, 4});
         tx.commit();
     }
 
-    auto read_tx = registry.transaction();
+    auto read_tx = registry.transaction<Position, Velocity>();
     REQUIRE(ecs::entity_index(second) == ecs::entity_index(first));
     REQUIRE(ecs::entity_version(second) != ecs::entity_version(first));
     REQUIRE_FALSE(registry.alive(first));
@@ -111,7 +143,7 @@ TEST_CASE("transactions support component lookups by explicit component id") {
 
     const ecs::Entity entity = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<Position, Velocity>();
         tx.write<Position>(entity, Position{7, 9});
         tx.commit();
     }
@@ -120,7 +152,7 @@ TEST_CASE("transactions support component lookups by explicit component id") {
     const ecs::ComponentId velocity_id = ecs::component_id<Velocity>();
 
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<Position, Velocity>();
         REQUIRE(tx.has(entity, position_id));
         REQUIRE_FALSE(tx.has(entity, velocity_id));
 
@@ -132,7 +164,7 @@ TEST_CASE("transactions support component lookups by explicit component id") {
 
     REQUIRE(registry.remove(entity, position_id));
     {
-        auto after_remove_tx = registry.transaction();
+        auto after_remove_tx = registry.transaction<Position, Velocity>();
         REQUIRE_FALSE(after_remove_tx.has(entity, position_id));
     }
     REQUIRE_FALSE(registry.remove(entity, position_id));
@@ -142,7 +174,7 @@ TEST_CASE("registry structural mutations throw while a snapshot is open") {
     ecs::Registry registry(4);
     const ecs::Entity entity = registry.create();
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<Position, Velocity>();
         tx.write<Position>(entity, Position{1, 2});
         tx.commit();
     }
@@ -158,12 +190,12 @@ TEST_CASE("registry structural mutations throw while a transaction is open") {
     ecs::Registry registry(4);
     const ecs::Entity entity = registry.create();
     {
-        auto seed = registry.transaction();
+        auto seed = registry.transaction<Position, Velocity>();
         seed.write<Position>(entity, Position{1, 2});
         seed.commit();
     }
 
-    auto tx = registry.transaction();
+    auto tx = registry.transaction<Position, Velocity>();
     REQUIRE_THROWS_AS(registry.create(), std::logic_error);
     REQUIRE_THROWS_AS(registry.destroy(entity), std::logic_error);
     REQUIRE_THROWS_AS(registry.remove<Position>(entity), std::logic_error);
@@ -175,7 +207,7 @@ TEST_CASE("registry structural mutations are allowed again after readers close")
     const ecs::Entity entity = registry.create();
 
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<Position, Velocity>();
         tx.write<Position>(entity, Position{1, 2});
         tx.commit();
     }
@@ -187,7 +219,7 @@ TEST_CASE("registry structural mutations are allowed again after readers close")
     REQUIRE(registry.create() != ecs::null_entity);
 
     {
-        auto tx = registry.transaction();
+        auto tx = registry.transaction<Position, Velocity>();
         REQUIRE_THROWS_AS(registry.remove<Position>(entity), std::logic_error);
         tx.rollback();
     }
