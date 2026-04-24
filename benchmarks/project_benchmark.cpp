@@ -42,8 +42,8 @@ struct TransientEffect {
     std::uint32_t ttl{0};
 };
 
-using SceneXIndex = ecs::Index<&IndexedScenePosition::x>;
-using SceneXYUniqueIndex = ecs::UniqueIndex<&IndexedScenePosition::x, &IndexedScenePosition::y>;
+using SceneXIndex = ecs::FlatIndex<&IndexedScenePosition::x>;
+using SceneXYUniqueIndex = ecs::OptimizedUniqueIndex<&IndexedScenePosition::x, &IndexedScenePosition::y>;
 
 constexpr std::int64_t kProjectMaxEntitiesRange = 262'144;
 constexpr std::int32_t kWorldWidth = 2048;

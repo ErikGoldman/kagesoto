@@ -43,6 +43,7 @@ inline void AddCommonContext(bool add_more_complex_systems) {
     benchmark::AddCustomContext("framework.name", kFrameworkName);
     benchmark::AddCustomContext("framework.version", ECS_BENCHMARK_VERSION);
     benchmark::AddCustomContext("options.add_more_complex_system", add_more_complex_systems ? "true" : "false");
+    benchmark::AddCustomContext("index.default_backend", ECS_INDEX_BACKEND_NAME);
 }
 
 class RandomXoshiro128 {

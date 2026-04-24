@@ -7,6 +7,8 @@ build_dir="${repo_root}/build/bench"
 build_type="${BUILD_TYPE:-RelWithDebInfo}"
 profiling="OFF"
 gprof="OFF"
+index_backend="${ECS_INDEX_BACKEND:-flat_sorted}"
+custom_build_dir="false"
 targets=(
   ecs_benchmark_entities
   ecs_benchmark_basic
@@ -30,6 +32,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --build-dir)
       build_dir="$2"
+      custom_build_dir="true"
       shift 2
       ;;
     --build-type)
@@ -40,9 +43,13 @@ while [[ $# -gt 0 ]]; do
       targets=("$2")
       shift 2
       ;;
+    --index-backend)
+      index_backend="$2"
+      shift 2
+      ;;
     --help)
       cat <<'EOF'
-Usage: build.sh [--profiling] [--gprof] [--build-dir DIR] [--build-type TYPE] [--target NAME]
+Usage: build.sh [--profiling] [--gprof] [--build-dir DIR] [--build-type TYPE] [--target NAME] [--index-backend NAME]
 EOF
       exit 0
       ;;
@@ -52,6 +59,25 @@ EOF
       ;;
   esac
 done
+
+case "${index_backend}" in
+  optimized_bplus|flat_sorted)
+    ;;
+  *)
+    echo "Unknown index backend: ${index_backend}" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${custom_build_dir}" != "true" ]]; then
+  if [[ "${profiling}" == "ON" ]]; then
+    build_dir="${repo_root}/build/prof-${index_backend}"
+  elif [[ "${gprof}" == "ON" ]]; then
+    build_dir="${repo_root}/build/gprof-${index_backend}"
+  else
+    build_dir="${repo_root}/build/bench-${index_backend}"
+  fi
+fi
 
 mkdir -p "${build_dir}"
 
@@ -63,6 +89,7 @@ cmake_args=(
   -DBUILD_TESTING=OFF
   -DECS_BUILD_BENCHMARKS=ON
   -DECS_BUILD_PROFILING="${profiling}"
+  -DECS_INDEX_BACKEND="${index_backend}"
 )
 
 if [[ "${gprof}" == "ON" ]]; then

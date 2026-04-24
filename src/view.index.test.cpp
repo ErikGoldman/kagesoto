@@ -17,11 +17,31 @@ struct Velocity {
     std::int32_t dy;
 };
 
-using XIndex = ecs::Index<&IndexedPosition::x>;
-using XYUniqueIndex = ecs::UniqueIndex<&IndexedPosition::x, &IndexedPosition::y>;
+struct Sprite {
+    char glyph;
+};
+
+struct CombatStats {
+    std::int32_t hp;
+    std::int32_t max_hp;
+    std::int32_t atk;
+    std::int32_t def;
+};
+
+struct AiState {
+    std::uint32_t seed;
+    std::uint32_t phase;
+};
+
+struct TransientEffect {
+    std::uint32_t ttl;
+};
+
+using XIndex = ecs::FlatIndex<&IndexedPosition::x>;
+using XYUniqueIndex = ecs::OptimizedUniqueIndex<&IndexedPosition::x, &IndexedPosition::y>;
 
 ecs::Registry make_index_mvcc_registry() {
-    ecs::Registry registry(4);
+    ecs::Registry registry;
     registry.set_storage_mode<IndexedPosition>(ecs::ComponentStorageMode::mvcc);
     registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::mvcc);
     return registry;
@@ -58,6 +78,130 @@ TEST_CASE("transaction storage supports indexed lookup on single and compound ke
     REQUIRE(positions.find_all<&IndexedPosition::x, &IndexedPosition::y>(10, 2) == std::vector<ecs::Entity>{second});
     REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(30, 3) == third);
     REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(99, 99) == ecs::null_entity);
+}
+
+TEST_CASE("grouped indexed iteration can stage position updates without violating unique keys") {
+    ecs::Registry registry(4);
+    registry.group<IndexedPosition, Velocity>();
+
+    std::vector<ecs::Entity> entities;
+    entities.reserve(8);
+    for (std::size_t i = 0; i < 8; ++i) {
+        entities.push_back(registry.create());
+    }
+
+    {
+        auto tx = registry.transaction<IndexedPosition, Velocity, Sprite, CombatStats, AiState, TransientEffect>();
+        for (std::size_t i = 0; i < entities.size(); ++i) {
+            IndexedPosition* position = tx.write<IndexedPosition>(entities[i]);
+            position->x = static_cast<std::int32_t>(i * 17);
+            position->y = static_cast<std::int32_t>(i);
+
+            Velocity* velocity = tx.write<Velocity>(entities[i]);
+            velocity->dx = static_cast<std::int32_t>((i % 7u) + 1u);
+            velocity->dy = 0;
+
+            Sprite* sprite = tx.write<Sprite>(entities[i]);
+            sprite->glyph = 'm';
+        }
+        tx.commit();
+    }
+
+    for (std::size_t iteration = 0; iteration < 16; ++iteration) {
+        auto tx = registry.transaction<IndexedPosition, Velocity, Sprite, CombatStats, AiState, TransientEffect>();
+        std::vector<ecs::Entity> seen;
+        tx.view<const IndexedPosition, const Velocity>().forEach([&](ecs::Entity entity, const IndexedPosition& position, const Velocity& velocity) {
+            seen.push_back(entity);
+            IndexedPosition* writable = tx.write<IndexedPosition>(entity);
+            writable->x = position.x + velocity.dx;
+            writable->y = position.y;
+        });
+
+        std::sort(seen.begin(), seen.end());
+        REQUIRE(seen == entities);
+        REQUIRE_NOTHROW(tx.commit());
+    }
+}
+
+TEST_CASE("ungrouped indexed iteration can stage position updates without violating unique keys") {
+    ecs::Registry registry(4);
+
+    std::vector<ecs::Entity> entities;
+    entities.reserve(8);
+    for (std::size_t i = 0; i < 8; ++i) {
+        entities.push_back(registry.create());
+    }
+
+    {
+        auto tx = registry.transaction<IndexedPosition, Velocity, Sprite, CombatStats, AiState, TransientEffect>();
+        for (std::size_t i = 0; i < entities.size(); ++i) {
+            IndexedPosition* position = tx.write<IndexedPosition>(entities[i]);
+            position->x = static_cast<std::int32_t>(i * 17);
+            position->y = static_cast<std::int32_t>(i);
+
+            Velocity* velocity = tx.write<Velocity>(entities[i]);
+            velocity->dx = static_cast<std::int32_t>((i % 7u) + 1u);
+            velocity->dy = 0;
+        }
+        tx.commit();
+    }
+
+    for (std::size_t iteration = 0; iteration < 16; ++iteration) {
+        auto tx = registry.transaction<IndexedPosition, Velocity, Sprite, CombatStats, AiState, TransientEffect>();
+        std::vector<ecs::Entity> seen;
+        tx.view<const IndexedPosition, const Velocity>().forEach([&](ecs::Entity entity, const IndexedPosition& position, const Velocity& velocity) {
+            seen.push_back(entity);
+            IndexedPosition* writable = tx.write<IndexedPosition>(entity);
+            writable->x = position.x + velocity.dx;
+            writable->y = position.y;
+        });
+
+        std::sort(seen.begin(), seen.end());
+        REQUIRE(seen == entities);
+        REQUIRE_NOTHROW(tx.commit());
+    }
+}
+
+TEST_CASE("selective range predicate view keeps using an index after repeated execution") {
+    ecs::Registry registry(4);
+
+    std::vector<ecs::Entity> entities;
+    entities.reserve(128);
+    for (std::size_t i = 0; i < 128; ++i) {
+        entities.push_back(registry.create());
+    }
+
+    {
+        auto tx = registry.transaction<IndexedPosition, Velocity>();
+        for (std::size_t i = 0; i < entities.size(); ++i) {
+            tx.write<IndexedPosition>(entities[i], IndexedPosition{static_cast<std::int32_t>(i), static_cast<std::int32_t>(i * 2)});
+        }
+        tx.commit();
+    }
+
+    auto tx = registry.transaction<IndexedPosition, Velocity>();
+    const auto range_view = tx.view<const IndexedPosition>()
+        .where_gte<&IndexedPosition::x>(20)
+        .where_lte<&IndexedPosition::x>(30);
+
+    const ecs::QueryExplain explain = range_view.explain();
+    REQUIRE(explain.uses_component_indexes);
+    REQUIRE(explain.anchor_component == ecs::component_id<IndexedPosition>());
+    REQUIRE(explain.steps.size() == 1);
+    REQUIRE(explain.steps[0].access == ecs::QueryAccessKind::index_seek);
+
+    for (std::size_t iteration = 0; iteration < 3; ++iteration) {
+        std::vector<ecs::Entity> seen;
+        range_view.forEach([&](ecs::Entity entity, const IndexedPosition&) {
+            seen.push_back(entity);
+        });
+
+        std::vector<ecs::Entity> expected;
+        for (std::size_t i = 20; i <= 30; ++i) {
+            expected.push_back(entities[i]);
+        }
+        REQUIRE(seen == expected);
+    }
 }
 
 TEST_CASE("transaction storage lookup can scan non indexed fields and return first matches") {

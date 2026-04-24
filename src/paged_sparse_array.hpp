@@ -248,6 +248,15 @@ public:
         return !visible.found || visible.tombstone ? nullptr : revision_value_ptr(visible.ref->value_index);
     }
 
+    const void* try_get_committed_visible_raw(Entity entity, Timestamp max_visible_tsn) const {
+        const std::size_t dense_index = dense_index_of(entity);
+        if (dense_index == npos) {
+            return nullptr;
+        }
+
+        return try_get_committed_visible_dense_raw(dense_index, max_visible_tsn);
+    }
+
     virtual bool erase(Entity entity, TraceCommitContext trace_context = {}) {
         const std::size_t dense_index = dense_index_of(entity);
         if (dense_index == npos) {
@@ -369,6 +378,24 @@ public:
 
         const VisibleRef visible = visible_ref(dense_index, max_visible_tsn, active_at_open, own_tsn);
         return !visible.found || visible.tombstone ? nullptr : revision_value_ptr(visible.ref->value_index);
+    }
+
+    const void* try_get_committed_visible_dense_raw(std::size_t dense_index, Timestamp max_visible_tsn) const {
+        if (dense_index >= dense_entities_.size() || dense_entities_[dense_index] == null_entity) {
+            return nullptr;
+        }
+
+        if (is_direct_write_storage_mode(mode_)) {
+            return element_ptr(dense_index);
+        }
+
+        const RevisionInfo& header = revision_headers_[dense_index];
+        if (header.latest_committed_valid && !header.has_live_isolated && header.latest_committed.tsn <= max_visible_tsn) {
+            return header.latest_committed.tombstone ? nullptr : revision_value_ptr(header.latest_committed.value_index);
+        }
+
+        const RevisionRef* visible = committed_visible_ref(dense_index, max_visible_tsn);
+        return visible == nullptr || visible->tombstone ? nullptr : revision_value_ptr(visible->value_index);
     }
 
     PendingWrite stage_write(Entity entity,
@@ -501,6 +528,17 @@ protected:
         const RevisionRef* result = nullptr;
         for_each_ref(dense_index, [&](const RevisionRef& ref) {
             if (!ref.voided && !ref.isolated) {
+                result = &ref;
+            }
+            return false;
+        });
+        return result;
+    }
+
+    const RevisionRef* committed_visible_ref(std::size_t dense_index, Timestamp max_visible_tsn) const {
+        const RevisionRef* result = nullptr;
+        for_each_ref(dense_index, [&](const RevisionRef& ref) {
+            if (!ref.voided && !ref.isolated && ref.tsn <= max_visible_tsn) {
                 result = &ref;
             }
             return false;
@@ -1358,7 +1396,7 @@ public:
 
     template <auto... Members, typename... KeyParts>
     std::vector<Entity> find_all(KeyParts&&... key_parts) const {
-        using query_spec = detail::ComponentIndexSpec<false, Members...>;
+        using query_spec = detail::ComponentIndexSpec<detail::default_index_backend_tag, false, Members...>;
         using index_spec = typename detail::tuple_member_pack_index_spec<typename ComponentIndices<T>::type, Members...>::type;
         static_assert(std::is_same_v<typename query_spec::component_type, T>, "find field must belong to the storage component");
 

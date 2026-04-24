@@ -7,8 +7,11 @@ build_dir="${repo_root}/build/gprof_project"
 target="ecs_benchmark_project"
 build_type="${BUILD_TYPE:-RelWithDebInfo}"
 min_time="2s"
+index_backend="${ECS_INDEX_BACKEND:-flat_sorted}"
 timestamp="$(date +%Y%m%d-%H%M%S)"
-out_dir="${repo_root}/artifacts/bench/${timestamp}"
+out_dir="${repo_root}/artifacts/bench/${timestamp}/${index_backend}"
+custom_build_dir="false"
+custom_out_dir="false"
 
 benchmarks=(
   "BM_ComplexSceneFrame/2048"
@@ -28,6 +31,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --build-dir)
       build_dir="$2"
+      custom_build_dir="true"
       shift 2
       ;;
     --build-type)
@@ -44,6 +48,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --out-dir)
       out_dir="$2"
+      custom_out_dir="true"
+      shift 2
+      ;;
+    --index-backend)
+      index_backend="$2"
       shift 2
       ;;
     --benchmark)
@@ -52,7 +61,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --help)
       cat <<'EOF'
-Usage: gprof.sh [--build-dir DIR] [--build-type TYPE] [--target NAME] [--min-time TIME] [--out-dir DIR] [--benchmark NAME]
+Usage: gprof.sh [--build-dir DIR] [--build-type TYPE] [--target NAME] [--min-time TIME] [--out-dir DIR] [--benchmark NAME] [--index-backend NAME]
 EOF
       exit 0
       ;;
@@ -63,11 +72,20 @@ EOF
   esac
 done
 
+if [[ "${custom_build_dir}" != "true" ]]; then
+  build_dir="${repo_root}/build/gprof-${index_backend}"
+fi
+
+if [[ "${custom_out_dir}" != "true" ]]; then
+  out_dir="${repo_root}/artifacts/bench/${timestamp}/${index_backend}"
+fi
+
 bash "${repo_root}/scripts/bench/build.sh" \
   --gprof \
   --build-dir "${build_dir}" \
   --build-type "${build_type}" \
-  --target "${target}"
+  --target "${target}" \
+  --index-backend "${index_backend}"
 
 mkdir -p "${out_dir}"
 

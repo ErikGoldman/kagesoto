@@ -11,6 +11,16 @@ include(CTest)
 option(ECS_BUILD_EXAMPLE "Build the example executable" ON)
 option(ECS_BUILD_BENCHMARKS "Build Google Benchmark suites" OFF)
 option(ECS_BUILD_PROFILING "Build benchmark-friendly profiling instrumentation" OFF)
+set(ECS_INDEX_BACKEND "flat_sorted" CACHE STRING "Internal component index backend")
+set_property(CACHE ECS_INDEX_BACKEND PROPERTY STRINGS optimized_bplus flat_sorted)
+
+if(ECS_INDEX_BACKEND STREQUAL "optimized_bplus")
+    set(ECS_INDEX_BACKEND_VALUE 1)
+elseif(ECS_INDEX_BACKEND STREQUAL "flat_sorted")
+    set(ECS_INDEX_BACKEND_VALUE 2)
+else()
+    message(FATAL_ERROR "ECS_INDEX_BACKEND must be one of: optimized_bplus, flat_sorted")
+endif()
 
 file(GLOB_RECURSE ecs_public_headers CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
@@ -53,6 +63,9 @@ target_include_directories(ecs
 
 target_compile_definitions(ecs
     PRIVATE ECS_BUILDING_LIBRARY
+    PUBLIC
+        ECS_INDEX_BACKEND=${ECS_INDEX_BACKEND_VALUE}
+        ECS_INDEX_BACKEND_NAME="${ECS_INDEX_BACKEND}"
 )
 
 if(NOT BUILD_SHARED_LIBS)

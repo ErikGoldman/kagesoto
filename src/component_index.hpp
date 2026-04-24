@@ -34,15 +34,16 @@ struct member_pointer_traits<Member Component::*> {
     using member_type = Member;
 };
 
-template <bool Unique, auto... Members>
+template <typename BackendTag, bool Unique, auto... Members>
 struct ComponentIndexSpec;
 
-template <bool Unique, auto Member>
-struct ComponentIndexSpec<Unique, Member> {
+template <typename BackendTag, bool Unique, auto Member>
+struct ComponentIndexSpec<BackendTag, Unique, Member> {
     using member_pointer = decltype(Member);
     using pointer_traits = member_pointer_traits<member_pointer>;
     using component_type = typename pointer_traits::component_type;
     using key_type = typename pointer_traits::member_type;
+    using backend_tag = BackendTag;
 
     static constexpr bool unique = Unique;
     static constexpr bool is_single_member = true;
@@ -53,13 +54,14 @@ struct ComponentIndexSpec<Unique, Member> {
     }
 };
 
-template <bool Unique, auto FirstMember, auto... RestMembers>
-struct ComponentIndexSpec<Unique, FirstMember, RestMembers...> {
+template <typename BackendTag, bool Unique, auto FirstMember, auto... RestMembers>
+struct ComponentIndexSpec<BackendTag, Unique, FirstMember, RestMembers...> {
     using first_pointer = decltype(FirstMember);
     using first_traits = member_pointer_traits<first_pointer>;
     using component_type = typename first_traits::component_type;
     using key_type = std::tuple<typename first_traits::member_type,
                                 typename member_pointer_traits<decltype(RestMembers)>::member_type...>;
+    using backend_tag = BackendTag;
 
     static constexpr bool unique = Unique;
     static constexpr bool is_single_member = false;
@@ -75,8 +77,8 @@ struct ComponentIndexSpec<Unique, FirstMember, RestMembers...> {
 template <typename IndexSpec, auto... Members>
 struct index_matches_members : std::false_type {};
 
-template <bool Unique, auto... IndexedMembers, auto... Members>
-struct index_matches_members<ComponentIndexSpec<Unique, IndexedMembers...>, Members...>
+template <typename BackendTag, bool Unique, auto... IndexedMembers, auto... Members>
+struct index_matches_members<ComponentIndexSpec<BackendTag, Unique, IndexedMembers...>, Members...>
     : std::is_same<
           std::tuple<std::integral_constant<decltype(IndexedMembers), IndexedMembers>...>,
           std::tuple<std::integral_constant<decltype(Members), Members>...>> {};
@@ -154,7 +156,7 @@ public:
     }
 
 private:
-    detail::BPlusTree<key_type> tree_{IndexSpec::unique};
+    detail::index_backend_type_t<typename IndexSpec::backend_tag, key_type> tree_{IndexSpec::unique};
 };
 
 template <typename Query, typename... Declared>
@@ -281,9 +283,21 @@ public:
 }  // namespace detail
 
 template <auto... Members>
-using Index = detail::ComponentIndexSpec<false, Members...>;
+using Index = detail::ComponentIndexSpec<detail::default_index_backend_tag, false, Members...>;
 
 template <auto... Members>
-using UniqueIndex = detail::ComponentIndexSpec<true, Members...>;
+using UniqueIndex = detail::ComponentIndexSpec<detail::default_index_backend_tag, true, Members...>;
+
+template <auto... Members>
+using OptimizedIndex = detail::ComponentIndexSpec<index_backend::optimized_bplus, false, Members...>;
+
+template <auto... Members>
+using OptimizedUniqueIndex = detail::ComponentIndexSpec<index_backend::optimized_bplus, true, Members...>;
+
+template <auto... Members>
+using FlatIndex = detail::ComponentIndexSpec<index_backend::flat_sorted, false, Members...>;
+
+template <auto... Members>
+using FlatUniqueIndex = detail::ComponentIndexSpec<index_backend::flat_sorted, true, Members...>;
 
 }  // namespace ecs

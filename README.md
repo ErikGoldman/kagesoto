@@ -1,21 +1,15 @@
 # ECS
 
-ECS is a C++17 entity component system library built around 64-bit entity IDs, paged sparse arrays, typed transactions, snapshots, query views, and optional component indexes.
-
-Entity IDs use 59 low bits for the sparse-array index and 5 high bits for a recycled-version counter. That keeps handles compact while still detecting stale handles after an entity index is reused.
-
-## Optimized For
-
-- Fast component lookups from sparse entity IDs without allocating one huge sparse array.
-- Dense component storage for cache-friendly iteration.
-- Stale entity detection through versioned 64-bit entity handles.
-- Transactional reads and writes with snapshot visibility in MVCC mode.
-- Selective lookups through optional B+ tree-backed component indexes.
-- Configurable storage behavior per component when rollback, raw write speed, or timestamped history matter more.
+Kagesoto is a C++17 ECS based on sparse lists with a few unusual features:
+* First-class support for singletons
+* Can rewind the system to previous states (for e.g. debugging)
+* Optional MVCC for transactional writes
+* Indexed fields for selective queries
+* Group support to optimize multi-component views
 
 ## Quick Start
 
-Include the aggregate header, define trivially copyable component types, create entities, and write components through a typed transaction.
+Include the aggregate header, define component structs, create entities, and write through a transaction.
 
 ```cpp
 #include "ecs/ecs.hpp"
@@ -25,69 +19,44 @@ struct Position {
     float y;
 };
 
+struct Velocity {
+    float dx;
+    float dy;
+};
+
 int main() {
     ecs::Registry registry;
-
     const ecs::Entity player = registry.create();
 
-    auto tx = registry.transaction<Position>();
-    tx.write<Position>(player, Position{10.0f, 20.0f});
+    {
+        auto tx = registry.transaction<Position, Velocity>();
+        tx.write<Position>(player, Position{10.0f, 20.0f});
+        tx.write<Velocity>(player, Velocity{1.0f, 0.0f});
+        tx.commit();
+    }
+
+    auto tx = registry.transaction<Position, Velocity>();
+    if (const Velocity* velocity = tx.try_get<Velocity>(player)) {
+        Position* position = tx.write<Position>(player);
+        position->x += velocity->dx;
+        position->y += velocity->dy;
+    }
     tx.commit();
-
-    auto read_tx = registry.transaction<Position>();
-    const Position& position = read_tx.get<Position>(player);
-
-    return position.x > 0.0f ? 0 : 1;
 }
 ```
 
-Transactions must declare the components they can access. A non-const declaration allows `tx.write<T>()`; a const declaration is read-only. View callbacks receive const component references, so mutate components by calling `tx.write<T>()` inside the transaction.
-
-Singleton components are declared with `ecs::ComponentSingletonTraits<T>`. They exist exactly once per registry, are default-constructed when first accessed, and use no entity ID for reads or writes.
-
-## Core Concepts
-
-- `ecs::Registry` owns entities, component storage, transactions, snapshots, and storage-mode settings.
-- `ecs::Entity` is a 64-bit handle. Use `registry.alive(entity)` when accepting handles from outside the current flow.
-- Components are plain trivially copyable C++ structs.
-- `registry.transaction<T...>()` opens a snapshot-visible read/write transaction for declared component types.
-- `tx.write<T>(entity, value)` stages or applies a component value, depending on the component storage mode.
-- `tx.commit()` publishes staged writes. In MVCC and `trace_ondemand` modes, closing a transaction without committing rolls staged writes back. `classic` and `trace_preallocate` write directly.
-- `registry.snapshot()` opens a read-only snapshot over committed component state.
+Transactions declare the component types they can access. A non-const declaration can write that component; a const declaration is read-only.
 
 ```cpp
-struct Position {
-    int x;
-    int y;
-};
+auto read_only = registry.transaction<const Position>();
+const Position& position = read_only.get<Position>(player);
 
-struct Velocity {
-    int dx;
-    int dy;
-};
-
-ecs::Registry registry;
-const ecs::Entity mover = registry.create();
-
-{
-    auto tx = registry.transaction<Position, Velocity>();
-    tx.write<Position>(mover, Position{10, 20});
-    tx.write<Velocity>(mover, Velocity{3, 4});
-    tx.commit();
-}
-
-auto tx = registry.transaction<Position, Velocity>();
-
-if (const Velocity* velocity = tx.try_get<Velocity>(mover)) {
-    Position* position = tx.write<Position>(mover);
-    position->x += velocity->dx;
-    position->y += velocity->dy;
-}
-
-tx.commit();
+auto writer = registry.transaction<Position>();
+writer.write<Position>(player, Position{5.0f, 6.0f});
+writer.commit();
 ```
 
-Iterate one component storage directly:
+Iterate a single component storage directly:
 
 ```cpp
 auto tx = registry.transaction<Position>();
@@ -102,34 +71,109 @@ Iterate entities that have multiple components:
 ```cpp
 auto tx = registry.transaction<Position, Velocity>();
 
-tx.view<Position, const Velocity>().forEach(
+tx.view<const Position, const Velocity>().forEach(
     [](ecs::Entity entity, const Position& position, const Velocity& velocity) {
         // entity has both Position and Velocity.
     });
 ```
 
-Views choose the smallest visible component storage as the anchor scan and use sparse lookups for the remaining components. Call `explain()` or `explain_text()` when you want to inspect that plan.
+Views pick an execution plan from the available sources: component storage, owning groups, and usable component indexes. Use `explain()` or `explain_text()` to inspect the chosen plan.
 
-## Modes and Settings
+## Core API
 
-Components default to `ecs::ComponentStorageMode::mvcc`, but storage mode can be configured per component before that component's storage is created.
+- `ecs::Registry` owns entities, component storage, storage-mode settings, snapshots, transactions, indexes, trace history, and groups.
+- `ecs::Entity` is a 64-bit handle. Use `registry.alive(entity)` when accepting handles from outside the current flow.
+- `registry.transaction<T...>()` opens a typed transaction. The component list is the transaction's access declaration.
+- `tx.write<T>(entity, value)` creates or updates a component in the transaction-visible state.
+- `tx.commit()` publishes writes. In rollback-capable modes, closing a transaction without `commit()` rolls back pending writes.
+- `registry.snapshot()` opens a read-only view over committed component state.
+- `registry.group<A, B>()` creates an owning group for entities that have all grouped components.
+
+Components must be trivially copyable. Singleton components are also supported by specializing `ecs::ComponentSingletonTraits<T>`; they exist once per registry and are accessed without an entity.
 
 ```cpp
-ecs::Registry registry(1024); // page size defaults to 1024
+struct GameClock {
+    std::uint64_t tick = 0;
+};
 
-registry.set_storage_mode<Position>(ecs::ComponentStorageMode::mvcc);
-registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::trace_ondemand);
-registry.set_trace_max_history(128);
+namespace ecs {
+
+template <>
+struct ComponentSingletonTraits<GameClock> {
+    static constexpr bool value = true;
+};
+
+}  // namespace ecs
+
+auto tx = registry.transaction<GameClock>();
+GameClock* clock = tx.write<GameClock>();
+clock->tick += 1;
+tx.commit();
 ```
 
-Storage modes:
+## Storage Modes
 
-- `classic`: in-place component storage for lower overhead. Writes are immediately visible through that transaction, explicit rollback is not supported, and the registry enforces per-component reader/writer access constraints.
-- `mvcc`: copy-on-write component storage. Transactions see stable snapshots, staged writes can be committed or rolled back, and uncommitted writes are isolated.
-- `trace_ondemand`: MVCC-style trace storage with timestamped per-write history. Use it when traced components change infrequently.
-- `trace_preallocate`: in-place trace storage with a preallocated circular history copied at trace-time boundaries. Use it when traced components usually change every tick. Set a bounded `trace_max_history` before creating this storage.
+Storage mode is configured per component before that component's storage is first created. Components default to `ecs::ComponentStorageMode::mvcc`.
 
-Set a component type's default mode by specializing `ComponentStorageModeTraits`:
+```cpp
+ecs::Registry registry;
+
+registry.set_storage_mode<Position>(ecs::ComponentStorageMode::mvcc);
+registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::classic);
+registry.set_trace_max_history(128);
+registry.set_storage_mode<DamageEvent>(ecs::ComponentStorageMode::trace_ondemand);
+```
+
+Use `mvcc` when you want the safest default: stable snapshot visibility, isolated uncommitted writes, and transaction rollback. This is the right choice for editor code, simulations with concurrent readers, and most components unless profiling proves the overhead matters.
+
+```cpp
+registry.set_storage_mode<Position>(ecs::ComponentStorageMode::mvcc);
+
+auto tx = registry.transaction<Position>();
+tx.write<Position>(entity, Position{10.0f, 20.0f});
+tx.rollback(); // valid: the write is discarded
+```
+
+Use `classic` when a component is updated in a tightly controlled phase and you prefer lower write overhead over rollback and MVCC isolation. `classic` writes directly into storage. The registry enforces per-component access rules: one writer is exclusive, and readers cannot overlap an active writer for the same direct-write component.
+
+```cpp
+registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::classic);
+
+auto tx = registry.transaction<Velocity>();
+Velocity* velocity = tx.write<Velocity>(entity);
+velocity->dx += 1.0f;
+tx.commit(); // rollback is not supported for direct-write storage
+```
+
+Use `trace_ondemand` when you need rewind history for a component that changes occasionally or only on meaningful events. It behaves like MVCC for transactions and records committed writes with the current trace timestamp.
+
+```cpp
+registry.set_trace_max_history(256);
+registry.set_storage_mode<Health>(ecs::ComponentStorageMode::trace_ondemand);
+
+registry.set_current_trace_time(42);
+auto tx = registry.transaction<Health>();
+tx.write<Health>(entity, Health{75});
+tx.commit();
+```
+
+Use `trace_preallocate` when the component changes nearly every tick and trace history should be captured at trace-time boundaries rather than per committed write. It is direct-write storage, so rollback of ordinary transactions is not supported. You must call `set_trace_max_history()` before the storage is created.
+
+```cpp
+registry.set_trace_max_history(64);
+registry.set_storage_mode<Transform>(ecs::ComponentStorageMode::trace_preallocate);
+
+registry.set_current_trace_time(100);
+{
+    auto tx = registry.transaction<Transform>();
+    tx.write<Transform>(entity, Transform{0.0f, 0.0f});
+    tx.commit();
+}
+
+registry.set_current_trace_time(101); // captures the timestamp 100 dense state
+```
+
+Set a component type's default mode with `ComponentStorageModeTraits` when the choice belongs to the component type instead of one registry setup site.
 
 ```cpp
 struct Transform {
@@ -149,57 +193,9 @@ struct ComponentStorageModeTraits<Transform> {
 
 Once storage exists for a component type, changing that component's storage mode throws `std::logic_error`.
 
-## Singleton Components
+## Indices
 
-Declare a singleton by specializing `ecs::ComponentSingletonTraits<T>`. Singletons must be trivially copyable and default constructible.
-
-```cpp
-struct GameClock {
-    std::uint64_t tick = 0;
-};
-
-namespace ecs {
-
-template <>
-struct ComponentSingletonTraits<GameClock> {
-    static constexpr bool value = true;
-};
-
-}  // namespace ecs
-```
-
-Access singleton state without an entity:
-
-```cpp
-ecs::Registry registry;
-
-{
-    auto tx = registry.transaction<GameClock>();
-    GameClock* clock = tx.write<GameClock>();
-    clock->tick = 42;
-    tx.commit();
-}
-
-auto read_tx = registry.transaction<GameClock>();
-const GameClock& clock = read_tx.get<GameClock>();
-```
-
-Views can include singleton components. A singleton-only view calls the callback once with `ecs::null_entity`.
-
-```cpp
-auto tx = registry.transaction<Position, GameClock>();
-
-tx.view<const Position, const GameClock>().forEach(
-    [](ecs::Entity entity, const Position& position, const GameClock& clock) {
-        // position belongs to entity, clock is the registry singleton.
-    });
-```
-
-Singletons cannot declare component indexes, and predicate filters such as `where_eq` are not available on singleton fields.
-
-## Query Views and Indexes
-
-Declare indexes by specializing `ecs::ComponentIndices<T>`. Use `ecs::Index` for non-unique keys and `ecs::UniqueIndex` for unique keys. Indexes can use one member or a compound key made from multiple members.
+Declare indexes by specializing `ecs::ComponentIndices<T>`. Use an index when you frequently find entities by component fields or when a view has selective predicates such as "x between 10 and 50". Do not index fields that are rarely queried or updated constantly unless benchmarks show the maintenance cost is worth it.
 
 ```cpp
 #include <cstdint>
@@ -226,11 +222,10 @@ struct ComponentIndices<IndexedPosition> {
 }  // namespace ecs
 ```
 
-Indexed storage lookups work through transaction storage views:
+Use `ecs::Index` for non-unique lookup keys and `ecs::UniqueIndex` when the key must identify at most one entity. Unique indexes are enforced on insert, replacement, and commit; violating a unique key throws `std::invalid_argument`.
 
 ```cpp
 ecs::Registry registry;
-
 const ecs::Entity first = registry.create();
 const ecs::Entity second = registry.create();
 
@@ -248,7 +243,7 @@ std::vector<ecs::Entity> by_x = positions.find_all<&IndexedPosition::x>(10);
 ecs::Entity exact = positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(10, 2);
 ```
 
-Predicate views can use component indexes for selective equality, inequality, and range filters:
+Use single-field indexes for equality, inequality, or range predicates on one member. Use compound indexes when your lookup naturally depends on all key fields in order, such as `(x, y)`.
 
 ```cpp
 auto tx = registry.transaction<IndexedPosition, Velocity>();
@@ -259,39 +254,52 @@ tx.view<const IndexedPosition, const Velocity>()
     .forEach([](ecs::Entity entity,
                 const IndexedPosition& position,
                 const Velocity& velocity) {
-        // Only indexed positions in the selected x range are considered.
+        // The planner can seed the view from the x index if it is selective.
     });
 ```
 
-Available predicate operators are `eq`, `ne`, `gt`, `gte`, `lt`, and `lte`, exposed through helpers such as `where_eq`, `where_ne`, `where_gt`, and `where_lte`. Predicates use the query planner, so an indexed predicate can seed execution when it reduces the candidate set and otherwise falls back to a scan.
+Available predicate helpers are `where_eq`, `where_ne`, `where_gt`, `where_gte`, `where_lt`, and `where_lte`, plus `or_where_*` variants. Indexes are used when the planner can use them profitably; otherwise the query falls back to scanning. For example, an indexed predicate that matches every row may still scan because the index does not reduce the candidate set.
+
+Choose the index backend at the project or index level:
+
+- `ecs::Index` and `ecs::UniqueIndex` use the build's default backend.
+- `ecs::FlatIndex` and `ecs::FlatUniqueIndex` force the flat sorted backend for that index.
+- `ecs::OptimizedIndex` and `ecs::OptimizedUniqueIndex` force the optimized B+ tree backend for that index.
+- CMake `ECS_INDEX_BACKEND=flat_sorted|optimized_bplus` sets the default backend used by `Index` and `UniqueIndex`.
+
+```cpp
+using FlatX = ecs::FlatIndex<&IndexedPosition::x>;
+using OptimizedXY = ecs::OptimizedUniqueIndex<&IndexedPosition::x, &IndexedPosition::y>;
+```
+
+Important limitation: if a component belongs to an owning group, storage lookups and predicate views for that component still return correct results, but index-seek execution is disabled for that grouped component and the planner scans the visible grouped/storage rows instead.
 
 ## Trace History
 
-Trace mode records component changes with the registry's current 64-bit trace timestamp. `trace_ondemand` records committed writes. `trace_preallocate` copies the current dense component state whenever `set_current_trace_time()` advances. Timestamps are monotonic and use the same `ecs::Timestamp` type as transaction timestamps.
+Trace history is for user-visible rewind, rollback-to-time, replay inspection, and time-travel debugging. It records component state against the registry's current trace timestamp, which you advance with `set_current_trace_time()`.
+
+Use `trace_ondemand` when history should track committed changes. This is usually the right mode for health, inventory, gameplay flags, sparse events, and editor state where changes are meaningful but not every component changes every tick.
 
 ```cpp
 ecs::Registry registry;
-registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_ondemand);
 registry.set_trace_max_history(16);
+registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_ondemand);
 
 const ecs::Entity entity = registry.create();
 
 registry.set_current_trace_time(1);
 {
     auto tx = registry.transaction<Position>();
-    tx.write<Position>(entity, Position{1, 2});
+    tx.write<Position>(entity, Position{1.0f, 2.0f});
     tx.commit();
 }
 
 registry.set_current_trace_time(3);
 {
     auto tx = registry.transaction<Position>();
-    tx.write<Position>(entity, Position{7, 8});
+    tx.write<Position>(entity, Position{7.0f, 8.0f});
     tx.commit();
 }
-
-registry.set_current_trace_time(5);
-registry.remove<Position>(entity);
 
 registry.each_trace_change<Position>(
     entity,
@@ -300,66 +308,82 @@ registry.each_trace_change<Position>(
             return;
         }
 
-        // value points at the Position committed at info.timestamp.
+        // value is the Position committed at info.timestamp.
     });
 
-registry.set_current_trace_time(6);
-registry.rollback_to_timestamp<Position>(entity, 3);
+registry.set_current_trace_time(4);
+registry.rollback_to_timestamp<Position>(entity, 1);
 ```
 
-For high-frequency components, configure `trace_preallocate` before the component storage is created. `set_trace_max_history()` is required because it controls the circular history depth.
+Use `trace_preallocate` when most rows are expected to change every frame and you want bounded frame snapshots. The previous dense state is captured when `set_current_trace_time()` advances, so call it at the boundary between simulated times.
 
 ```cpp
 ecs::Registry registry;
-registry.set_trace_max_history(64);
+registry.set_trace_max_history(4);
 registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
 
-const ecs::Entity mover = registry.create();
+const ecs::Entity entity = registry.create();
 
-registry.set_current_trace_time(1);
+registry.set_current_trace_time(10);
 {
     auto tx = registry.transaction<Position>();
-    tx.write<Position>(mover, Position{0, 0});
+    tx.write<Position>(entity, Position{1.0f, 2.0f});
     tx.commit();
 }
 
-registry.set_current_trace_time(2); // copies the timestamp 1 dense state into the ring
+registry.set_current_trace_time(11); // stores the timestamp 10 frame
 {
     auto tx = registry.transaction<Position>();
-    Position* position = tx.write<Position>(mover);
-    position->x += 1;
-    position->y += 1;
+    tx.write<Position>(entity, Position{3.0f, 4.0f});
     tx.commit();
 }
 
-registry.set_current_trace_time(3); // copies the timestamp 2 dense state into the ring
-registry.rollback_to_timestamp<Position>(mover, 1);
+registry.set_current_trace_time(12); // stores the timestamp 11 frame
+registry.rollback_to_timestamp<Position>(entity, 10);
 ```
 
-Trace operations that mutate history require readers and transactions to be closed first.
+Trace timestamps are monotonic. `set_trace_max_history()` bounds retained history; older history is compacted when trace time advances. Trace operations that mutate history, including changing trace time and rollback-to-timestamp, require open readers and transactions to be closed first.
 
-## Layout
+Removals are part of trace history. In `trace_ondemand`, removing a component records a tombstone at the current trace timestamp. Rolling back to a timestamp before a tombstone can restore the component; rolling back to a timestamp with no prior value can remove it.
 
-- `include/ecs/`: public headers
-- `src/`: library implementation
-- `examples/`: small consumer executable
-- `tests/`: Catch2 unit tests
+Singleton components can also use trace storage. Call `each_trace_change<T>(callback)` and `rollback_to_timestamp<T>(timestamp)` without an entity argument.
 
-## Build a Static Library
+## Groups
+
+Owning groups store entities that have the same set of grouped components in group-owned storage. Use a group when a hot view repeatedly reads the same component combination and sparse lookups for the secondary components show up in profiling.
+
+```cpp
+ecs::Registry registry;
+registry.group<Position, Velocity>();
+
+auto tx = registry.transaction<Position, Velocity>();
+tx.view<const Position, const Velocity>().forEach(
+    [](ecs::Entity entity, const Position& position, const Velocity& velocity) {
+        // The planner can use the owning group as the view source.
+    });
+```
+
+Groups are best for stable, frequently co-iterated component sets such as `Position` plus `Velocity`. Avoid grouping components that churn in and out constantly unless profiling shows the grouped layout still wins.
+
+Grouped component types must share the same storage mode, and a component type can belong to only one owning group. Entities are promoted into the group when they have every grouped component and demoted when a committed removal breaks membership. Existing storage and view APIs continue to work.
+
+## Build
+
+Build a static library:
 
 ```bash
 cmake -S . -B build/static -DBUILD_SHARED_LIBS=OFF
 cmake --build build/static
 ```
 
-## Build a Shared Library
+Build a shared library:
 
 ```bash
 cmake -S . -B build/shared -DBUILD_SHARED_LIBS=ON
 cmake --build build/shared
 ```
 
-## Build and Run Tests
+Build and run tests:
 
 ```bash
 cmake -S . -B build/test -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=ON
@@ -367,60 +391,56 @@ cmake --build build/test --target tests
 ctest --test-dir build/test --output-on-failure
 ```
 
-## Build and Run Benchmarks
+## Benchmarks
 
-The benchmark suite mirrors the data setup and benchmark shapes used in `abeimler/ecs_benchmark` so the results are directly comparable.
-
-```bash
-cmake -S . -B build/bench -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DECS_BUILD_BENCHMARKS=ON
-cmake --build build/bench --target ecs_benchmark_entities ecs_benchmark_basic ecs_benchmark_extended ecs_benchmark_trace
-```
-
-Run the executables directly or emit Google Benchmark JSON:
+Use the benchmark scripts for performance work. They configure benchmark builds consistently, write JSON/log artifacts, and support both index backends. Use `RelWithDebInfo` for benchmark numbers.
 
 ```bash
-./build/bench/ecs_benchmark_entities --benchmark_out=entities.json --benchmark_out_format=json
-./build/bench/ecs_benchmark_basic --benchmark_out=basic.json --benchmark_out_format=json
-./build/bench/ecs_benchmark_extended --benchmark_out=extended.json --benchmark_out_format=json
-./build/bench/ecs_benchmark_trace --benchmark_out=trace.json --benchmark_out_format=json
+bash scripts/bench/run.sh \
+  --target ecs_benchmark_project \
+  --index-backend flat_sorted \
+  --min-time 0.2s
 ```
 
-Scripted workflow:
+Run backends serially when collecting numbers:
 
 ```bash
-# Build and run the default extended benchmark target.
-bash benchmark.sh
-
-# Run grouped vs ungrouped comparison benchmarks and write artifacts under artifacts/bench/<timestamp>.
-bash scripts/bench/compare.sh --min-time 0.25s
-
-# Build Tracy-enabled benchmarks and profile the default grouped hot case.
-bash scripts/bench/profile.sh --min-time 0.5s
-
-# Save a Tracy capture automatically using the bundled `tracy-capture` build,
-# or an external TracyCapture / tracy-capture binary if provided explicitly.
-TRACY_CAPTURE_TOOL=/path/to/TracyCapture bash scripts/bench/profile.sh
+bash scripts/bench/run.sh \
+  --target ecs_benchmark_project \
+  --index-backend optimized_bplus \
+  --min-time 0.2s
 ```
 
-The script suite is Linux/WSL-oriented:
+For confirmation, prefer an exact benchmark filter:
 
-- `scripts/bench/build.sh`: configure and build benchmark targets
-- `scripts/bench/run.sh`: run a benchmark target with JSON/log output
-- `scripts/bench/compare.sh`: run the grouped comparison benchmark family
-- `scripts/bench/profile.sh`: build with Tracy instrumentation and run a profiling-oriented benchmark set
+```bash
+bash scripts/bench/run.sh \
+  --target ecs_benchmark_project \
+  --index-backend flat_sorted \
+  --filter '^BM_ComplexSceneVisibilityQuery/16384$' \
+  --min-time 0.2s
+```
 
-Profiling builds add Tracy zones to view planning, grouped iteration, and MVCC visibility paths. By default `profile.sh` focuses on `BM_CompareIterateTwoComponentsGrouped/(16384|32768)` so the trace is short and centered on the grouped hot path. Profiling configuration now also builds Tracy's bundled `tracy-capture` CLI alongside the selected benchmark target. The script writes benchmark JSON/log artifacts and a small note describing the Tracy capture step. If `TracyCapture` or `tracy-capture` is on `PATH`, or `TRACY_CAPTURE_TOOL` / `--capture-tool` is provided, the script will also save a `.tracy` capture file automatically.
+Useful scripts:
 
-Suite mapping:
+- `scripts/bench/build.sh`: configure and build benchmark targets.
+- `scripts/bench/run.sh`: run one benchmark target with JSON/log output.
+- `scripts/bench/compare.sh`: run the grouped comparison benchmark family.
+- `scripts/bench/profile.sh`: build with Tracy instrumentation and run a profiling-oriented benchmark set.
+- `scripts/bench/gprof.sh`: collect `gprof` hotspot direction.
 
-- `ecs_benchmark_entities`: entity creation, destruction, component unpack, and remove/add benchmarks
-- `ecs_benchmark_basic`: the 2-system update benchmarks (`MovementSystem` and `DataSystem`)
-- `ecs_benchmark_extended`: the 7-system update benchmarks plus iteration benchmarks
-- `ecs_benchmark_trace`: high-frequency traced position updates comparing `trace_ondemand` and `trace_preallocate`
+Treat Tracy and `gprof` as hotspot tools, not authoritative timing sources. Record the artifact paths used in any performance summary.
+
+## Layout
+
+- `include/ecs/`: public aggregate/export headers.
+- `src/`: library headers, implementation, and unit tests.
+- `benchmarks/`: Google Benchmark targets.
+- `scripts/bench/`: benchmark build, run, compare, Tracy, and `gprof` helpers.
 
 ## Notes
 
-- The same `CMakeLists.txt` works across macOS, Windows, and Linux.
+- The same `CMakeLists.txt` is intended to work across macOS, Windows, Linux, and WSL.
 - `BUILD_SHARED_LIBS` controls whether `ecs` is created as static or shared.
-- The export macro in `include/ecs/export.hpp` handles symbol visibility for shared builds.
 - `BUILD_TESTING=ON` enables Catch2-based unit tests and creates the `ecs_tests` and `tests` build targets.
+- The export macro in `include/ecs/export.hpp` handles symbol visibility for shared builds.

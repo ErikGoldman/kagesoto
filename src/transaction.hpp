@@ -164,6 +164,24 @@ struct is_or_predicate : std::false_type {};
 template <typename Left, typename Right>
 struct is_or_predicate<OrPredicate<Left, Right>> : std::true_type {};
 
+struct ViewPlanCacheEntryBase {
+    virtual ~ViewPlanCacheEntryBase() = default;
+};
+
+template <typename Plan>
+struct ViewPlanCacheEntry final : ViewPlanCacheEntryBase {
+    explicit ViewPlanCacheEntry(Plan value)
+        : plan(std::move(value)) {}
+
+    Plan plan;
+};
+
+template <typename ViewType>
+const void* view_plan_cache_key() {
+    static const int key = 0;
+    return &key;
+}
+
 class Snapshot {
 public:
     explicit Snapshot(Registry& registry)
@@ -177,6 +195,7 @@ public:
         : registry_(other.registry_),
           max_visible_tsn_(other.max_visible_tsn_),
           active_at_open_(std::move(other.active_at_open_)),
+          view_plan_cache_(std::move(other.view_plan_cache_)),
           holds_snapshot_classic_access_(other.holds_snapshot_classic_access_) {
         other.registry_ = nullptr;
         other.max_visible_tsn_ = 0;
@@ -189,6 +208,7 @@ public:
             registry_ = other.registry_;
             max_visible_tsn_ = other.max_visible_tsn_;
             active_at_open_ = std::move(other.active_at_open_);
+            view_plan_cache_ = std::move(other.view_plan_cache_);
             holds_snapshot_classic_access_ = other.holds_snapshot_classic_access_;
             other.registry_ = nullptr;
             other.max_visible_tsn_ = 0;
@@ -275,6 +295,32 @@ public:
         return false;
     }
 
+    std::size_t write_epoch() const {
+        return 0;
+    }
+
+    template <typename Plan, typename Builder>
+    const Plan& cached_view_plan(const void* key, Builder&& builder) const {
+        require_open();
+        const auto it = view_plan_cache_.find(key);
+        if (it != view_plan_cache_.end()) {
+            return static_cast<const ViewPlanCacheEntry<Plan>*>(it->second.get())->plan;
+        }
+
+        auto entry = std::make_unique<ViewPlanCacheEntry<Plan>>(std::forward<Builder>(builder)());
+        const Plan& plan = entry->plan;
+        view_plan_cache_[key] = std::move(entry);
+        return plan;
+    }
+
+    const void* try_get_committed_visible_dense(const RawPagedSparseArray& storage, std::size_t dense_index) const {
+        return storage.try_get_committed_visible_dense_raw(dense_index, max_visible_tsn_);
+    }
+
+    const void* try_get_committed_visible_from_storage(const RawPagedSparseArray& storage, Entity entity) const {
+        return storage.try_get_committed_visible_raw(entity, max_visible_tsn_);
+    }
+
 protected:
     Snapshot(Registry& registry, bool register_snapshot_classic_access)
         : registry_(&registry),
@@ -304,6 +350,7 @@ protected:
 
     void close() {
         if (registry_ != nullptr) {
+            invalidate_view_plan_cache();
             if (holds_snapshot_classic_access_) {
                 registry_->unregister_snapshot_classic_access();
                 holds_snapshot_classic_access_ = false;
@@ -315,9 +362,14 @@ protected:
         }
     }
 
+    void invalidate_view_plan_cache() const {
+        view_plan_cache_.clear();
+    }
+
     Registry* registry_ = nullptr;
     Timestamp max_visible_tsn_ = 0;
     std::vector<Timestamp> active_at_open_;
+    mutable std::unordered_map<const void*, std::unique_ptr<ViewPlanCacheEntryBase>> view_plan_cache_;
     bool holds_snapshot_classic_access_ = false;
 };
 
@@ -363,10 +415,12 @@ public:
           pending_write_stores_(std::move(other.pending_write_stores_)),
           classic_accesses_(std::move(other.classic_accesses_)),
           pending_write_count_(other.pending_write_count_),
-          pending_write_reserve_hint_(other.pending_write_reserve_hint_) {
+          pending_write_reserve_hint_(other.pending_write_reserve_hint_),
+          pending_write_epoch_(other.pending_write_epoch_) {
         other.tsn_ = 0;
         other.pending_write_count_ = 0;
         other.pending_write_reserve_hint_ = 0;
+        other.pending_write_epoch_ = 0;
     }
 
     Transaction& operator=(Transaction&& other) noexcept {
@@ -384,9 +438,11 @@ public:
             classic_accesses_ = std::move(other.classic_accesses_);
             pending_write_count_ = other.pending_write_count_;
             pending_write_reserve_hint_ = other.pending_write_reserve_hint_;
+            pending_write_epoch_ = other.pending_write_epoch_;
             other.tsn_ = 0;
             other.pending_write_count_ = 0;
             other.pending_write_reserve_hint_ = 0;
+            other.pending_write_epoch_ = 0;
         }
         return *this;
     }
@@ -669,10 +725,12 @@ private:
                            typename ComponentStorage<T>::PendingWrite pending,
                            bool requires_alive = true) {
         ensure_pending_store_capacity<T>();
+        invalidate_view_plan_cache();
         auto& store = pending_store<T>();
         store.index_by_entity.emplace(entity, store.writes.size());
         store.writes.push_back(PendingWriteEntry<T>{entity, storage, pending, requires_alive});
         ++pending_write_count_;
+        ++pending_write_epoch_;
     }
 
     template <typename Store, typename Func>
@@ -747,6 +805,7 @@ private:
 
         std::apply([](auto&... stores) { (stores.clear(), ...); }, pending_write_stores_);
         pending_write_count_ = 0;
+        pending_write_epoch_ = 0;
         registry_->unregister_classic_access(classic_accesses_);
         classic_accesses_.clear();
         if (tsn_ != 0) {
@@ -791,6 +850,10 @@ public:
         return pending_write_count_ != 0;
     }
 
+    std::size_t write_epoch() const {
+        return pending_write_epoch_;
+    }
+
     template <typename T, typename Func>
     void each_pending_write(Func&& func) const {
         const auto& store = pending_store<T>();
@@ -805,6 +868,7 @@ public:
     std::vector<typename Registry::ClassicAccessRegistration> classic_accesses_;
     std::size_t pending_write_count_ = 0;
     std::size_t pending_write_reserve_hint_ = 0;
+    std::size_t pending_write_epoch_ = 0;
 };
 
 template <typename T, typename TransactionType>
@@ -912,7 +976,7 @@ public:
 
     template <auto... Members, typename... KeyParts>
     std::vector<Entity> find_all(KeyParts&&... key_parts) const {
-        using query_spec = detail::ComponentIndexSpec<false, Members...>;
+        using query_spec = detail::ComponentIndexSpec<detail::default_index_backend_tag, false, Members...>;
         using index_spec = typename detail::tuple_member_pack_index_spec<typename ComponentIndices<T>::type, Members...>::type;
         static_assert(std::is_same_v<typename query_spec::component_type, T>, "find field must belong to the storage component");
 
@@ -1138,6 +1202,17 @@ public:
     }
 
 private:
+    struct IterationVisibilityState {
+        bool use_committed_visible_fast_path = false;
+        std::size_t write_epoch = 0;
+
+        void refresh(const TransactionType& transaction) {
+            if (use_committed_visible_fast_path && transaction.write_epoch() != write_epoch) {
+                use_committed_visible_fast_path = false;
+            }
+        }
+    };
+
     struct ComponentDescriptor {
         ComponentId component = null_component;
         std::size_t component_index = 0;
@@ -1147,6 +1222,13 @@ private:
     };
 
     struct PlannedView {
+        struct ComponentFetchPlan {
+            const RawPagedSparseArray* standalone_storage = nullptr;
+            const RawPagedSparseArray* owner_storage = nullptr;
+            const OwningGroupBase* owner = nullptr;
+            bool singleton = false;
+        };
+
         const std::vector<Entity>* anchor_entities = nullptr;
         std::vector<Entity> materialized_anchor_entities;
         std::size_t anchor_index = 0;
@@ -1156,7 +1238,88 @@ private:
         std::array<const RawPagedSparseArray*, sizeof...(Components)> grouped_storages{};
         const RawPagedSparseArray* anchor_storage = nullptr;
         bool anchor_uses_dense_iteration = false;
+        bool use_committed_visible_fast_path = false;
         QueryExplain explain;
+        std::array<ComponentFetchPlan, sizeof...(Components)> fetch_plans{};
+
+        PlannedView() = default;
+
+        PlannedView(const PlannedView& other)
+            : anchor_entities(other.anchor_entities),
+              materialized_anchor_entities(other.materialized_anchor_entities),
+              anchor_index(other.anchor_index),
+              grouped_component_count(other.grouped_component_count),
+              group(other.group),
+              covered_component_indices(other.covered_component_indices),
+              grouped_storages(other.grouped_storages),
+              anchor_storage(other.anchor_storage),
+              anchor_uses_dense_iteration(other.anchor_uses_dense_iteration),
+              use_committed_visible_fast_path(other.use_committed_visible_fast_path),
+              explain(other.explain),
+              fetch_plans(other.fetch_plans) {
+            rebind_anchor_entities(other);
+        }
+
+        PlannedView(PlannedView&& other) noexcept
+            : anchor_entities(other.anchor_entities),
+              materialized_anchor_entities(std::move(other.materialized_anchor_entities)),
+              anchor_index(other.anchor_index),
+              grouped_component_count(other.grouped_component_count),
+              group(other.group),
+              covered_component_indices(std::move(other.covered_component_indices)),
+              grouped_storages(other.grouped_storages),
+              anchor_storage(other.anchor_storage),
+              anchor_uses_dense_iteration(other.anchor_uses_dense_iteration),
+              use_committed_visible_fast_path(other.use_committed_visible_fast_path),
+              explain(std::move(other.explain)),
+              fetch_plans(other.fetch_plans) {
+            rebind_anchor_entities(other);
+        }
+
+        PlannedView& operator=(const PlannedView& other) {
+            if (this != &other) {
+                anchor_entities = other.anchor_entities;
+                materialized_anchor_entities = other.materialized_anchor_entities;
+                anchor_index = other.anchor_index;
+                grouped_component_count = other.grouped_component_count;
+                group = other.group;
+                covered_component_indices = other.covered_component_indices;
+                grouped_storages = other.grouped_storages;
+                anchor_storage = other.anchor_storage;
+                anchor_uses_dense_iteration = other.anchor_uses_dense_iteration;
+                use_committed_visible_fast_path = other.use_committed_visible_fast_path;
+                explain = other.explain;
+                fetch_plans = other.fetch_plans;
+                rebind_anchor_entities(other);
+            }
+            return *this;
+        }
+
+        PlannedView& operator=(PlannedView&& other) noexcept {
+            if (this != &other) {
+                anchor_entities = other.anchor_entities;
+                materialized_anchor_entities = std::move(other.materialized_anchor_entities);
+                anchor_index = other.anchor_index;
+                grouped_component_count = other.grouped_component_count;
+                group = other.group;
+                covered_component_indices = std::move(other.covered_component_indices);
+                grouped_storages = other.grouped_storages;
+                anchor_storage = other.anchor_storage;
+                anchor_uses_dense_iteration = other.anchor_uses_dense_iteration;
+                use_committed_visible_fast_path = other.use_committed_visible_fast_path;
+                explain = std::move(other.explain);
+                fetch_plans = other.fetch_plans;
+                rebind_anchor_entities(other);
+            }
+            return *this;
+        }
+
+    private:
+        void rebind_anchor_entities(const PlannedView& other) {
+            if (other.anchor_entities == &other.materialized_anchor_entities) {
+                anchor_entities = &materialized_anchor_entities;
+            }
+        }
     };
 
     struct SourceCandidate {
@@ -1200,7 +1363,37 @@ private:
     }
 
     template <typename Component>
-    detail::component_pointer_t<TransactionType, Component> fetch_known_alive(Entity entity, std::size_t component_index) const {
+    detail::component_pointer_t<TransactionType, Component> fetch_from_storage(
+        const IterationVisibilityState& visibility,
+        const RawPagedSparseArray& storage,
+        Entity entity) const {
+        if (visibility.use_committed_visible_fast_path) {
+            return static_cast<detail::component_pointer_t<TransactionType, Component>>(
+                transaction_->try_get_committed_visible_from_storage(storage, entity));
+        }
+        return static_cast<detail::component_pointer_t<TransactionType, Component>>(
+            transaction_->try_get_visible_from_storage(storage, entity));
+    }
+
+    template <typename Component>
+    detail::component_pointer_t<TransactionType, Component> fetch_dense_from_storage(
+        const IterationVisibilityState& visibility,
+        const RawPagedSparseArray& storage,
+        std::size_t dense_index) const {
+        if (visibility.use_committed_visible_fast_path) {
+            return static_cast<detail::component_pointer_t<TransactionType, Component>>(
+                transaction_->try_get_committed_visible_dense(storage, dense_index));
+        }
+        return static_cast<detail::component_pointer_t<TransactionType, Component>>(
+            transaction_->try_get_visible_dense(storage, dense_index));
+    }
+
+    template <typename Component>
+    detail::component_pointer_t<TransactionType, Component> fetch_entity_storage(
+        const PlannedView& planned,
+        const IterationVisibilityState& visibility,
+        Entity entity,
+        std::size_t component_index) const {
         using Base = detail::component_base_t<Component>;
         if constexpr (detail::is_singleton_component_v<Base>) {
             (void)entity;
@@ -1208,18 +1401,15 @@ private:
             return transaction_->template try_get<Base>();
         }
 
-        const ComponentId component = component_descriptors()[component_index].component;
-        if (const OwningGroupBase* owner = transaction_->owning_group(component); owner != nullptr && owner->contains(entity)) {
-            if (const RawPagedSparseArray* raw = owner->storage(component); raw != nullptr) {
-                return static_cast<detail::component_pointer_t<TransactionType, Component>>(
-                    transaction_->try_get_visible_from_storage(*raw, entity));
+        const typename PlannedView::ComponentFetchPlan& fetch_plan = planned.fetch_plans[component_index];
+        if (fetch_plan.owner != nullptr && fetch_plan.owner->contains(entity)) {
+            if (fetch_plan.owner_storage != nullptr) {
+                return fetch_from_storage<Component>(visibility, *fetch_plan.owner_storage, entity);
             }
             return nullptr;
         }
-
-        if (const RawPagedSparseArray* raw = transaction_->raw_storage(component); raw != nullptr) {
-            return static_cast<detail::component_pointer_t<TransactionType, Component>>(
-                transaction_->try_get_visible_from_storage(*raw, entity));
+        if (fetch_plan.standalone_storage != nullptr) {
+            return fetch_from_storage<Component>(visibility, *fetch_plan.standalone_storage, entity);
         }
         return nullptr;
     }
@@ -1238,8 +1428,9 @@ private:
     void iterate_scan(Func& func, const PlannedView& planned) const {
         ECS_PROFILE_ZONE("TransactionView::iterate_scan");
         const std::vector<Entity>& anchor_entities = *planned.anchor_entities;
+        IterationVisibilityState visibility{planned.use_committed_visible_fast_path, transaction_->write_epoch()};
         if (planned.anchor_uses_dense_iteration && planned.anchor_storage != nullptr) {
-            iterate_scan_dense(func, planned, anchor_entities);
+            iterate_scan_dense(func, planned, anchor_entities, visibility);
             return;
         }
 
@@ -1248,10 +1439,15 @@ private:
                 continue;
             }
             auto components = std::tuple<detail::component_pointer_t<TransactionType, Components>...>{
-                fetch_known_alive<Components>(entity, detail::component_index_of<detail::component_base_t<Components>, detail::component_base_t<Components>...>::value)...};
+                fetch_entity_storage<Components>(
+                    planned,
+                    visibility,
+                    entity,
+                    detail::component_index_of<detail::component_base_t<Components>, detail::component_base_t<Components>...>::value)...};
 
             if (all_present(components, std::index_sequence_for<Components...>{})) {
                 invoke(func, entity, components, std::index_sequence_for<Components...>{});
+                visibility.refresh(*transaction_);
             }
         }
     }
@@ -1261,6 +1457,7 @@ private:
         Func& func,
         const PlannedView& planned,
         const std::vector<Entity>& anchor_entities,
+        IterationVisibilityState& visibility,
         std::index_sequence<Indices...>) const {
         for (std::size_t dense_index = 0; dense_index < anchor_entities.size(); ++dense_index) {
             const Entity entity = anchor_entities[dense_index];
@@ -1269,18 +1466,23 @@ private:
             }
 
             auto components = std::tuple<detail::component_pointer_t<TransactionType, Components>...>{
-                fetch_anchor_dense<Components>(planned, entity, dense_index, Indices)...};
+                fetch_planned<Components>(planned, visibility, entity, dense_index, Indices)...};
 
             if (all_present(components, std::index_sequence_for<Components...>{})) {
                 invoke(func, entity, components, std::index_sequence_for<Components...>{});
+                visibility.refresh(*transaction_);
             }
         }
     }
 
     template <typename Func>
-    void iterate_scan_dense(Func& func, const PlannedView& planned, const std::vector<Entity>& anchor_entities) const {
+    void iterate_scan_dense(
+        Func& func,
+        const PlannedView& planned,
+        const std::vector<Entity>& anchor_entities,
+        IterationVisibilityState& visibility) const {
         ECS_PROFILE_ZONE("TransactionView::iterate_scan_dense");
-        iterate_scan_dense_impl(func, planned, anchor_entities, std::index_sequence_for<Components...>{});
+        iterate_scan_dense_impl(func, planned, anchor_entities, visibility, std::index_sequence_for<Components...>{});
     }
 
     static bool plan_covers_component(const PlannedView& planned, std::size_t component_index) {
@@ -1288,43 +1490,43 @@ private:
     }
 
     template <typename Component>
-    detail::component_pointer_t<TransactionType, Component> fetch_anchor_dense(
+    detail::component_pointer_t<TransactionType, Component> fetch_planned(
         const PlannedView& planned,
+        const IterationVisibilityState& visibility,
         Entity entity,
         std::size_t dense_index,
         std::size_t component_index) const {
-        if (component_index == planned.anchor_index && planned.anchor_storage != nullptr) {
-            return static_cast<detail::component_pointer_t<TransactionType, Component>>(
-                transaction_->try_get_visible_dense(*planned.anchor_storage, dense_index));
+        using Base = detail::component_base_t<Component>;
+        if constexpr (detail::is_singleton_component_v<Base>) {
+            (void)planned;
+            (void)entity;
+            (void)dense_index;
+            (void)component_index;
+            return transaction_->template try_get<Base>();
         }
-        if (planned.group != nullptr && plan_covers_component(planned, component_index)) {
-            return static_cast<detail::component_pointer_t<TransactionType, Component>>(
-                transaction_->try_get_visible_dense(*planned.grouped_storages[component_index], dense_index));
+
+        if (dense_index != std::numeric_limits<std::size_t>::max() &&
+            component_index == planned.anchor_index &&
+            planned.anchor_uses_dense_iteration &&
+            planned.anchor_storage != nullptr) {
+            return fetch_dense_from_storage<Component>(visibility, *planned.anchor_storage, dense_index);
         }
-        return fetch_known_alive<Component>(entity, component_index);
-    }
 
-    template <typename Component>
-    detail::component_pointer_t<TransactionType, Component> fetch_grouped(
-        const PlannedView& planned,
-        Entity entity,
-        std::size_t dense_index,
-        std::size_t component_index) const {
-
-        if (planned.group != nullptr && plan_covers_component(planned, component_index)) {
+        if (dense_index != std::numeric_limits<std::size_t>::max() &&
+            planned.group != nullptr &&
+            plan_covers_component(planned, component_index)) {
             const RawPagedSparseArray* raw = planned.grouped_storages[component_index];
-            return raw == nullptr
-                ? nullptr
-                : static_cast<detail::component_pointer_t<TransactionType, Component>>(
-                      transaction_->try_get_visible_dense(*raw, dense_index));
+            return raw == nullptr ? nullptr : fetch_dense_from_storage<Component>(visibility, *raw, dense_index);
         }
-        return fetch_known_alive<Component>(entity, component_index);
+
+        return fetch_entity_storage<Component>(planned, visibility, entity, component_index);
     }
 
     template <typename Func, std::size_t... Indices>
     void iterate_group_impl(Func& func, const PlannedView& planned, std::index_sequence<Indices...>) const {
         ECS_PROFILE_ZONE("TransactionView::iterate_group");
         const std::vector<Entity>& anchor_entities = *planned.anchor_entities;
+        IterationVisibilityState visibility{planned.use_committed_visible_fast_path, transaction_->write_epoch()};
         for (std::size_t dense_index = 0; dense_index < anchor_entities.size(); ++dense_index) {
             const Entity entity = anchor_entities[dense_index];
             if (entity == null_entity) {
@@ -1332,10 +1534,11 @@ private:
             }
 
             auto components = std::tuple<detail::component_pointer_t<TransactionType, Components>...>{
-                fetch_grouped<Components>(planned, entity, dense_index, Indices)...};
+                fetch_planned<Components>(planned, visibility, entity, dense_index, Indices)...};
 
             if (all_present(components, std::index_sequence_for<Components...>{})) {
                 invoke(func, entity, components, std::index_sequence_for<Components...>{});
+                visibility.refresh(*transaction_);
             }
         }
     }
@@ -1509,6 +1712,20 @@ private:
         return candidates;
     }
 
+    void populate_fetch_plans(PlannedView& planned) const {
+        for (const ComponentDescriptor& descriptor : component_descriptors()) {
+            typename PlannedView::ComponentFetchPlan& fetch_plan = planned.fetch_plans[descriptor.component_index];
+            fetch_plan.singleton = descriptor.singleton;
+            if (descriptor.singleton) {
+                continue;
+            }
+
+            fetch_plan.standalone_storage = transaction_->raw_storage(descriptor.component);
+            fetch_plan.owner = transaction_->owning_group(descriptor.component);
+            fetch_plan.owner_storage = fetch_plan.owner == nullptr ? nullptr : fetch_plan.owner->storage(descriptor.component);
+        }
+    }
+
     void apply_candidate(PlannedView& planned, const SourceCandidate& candidate) const {
         if (candidate.entities != nullptr) {
             planned.anchor_entities = candidate.entities;
@@ -1524,10 +1741,12 @@ private:
         planned.grouped_storages = candidate.grouped_storages;
         planned.anchor_storage = candidate.anchor_storage;
         planned.anchor_uses_dense_iteration = candidate.anchor_uses_dense_iteration;
+        planned.use_committed_visible_fast_path = transaction_->has_stable_visibility() && !transaction_->has_pending_writes();
         planned.explain.anchor_component = candidate.anchor_component;
         planned.explain.anchor_component_name = candidate.anchor_name;
         planned.explain.anchor_component_index = candidate.anchor_index;
         planned.explain.candidate_rows = candidate.row_count;
+        populate_fetch_plans(planned);
     }
 
     void append_candidate_explain(QueryExplain& explain,
@@ -1669,8 +1888,10 @@ private:
         return planned;
     }
 
-    PlannedView build_scan_plan() const {
-        return build_scan_plan_impl(std::index_sequence_for<Components...>{});
+    const PlannedView& build_scan_plan() const {
+        return transaction_->template cached_view_plan<PlannedView>(
+            view_plan_cache_key<TransactionView<TransactionType, Components...>>(),
+            [&]() { return build_scan_plan_impl(std::index_sequence_for<Components...>{}); });
     }
 
     static std::string format_explain(const QueryExplain& plan) {
@@ -1842,51 +2063,50 @@ public:
     void forEach(Func&& func) const {
         auto&& callback = func;
         const PlannedView planned = build_plan();
+        typename BaseView::IterationVisibilityState visibility{
+            planned.base_plan != nullptr ? planned.base_plan->use_committed_visible_fast_path : false,
+            transaction_->write_epoch()};
         if (planned.explain.empty) {
             return;
         }
 
         if (planned.use_index) {
             for (const Entity entity : planned.candidates) {
-                visit_entity(callback, entity);
+                visit_entity(callback, planned, visibility, entity, std::numeric_limits<std::size_t>::max());
             }
             return;
         }
 
         if (planned.anchor_entities == nullptr) {
-            visit_entity(callback, null_entity);
+            visit_entity(callback, planned, visibility, null_entity, std::numeric_limits<std::size_t>::max());
             return;
         }
 
-        for (const Entity entity : *planned.anchor_entities) {
+        const std::vector<Entity>& anchor_entities = *planned.anchor_entities;
+        for (std::size_t dense_index = 0; dense_index < anchor_entities.size(); ++dense_index) {
+            const Entity entity = anchor_entities[dense_index];
             if (entity != null_entity) {
-                visit_entity(callback, entity);
+                const std::size_t planned_dense_index =
+                    planned.base_plan != nullptr && planned.base_plan->anchor_uses_dense_iteration
+                    ? dense_index
+                    : std::numeric_limits<std::size_t>::max();
+                visit_entity(callback, planned, visibility, entity, planned_dense_index);
             }
         }
     }
 
 private:
     using expression_type = Expression;
+    using BaseView = TransactionView<TransactionType, Components...>;
+    using BasePlannedView = typename BaseView::PlannedView;
 
     struct PlannedView {
+        const BasePlannedView* base_plan = nullptr;
         const std::vector<Entity>* anchor_entities = nullptr;
-        std::vector<Entity> materialized_anchor_entities;
-        std::size_t anchor_index = 0;
         bool use_index = false;
         std::vector<Entity> candidates;
         QueryExplain explain;
     };
-
-    template <typename Component>
-    detail::component_pointer_t<TransactionType, Component> fetch(Entity entity) const {
-        using Base = detail::component_base_t<Component>;
-        if constexpr (detail::is_singleton_component_v<Base>) {
-            (void)entity;
-            return transaction_->template try_get<Base>();
-        } else {
-            return transaction_->template try_get<Base>(entity);
-        }
-    }
 
     template <typename Tuple, std::size_t... Indices>
     static bool all_present(const Tuple& components, std::index_sequence<Indices...>) {
@@ -1899,58 +2119,65 @@ private:
     }
 
     template <typename Func>
-    void visit_entity(Func& func, Entity entity) const {
-            auto components = std::tuple<detail::component_pointer_t<TransactionType, Components>...>{
-                fetch<Components>(entity)...};
+    void visit_entity(
+        Func& func,
+        const PlannedView& planned,
+        typename BaseView::IterationVisibilityState& visibility,
+        Entity entity,
+        std::size_t dense_index) const {
+        BaseView base(*transaction_);
+        auto components = std::tuple<detail::component_pointer_t<TransactionType, Components>...>{
+            base.template fetch_planned<Components>(
+                *planned.base_plan,
+                visibility,
+                entity,
+                dense_index,
+                detail::component_index_of<detail::component_base_t<Components>, detail::component_base_t<Components>...>::value)...};
 
         if (all_present(components, std::index_sequence_for<Components...>{}) &&
-            expression_matches(expression_, entity)) {
+            expression_matches(*planned.base_plan, visibility, expression_, entity, dense_index)) {
             invoke(func, entity, components, std::index_sequence_for<Components...>{});
-        }
-    }
-
-    template <typename Component>
-    std::size_t visible_size() const {
-        using Base = detail::component_base_t<Component>;
-        if constexpr (detail::is_singleton_component_v<Base>) {
-            return transaction_->template try_get<Base>() == nullptr ? 0 : 1;
-        } else {
-            std::size_t count = 0;
-            for (const Entity entity : transaction_->entities()) {
-                if (transaction_->template try_get<Base>(entity) != nullptr) {
-                    ++count;
-                }
-            }
-            return count;
+            visibility.refresh(*transaction_);
         }
     }
 
     template <typename Expr>
-    bool expression_matches(const Expr& expression, Entity entity) const {
+    bool expression_matches(
+        const BasePlannedView& planned,
+        typename BaseView::IterationVisibilityState& visibility,
+        const Expr& expression,
+        Entity entity,
+        std::size_t dense_index) const {
         if constexpr (std::is_same_v<Expr, TruePredicate>) {
             return true;
         } else if constexpr (is_and_predicate<Expr>::value) {
-            return expression_matches(expression.left, entity) && expression_matches(expression.right, entity);
+            return expression_matches(planned, visibility, expression.left, entity, dense_index) &&
+                   expression_matches(planned, visibility, expression.right, entity, dense_index);
         } else if constexpr (is_or_predicate<Expr>::value) {
-            return expression_matches(expression.left, entity) || expression_matches(expression.right, entity);
+            return expression_matches(planned, visibility, expression.left, entity, dense_index) ||
+                   expression_matches(planned, visibility, expression.right, entity, dense_index);
         } else {
             using Component = typename Expr::component_type;
             static_assert(!detail::is_singleton_component_v<Component>,
                           "predicates on singleton components are not supported");
-            const Component* component = transaction_->template try_get<Component>(entity);
+            using Base = detail::component_base_t<Component>;
+            BaseView base(*transaction_);
+            const Component* component = base.template fetch_planned<Component>(
+                planned,
+                visibility,
+                entity,
+                dense_index,
+                detail::component_index_of<Base, detail::component_base_t<Components>...>::value);
             return component != nullptr && expression.matches(*component);
         }
     }
 
     PlannedView build_plan() const {
         PlannedView planned{};
-        const auto base_plan = TransactionView<TransactionType, Components...>(*transaction_).build_scan_plan();
+        const BasePlannedView& base_plan = BaseView(*transaction_).build_scan_plan();
+        planned.base_plan = &base_plan;
         planned.explain = base_plan.explain;
-        if (base_plan.anchor_entities != nullptr) {
-            planned.materialized_anchor_entities = *base_plan.anchor_entities;
-            planned.anchor_entities = &planned.materialized_anchor_entities;
-        }
-        planned.anchor_index = planned.explain.anchor_component_index;
+        planned.anchor_entities = base_plan.anchor_entities;
 
         if (auto seed = build_seed_plan(expression_)) {
             if (seed->candidates.size() < planned.explain.candidate_rows) {
