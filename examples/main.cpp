@@ -1,27 +1,29 @@
-#include <iostream>
-
 #include "ecs/ecs.hpp"
 
-namespace {
+#include <iostream>
 
 struct Position {
-    float x;
-    float y;
+    float x = 0.0f;
+    float y = 0.0f;
 };
-
-}  // namespace
 
 int main() {
     ecs::Registry registry;
+    registry.register_component<Position>("Position");
 
-    const ecs::Entity player = registry.create();
-    auto tx = registry.transaction<Position>();
-    tx.write<Position>(player, Position{10.0f, 20.0f});
-    tx.commit();
+    const ecs::Entity entity = registry.create();
 
-    auto read_tx = registry.transaction<Position>();
-    const Position& position = read_tx.get<Position>(player);
-    std::cout << "entity " << player << " -> (" << position.x << ", " << position.y << ")\n";
+    registry.add<Position>(entity, Position{1.0f, 2.0f});
 
+    if (Position* position = registry.write<Position>(entity)) {
+        position->x += 3.0f;
+    }
+
+    const Position* position = registry.get<Position>(entity);
+    if (position == nullptr) {
+        return 1;
+    }
+
+    std::cout << position->x << ", " << position->y << '\n';
     return 0;
 }
