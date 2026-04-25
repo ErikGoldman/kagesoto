@@ -106,7 +106,7 @@ TEST_CASE("owning groups are chosen as the view anchor when they are the cheapes
     REQUIRE(explain_text.find("group row fetch") != std::string::npos);
 }
 
-TEST_CASE("owning groups promote committed MVCC writes into isolated group storage while staged queries still work") {
+TEST_CASE("owning groups promote committed direct writes into group storage") {
     ecs::Registry registry(4);
 
     const ecs::Entity grouped = registry.create();
@@ -121,29 +121,6 @@ TEST_CASE("owning groups promote committed MVCC writes into isolated group stora
     }
 
     registry.group<Position, Velocity>();
-
-    {
-        auto tx = registry.transaction<Position, Velocity>();
-        tx.write<Velocity>(partial, Velocity{7, 8});
-
-        std::vector<ecs::Entity> seen;
-        tx.view<const Position, const Velocity>().forEach([&](ecs::Entity entity, const Position&, const Velocity&) {
-            seen.push_back(entity);
-        });
-        std::sort(seen.begin(), seen.end());
-        REQUIRE(seen == std::vector<ecs::Entity>{grouped, partial});
-
-        tx.rollback();
-    }
-
-    {
-        auto tx = registry.transaction<Position, Velocity>();
-        std::vector<ecs::Entity> seen;
-        tx.view<const Position, const Velocity>().forEach([&](ecs::Entity entity, const Position&, const Velocity&) {
-            seen.push_back(entity);
-        });
-        REQUIRE(seen == std::vector<ecs::Entity>{grouped});
-    }
 
     {
         auto tx = registry.transaction<Position, Velocity>();
@@ -190,21 +167,16 @@ TEST_CASE("owning groups promote committed MVCC writes into isolated group stora
     }
 }
 
-TEST_CASE("owning groups enforce shared storage modes and exclusive ownership") {
-    ecs::Registry mismatched(4);
-    mismatched.set_storage_mode<Position>(ecs::ComponentStorageMode::classic);
-    REQUIRE_THROWS_AS((mismatched.group<Position, Velocity>()), std::logic_error);
-
+TEST_CASE("owning groups enforce exclusive ownership") {
     ecs::Registry registry(4);
     registry.group<Position, Velocity>();
     REQUIRE_THROWS_AS((registry.group<Velocity, Health>()), std::logic_error);
 }
 
-TEST_CASE("trace ondemand owning groups preserve history and rollback while group membership stays intact") {
+TEST_CASE("copy-on-write trace owning groups preserve history and rollback while group membership stays intact") {
     ecs::Registry registry(4);
     registry.set_trace_max_history(8);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_ondemand);
-    registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::trace_ondemand);
+    registry.set_tracing_enabled(true);
     registry.group<Position, Velocity>();
 
     const ecs::Entity entity = registry.create();
@@ -245,94 +217,10 @@ TEST_CASE("trace ondemand owning groups preserve history and rollback while grou
     REQUIRE(seen == std::vector<ecs::Entity>{entity});
 }
 
-TEST_CASE("trace ondemand owning groups demote correctly when committed removal breaks membership") {
+TEST_CASE("copy-on-write trace owning groups demote correctly when committed removal breaks membership") {
     ecs::Registry registry(4);
     registry.set_trace_max_history(8);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_ondemand);
-    registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::trace_ondemand);
-    registry.group<Position, Velocity>();
-
-    const ecs::Entity entity = registry.create();
-
-    registry.set_current_trace_time(1);
-    {
-        auto tx = registry.transaction<Position, Velocity>();
-        tx.write<Position>(entity, Position{1, 2});
-        tx.write<Velocity>(entity, Velocity{3, 4});
-        tx.commit();
-    }
-
-    registry.set_current_trace_time(2);
-    REQUIRE(registry.remove<Velocity>(entity));
-
-    auto tx = registry.transaction<Position, Velocity>();
-    REQUIRE(tx.has<Position>(entity));
-    REQUIRE_FALSE(tx.has<Velocity>(entity));
-
-    std::vector<ecs::Entity> positions;
-    tx.storage<Position>().each([&](ecs::Entity current, const Position&) {
-        positions.push_back(current);
-    });
-    REQUIRE(positions == std::vector<ecs::Entity>{entity});
-
-    std::vector<ecs::Entity> grouped;
-    tx.view<const Position, const Velocity>().forEach([&](ecs::Entity current, const Position&, const Velocity&) {
-        grouped.push_back(current);
-    });
-    REQUIRE(grouped.empty());
-}
-
-TEST_CASE("trace preallocate owning groups expose retained frames and keep queries correct after rollback") {
-    ecs::Registry registry(4);
-    registry.set_trace_max_history(4);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
-    registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::trace_preallocate);
-    registry.group<Position, Velocity>();
-
-    const ecs::Entity entity = registry.create();
-
-    registry.set_current_trace_time(1);
-    {
-        auto tx = registry.transaction<Position, Velocity>();
-        tx.write<Position>(entity, Position{1, 2});
-        tx.write<Velocity>(entity, Velocity{3, 4});
-        tx.commit();
-    }
-
-    registry.set_current_trace_time(2);
-    {
-        auto tx = registry.transaction<Position, Velocity>();
-        tx.write<Position>(entity, Position{10, 20});
-        tx.write<Velocity>(entity, Velocity{30, 40});
-        tx.commit();
-    }
-
-    std::vector<ecs::Timestamp> timestamps;
-    registry.each_trace_change<Position>(entity, [&](ecs::TraceChangeInfo info, const Position*) {
-        timestamps.push_back(info.timestamp);
-    });
-    REQUIRE(timestamps == std::vector<ecs::Timestamp>{1});
-
-    registry.set_current_trace_time(3);
-    REQUIRE(registry.rollback_to_timestamp<Position>(entity, 1));
-
-    auto tx = registry.transaction<Position, Velocity>();
-    std::vector<ecs::Entity> seen;
-    tx.view<const Position, const Velocity>().forEach([&](ecs::Entity current, const Position& position, const Velocity& velocity) {
-        seen.push_back(current);
-        REQUIRE(position.x == 1);
-        REQUIRE(position.y == 2);
-        REQUIRE(velocity.dx == 30);
-        REQUIRE(velocity.dy == 40);
-    });
-    REQUIRE(seen == std::vector<ecs::Entity>{entity});
-}
-
-TEST_CASE("trace preallocate owning groups demote correctly when committed removal breaks membership") {
-    ecs::Registry registry(4);
-    registry.set_trace_max_history(4);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
-    registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::trace_preallocate);
+    registry.set_tracing_enabled(true);
     registry.group<Position, Velocity>();
 
     const ecs::Entity entity = registry.create();

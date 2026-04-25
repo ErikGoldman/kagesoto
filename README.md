@@ -3,7 +3,7 @@
 Kagesoto is a C++17 ECS based on sparse lists with a few unusual features:
 * First-class support for singletons
 * Can rewind the system to previous states (for e.g. debugging)
-* Optional MVCC for transactional writes
+* Direct transactional writes with configurable trace history
 * Indexed fields for selective queries
 * Group support to optimize multi-component views
 
@@ -81,11 +81,11 @@ Views pick an execution plan from the available sources: component storage, owni
 
 ## Core API
 
-- `ecs::Registry` owns entities, component storage, storage-mode settings, snapshots, transactions, indexes, trace history, and groups.
+- `ecs::Registry` owns entities, component storage, snapshots, transactions, indexes, trace history, and groups.
 - `ecs::Entity` is a 64-bit handle. Use `registry.alive(entity)` when accepting handles from outside the current flow.
 - `registry.transaction<T...>()` opens a typed transaction. The component list is the transaction's access declaration.
 - `tx.write<T>(entity, value)` creates or updates a component in the transaction-visible state.
-- `tx.commit()` publishes writes. In rollback-capable modes, closing a transaction without `commit()` rolls back pending writes.
+- `tx.commit()` closes the transaction. Component writes are direct and remain visible even if a transaction is destroyed without an explicit commit.
 - `registry.snapshot()` opens a read-only view over committed component state.
 - `registry.group<A, B>()` creates an owning group for entities that have all grouped components.
 
@@ -111,69 +111,26 @@ clock->tick += 1;
 tx.commit();
 ```
 
-## Storage Modes
+## Tracing
 
-Storage mode is configured per component before that component's storage is first created. Components default to `ecs::ComponentStorageMode::mvcc`.
-
-```cpp
-ecs::Registry registry;
-
-registry.set_storage_mode<Position>(ecs::ComponentStorageMode::mvcc);
-registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::classic);
-registry.set_trace_max_history(128);
-registry.set_storage_mode<DamageEvent>(ecs::ComponentStorageMode::trace_ondemand);
-```
-
-Use `mvcc` when you want the safest default: stable snapshot visibility, isolated uncommitted writes, and transaction rollback. This is the right choice for editor code, simulations with concurrent readers, and most components unless profiling proves the overhead matters.
+All component storage is direct-write storage. The registry enforces per-component access rules: one writer is exclusive, and readers cannot overlap an active writer for the same component.
 
 ```cpp
-registry.set_storage_mode<Position>(ecs::ComponentStorageMode::mvcc);
-
 auto tx = registry.transaction<Position>();
 tx.write<Position>(entity, Position{10.0f, 20.0f});
-tx.rollback(); // valid: the write is discarded
-```
-
-Use `classic` when a component is updated in a tightly controlled phase and you prefer lower write overhead over rollback and MVCC isolation. `classic` writes directly into storage. The registry enforces per-component access rules: one writer is exclusive, and readers cannot overlap an active writer for the same direct-write component.
-
-```cpp
-registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::classic);
-
-auto tx = registry.transaction<Velocity>();
-Velocity* velocity = tx.write<Velocity>(entity);
-velocity->dx += 1.0f;
-tx.commit(); // rollback is not supported for direct-write storage
-```
-
-Use `trace_ondemand` when you need rewind history for a component that changes occasionally or only on meaningful events. It behaves like MVCC for transactions and records committed writes with the current trace timestamp.
-
-```cpp
-registry.set_trace_max_history(256);
-registry.set_storage_mode<Health>(ecs::ComponentStorageMode::trace_ondemand);
-
-registry.set_current_trace_time(42);
-auto tx = registry.transaction<Health>();
-tx.write<Health>(entity, Health{75});
 tx.commit();
 ```
 
-Use `trace_preallocate` when the component changes nearly every tick and trace history should be captured at trace-time boundaries rather than per committed write. It is direct-write storage, so rollback of ordinary transactions is not supported. You must call `set_trace_max_history()` before the storage is created.
+Trace history is globally enabled or disabled. Enabling tracing allocates trace structures for existing storages and captures a baseline at the current trace timestamp. Disabling tracing keeps old history but records no new writes, removals, or frames.
 
 ```cpp
-registry.set_trace_max_history(64);
-registry.set_storage_mode<Transform>(ecs::ComponentStorageMode::trace_preallocate);
-
-registry.set_current_trace_time(100);
-{
-    auto tx = registry.transaction<Transform>();
-    tx.write<Transform>(entity, Transform{0.0f, 0.0f});
-    tx.commit();
-}
-
-registry.set_current_trace_time(101); // captures the timestamp 100 dense state
+ecs::Registry registry;
+registry.set_trace_max_history(128);
+registry.set_current_trace_time(1);
+registry.set_tracing_enabled(true);
 ```
 
-Set a component type's default mode with `ComponentStorageModeTraits` when the choice belongs to the component type instead of one registry setup site.
+By default, tracing stores copy-on-write records for committed writes and removals. Use `ComponentTraceStorageTraits` when a component should use preallocated frame snapshots instead.
 
 ```cpp
 struct Transform {
@@ -184,14 +141,12 @@ struct Transform {
 namespace ecs {
 
 template <>
-struct ComponentStorageModeTraits<Transform> {
-    static constexpr ComponentStorageMode value = ComponentStorageMode::classic;
+struct ComponentTraceStorageTraits<Transform> {
+    static constexpr ComponentTraceStorage value = ComponentTraceStorage::preallocated;
 };
 
 }  // namespace ecs
 ```
-
-Once storage exists for a component type, changing that component's storage mode throws `std::logic_error`.
 
 ## Indices
 
@@ -276,18 +231,18 @@ Important limitation: if a component belongs to an owning group, storage lookups
 
 ## Trace History
 
-Trace history is for user-visible rewind, rollback-to-time, replay inspection, and time-travel debugging. It records component state against the registry's current trace timestamp, which you advance with `set_current_trace_time()`.
+Trace history is for user-visible rewind, rollback-to-time, replay inspection, and time-travel debugging. It records component state against the registry's current trace timestamp, which you advance with `set_current_trace_time()`. Tracing records data only while `set_tracing_enabled(true)` is active.
 
-Use `trace_ondemand` when history should track committed changes. This is usually the right mode for health, inventory, gameplay flags, sparse events, and editor state where changes are meaningful but not every component changes every tick.
+Copy-on-write trace storage tracks committed changes. This is the default and is usually the right strategy for health, inventory, gameplay flags, sparse events, and editor state where changes are meaningful but not every component changes every tick.
 
 ```cpp
 ecs::Registry registry;
 registry.set_trace_max_history(16);
-registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_ondemand);
 
 const ecs::Entity entity = registry.create();
-
 registry.set_current_trace_time(1);
+registry.set_tracing_enabled(true);
+
 {
     auto tx = registry.transaction<Position>();
     tx.write<Position>(entity, Position{1.0f, 2.0f});
@@ -315,16 +270,16 @@ registry.set_current_trace_time(4);
 registry.rollback_to_timestamp<Position>(entity, 1);
 ```
 
-Use `trace_preallocate` when most rows are expected to change every frame and you want bounded frame snapshots. The previous dense state is captured when `set_current_trace_time()` advances, so call it at the boundary between simulated times.
+Use preallocated trace storage when most rows are expected to change every frame and you want bounded frame snapshots. The previous dense state is captured when `set_current_trace_time()` advances, so call it at the boundary between simulated times.
 
 ```cpp
 ecs::Registry registry;
 registry.set_trace_max_history(4);
-registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
 
 const ecs::Entity entity = registry.create();
 
 registry.set_current_trace_time(10);
+registry.set_tracing_enabled(true);
 {
     auto tx = registry.transaction<Position>();
     tx.write<Position>(entity, Position{1.0f, 2.0f});
@@ -344,7 +299,7 @@ registry.rollback_to_timestamp<Position>(entity, 10);
 
 Trace timestamps are monotonic. `set_trace_max_history()` bounds retained history; older history is compacted when trace time advances. Trace operations that mutate history, including changing trace time and rollback-to-timestamp, require open readers and transactions to be closed first.
 
-Removals are part of trace history. In `trace_ondemand`, removing a component records a tombstone at the current trace timestamp. Rolling back to a timestamp before a tombstone can restore the component; rolling back to a timestamp with no prior value can remove it.
+Removals are part of trace history. In copy-on-write trace storage, removing a component records a tombstone at the current trace timestamp. Rolling back to a timestamp before a tombstone can restore the component.
 
 Singleton components can also use trace storage. Call `each_trace_change<T>(callback)` and `rollback_to_timestamp<T>(timestamp)` without an entity argument.
 
@@ -365,7 +320,7 @@ tx.view<const Position, const Velocity>().forEach(
 
 Groups are best for stable, frequently co-iterated component sets such as `Position` plus `Velocity`. Avoid grouping components that churn in and out constantly unless profiling shows the grouped layout still wins.
 
-Grouped component types must share the same storage mode, and a component type can belong to only one owning group. Entities are promoted into the group when they have every grouped component and demoted when a committed removal breaks membership. Existing storage and view APIs continue to work.
+A component type can belong to only one owning group. Entities are promoted into the group when they have every grouped component and demoted when a committed removal breaks membership. Existing storage and view APIs continue to work.
 
 ## Build
 

@@ -17,10 +17,6 @@ struct Velocity {
     int dy;
 };
 
-struct ClassicByTrait {
-    int value;
-};
-
 struct PreallocatedTraceByTrait {
     int value;
 };
@@ -34,13 +30,8 @@ struct GameClock {
 namespace ecs {
 
 template <>
-struct ComponentStorageModeTraits<ClassicByTrait> {
-    static constexpr ComponentStorageMode value = ComponentStorageMode::classic;
-};
-
-template <>
-struct ComponentStorageModeTraits<PreallocatedTraceByTrait> {
-    static constexpr ComponentStorageMode value = ComponentStorageMode::trace_preallocate;
+struct ComponentTraceStorageTraits<PreallocatedTraceByTrait> {
+    static constexpr ComponentTraceStorage value = ComponentTraceStorage::preallocated;
 };
 
 template <>
@@ -63,41 +54,42 @@ TEST_CASE("component ids are stable and distinct per component type") {
     REQUIRE(position_id != velocity_id);
 }
 
-TEST_CASE("component storage modes default to MVCC and can be configured per component") {
+TEST_CASE("tracing can be globally enabled and disabled while retaining history") {
     ecs::Registry registry(4);
-
-    REQUIRE(registry.storage_mode<Position>() == ecs::ComponentStorageMode::mvcc);
-    REQUIRE(registry.storage_mode<ClassicByTrait>() == ecs::ComponentStorageMode::classic);
-    REQUIRE(registry.storage_mode<PreallocatedTraceByTrait>() == ecs::ComponentStorageMode::trace_preallocate);
-
-    registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::trace_ondemand);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::classic);
-    REQUIRE(registry.storage_mode<Position>() == ecs::ComponentStorageMode::classic);
-    REQUIRE(registry.storage_mode<Velocity>() == ecs::ComponentStorageMode::trace_ondemand);
-
-    const ecs::Entity entity = registry.create();
-    auto tx = registry.transaction<Position, Velocity>();
-    tx.write<Position>(entity, Position{1, 2});
-    tx.commit();
-
-    REQUIRE_THROWS_AS(registry.set_storage_mode<Position>(ecs::ComponentStorageMode::mvcc), std::logic_error);
-}
-
-TEST_CASE("preallocated trace storage requires explicit bounded history before creation") {
-    ecs::Registry registry(4);
-    registry.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
     const ecs::Entity entity = registry.create();
 
-    REQUIRE_THROWS_AS(registry.transaction<Position>().write<Position>(entity, Position{1, 2}), std::logic_error);
+    {
+        auto tx = registry.transaction<Position>();
+        tx.write<Position>(entity, Position{1, 2});
+        tx.commit();
+    }
 
-    ecs::Registry configured(4);
-    configured.set_trace_max_history(3);
-    configured.set_storage_mode<Position>(ecs::ComponentStorageMode::trace_preallocate);
-    const ecs::Entity configured_entity = configured.create();
+    registry.set_current_trace_time(1);
+    registry.set_tracing_enabled(true);
+    REQUIRE(registry.tracing_enabled());
 
-    auto tx = configured.transaction<Position>();
-    REQUIRE(tx.write<Position>(configured_entity, Position{3, 4}) != nullptr);
-    tx.commit();
+    registry.set_current_trace_time(2);
+    {
+        auto tx = registry.transaction<Position>();
+        tx.write<Position>(entity, Position{3, 4});
+        tx.commit();
+    }
+
+    registry.set_tracing_enabled(false);
+    registry.set_current_trace_time(3);
+    {
+        auto tx = registry.transaction<Position>();
+        tx.write<Position>(entity, Position{5, 6});
+        tx.commit();
+    }
+
+    std::vector<int> seen;
+    registry.each_trace_change<Position>(entity, [&](ecs::TraceChangeInfo, const Position* position) {
+        if (position != nullptr) {
+            seen.push_back(position->x);
+        }
+    });
+    REQUIRE(seen == std::vector<int>{1, 3});
 }
 
 TEST_CASE("singleton components exist without an entity and are not removed by entity lifecycle changes") {
@@ -119,7 +111,7 @@ TEST_CASE("singleton components exist without an entity and are not removed by e
 
 TEST_CASE("singleton trace history works without an entity argument") {
     ecs::Registry registry(4);
-    registry.set_storage_mode<GameClock>(ecs::ComponentStorageMode::trace_ondemand);
+    registry.set_tracing_enabled(true);
 
     registry.set_current_trace_time(1);
     {

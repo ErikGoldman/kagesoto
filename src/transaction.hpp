@@ -196,10 +196,10 @@ public:
           max_visible_tsn_(other.max_visible_tsn_),
           active_at_open_(std::move(other.active_at_open_)),
           view_plan_cache_(std::move(other.view_plan_cache_)),
-          holds_snapshot_classic_access_(other.holds_snapshot_classic_access_) {
+          holds_snapshot_direct_access_(other.holds_snapshot_direct_access_) {
         other.registry_ = nullptr;
         other.max_visible_tsn_ = 0;
-        other.holds_snapshot_classic_access_ = false;
+        other.holds_snapshot_direct_access_ = false;
     }
 
     Snapshot& operator=(Snapshot&& other) noexcept {
@@ -209,10 +209,10 @@ public:
             max_visible_tsn_ = other.max_visible_tsn_;
             active_at_open_ = std::move(other.active_at_open_);
             view_plan_cache_ = std::move(other.view_plan_cache_);
-            holds_snapshot_classic_access_ = other.holds_snapshot_classic_access_;
+            holds_snapshot_direct_access_ = other.holds_snapshot_direct_access_;
             other.registry_ = nullptr;
             other.max_visible_tsn_ = 0;
-            other.holds_snapshot_classic_access_ = false;
+            other.holds_snapshot_direct_access_ = false;
         }
         return *this;
     }
@@ -288,7 +288,7 @@ public:
 
     bool has_stable_visibility() const {
         require_open();
-        return active_at_open_.empty();
+        return true;
     }
 
     bool has_pending_writes() const {
@@ -322,22 +322,21 @@ public:
     }
 
 protected:
-    Snapshot(Registry& registry, bool register_snapshot_classic_access)
+    Snapshot(Registry& registry, bool register_snapshot_direct_access)
         : registry_(&registry),
-          max_visible_tsn_(registry.next_tsn_ - 1),
-          active_at_open_(registry.active_transactions_snapshot()) {
+          max_visible_tsn_(0) {
         registry_->register_reader();
         try {
-            if (register_snapshot_classic_access) {
-                registry_->register_snapshot_classic_access();
-                holds_snapshot_classic_access_ = true;
+            if (register_snapshot_direct_access) {
+                registry_->register_snapshot_direct_access();
+                holds_snapshot_direct_access_ = true;
             }
         } catch (...) {
             registry_->unregister_reader();
             registry_ = nullptr;
             max_visible_tsn_ = 0;
             active_at_open_.clear();
-            holds_snapshot_classic_access_ = false;
+            holds_snapshot_direct_access_ = false;
             throw;
         }
     }
@@ -351,9 +350,9 @@ protected:
     void close() {
         if (registry_ != nullptr) {
             invalidate_view_plan_cache();
-            if (holds_snapshot_classic_access_) {
-                registry_->unregister_snapshot_classic_access();
-                holds_snapshot_classic_access_ = false;
+            if (holds_snapshot_direct_access_) {
+                registry_->unregister_snapshot_direct_access();
+                holds_snapshot_direct_access_ = false;
             }
             registry_->unregister_reader();
             registry_ = nullptr;
@@ -370,7 +369,7 @@ protected:
     Timestamp max_visible_tsn_ = 0;
     std::vector<Timestamp> active_at_open_;
     mutable std::unordered_map<const void*, std::unique_ptr<ViewPlanCacheEntryBase>> view_plan_cache_;
-    bool holds_snapshot_classic_access_ = false;
+    bool holds_snapshot_direct_access_ = false;
 };
 
 template <typename... DeclaredComponents>
@@ -382,16 +381,10 @@ class Transaction : public Snapshot {
 
 public:
     explicit Transaction(Registry& registry)
-        : Snapshot(registry, false),
-          tsn_(registry.acquire_tsn()) {
-        max_visible_tsn_ = tsn_ - 1;
-        active_at_open_ = registry.active_transactions_snapshot();
-        registry_->register_transaction(tsn_);
+        : Snapshot(registry, false) {
         try {
-            classic_accesses_ = registry_->template register_transaction_classic_access<DeclaredComponents...>();
+            direct_accesses_ = registry_->template register_transaction_direct_access<DeclaredComponents...>();
         } catch (...) {
-            registry_->unregister_transaction(tsn_);
-            tsn_ = 0;
             close();
             throw;
         }
@@ -402,22 +395,16 @@ public:
             return;
         }
 
-        if (rollback_supported()) {
-            finalize_writes(false);
-        } else {
-            finalize_writes(true);
-        }
+        finalize_writes(true);
     }
 
     Transaction(Transaction&& other) noexcept
         : Snapshot(std::move(other)),
-          tsn_(other.tsn_),
           pending_write_stores_(std::move(other.pending_write_stores_)),
-          classic_accesses_(std::move(other.classic_accesses_)),
+          direct_accesses_(std::move(other.direct_accesses_)),
           pending_write_count_(other.pending_write_count_),
           pending_write_reserve_hint_(other.pending_write_reserve_hint_),
           pending_write_epoch_(other.pending_write_epoch_) {
-        other.tsn_ = 0;
         other.pending_write_count_ = 0;
         other.pending_write_reserve_hint_ = 0;
         other.pending_write_epoch_ = 0;
@@ -426,20 +413,14 @@ public:
     Transaction& operator=(Transaction&& other) noexcept {
         if (this != &other) {
             if (registry_ != nullptr) {
-                if (rollback_supported()) {
-                    finalize_writes(false);
-                } else {
-                    finalize_writes(true);
-                }
+                finalize_writes(true);
             }
             Snapshot::operator=(std::move(other));
-            tsn_ = other.tsn_;
             pending_write_stores_ = std::move(other.pending_write_stores_);
-            classic_accesses_ = std::move(other.classic_accesses_);
+            direct_accesses_ = std::move(other.direct_accesses_);
             pending_write_count_ = other.pending_write_count_;
             pending_write_reserve_hint_ = other.pending_write_reserve_hint_;
             pending_write_epoch_ = other.pending_write_epoch_;
-            other.tsn_ = 0;
             other.pending_write_count_ = 0;
             other.pending_write_reserve_hint_ = 0;
             other.pending_write_epoch_ = 0;
@@ -473,7 +454,7 @@ public:
         }
 
         const RawPagedSparseArray* raw = registry_->storage_for_entity(entity, component);
-        return raw == nullptr ? nullptr : raw->try_get_visible_raw(entity, max_visible_tsn_, active_at_open_, tsn_);
+        return raw == nullptr ? nullptr : raw->try_get_visible_raw(entity, max_visible_tsn_, active_at_open_, 0);
     }
 
     template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...> &&
@@ -487,7 +468,7 @@ public:
     const T* try_get() const {
         require_open();
         auto& storage = registry_->template assure_singleton_storage<T>();
-        return storage.try_get_visible(detail::singleton_entity, max_visible_tsn_, active_at_open_, tsn_);
+        return storage.try_get_visible(detail::singleton_entity, max_visible_tsn_, active_at_open_, 0);
     }
 
     template <typename T, typename = std::enable_if_t<detail::readable_component_v<T, DeclaredComponents...> &&
@@ -558,12 +539,12 @@ public:
 
     const void* try_get_visible_dense(const RawPagedSparseArray& storage, std::size_t dense_index) const {
         ECS_PROFILE_ZONE("Transaction::try_get_visible_dense");
-        return storage.try_get_visible_dense_raw(dense_index, max_visible_tsn_, active_at_open_, tsn_);
+        return storage.try_get_visible_dense_raw(dense_index, max_visible_tsn_, active_at_open_, 0);
     }
 
     const void* try_get_visible_from_storage(const RawPagedSparseArray& storage, Entity entity) const {
         ECS_PROFILE_ZONE("Transaction::try_get_from_storage");
-        return storage.try_get_visible_raw(entity, max_visible_tsn_, active_at_open_, tsn_);
+        return storage.try_get_visible_raw(entity, max_visible_tsn_, active_at_open_, 0);
     }
 
     template <typename T, typename = std::enable_if_t<detail::writable_component_v<T, DeclaredComponents...> &&
@@ -574,12 +555,12 @@ public:
         registry_->require_alive(entity);
 
         if (auto* pending = find_pending<T>(entity)) {
-            return pending->storage->staged_ptr(pending->pending, tsn_);
+            return pending->storage->staged_ptr(pending->pending, 0);
         }
 
         auto& storage = registry_->template assure_storage_for_entity<T>(entity);
-        auto pending = storage.stage_write(entity, tsn_, active_at_open_, max_visible_tsn_);
-        T* staged = storage.staged_ptr(pending, tsn_);
+        auto pending = storage.stage_write(entity, 0, active_at_open_, max_visible_tsn_);
+        T* staged = storage.staged_ptr(pending, 0);
         add_pending_write(entity, &storage, pending);
         return staged;
     }
@@ -595,14 +576,14 @@ public:
 
         T value{std::forward<Args>(args)...};
         if (auto* pending = find_pending<T>(entity)) {
-            T* staged = pending->storage->staged_ptr(pending->pending, tsn_);
+            T* staged = pending->storage->staged_ptr(pending->pending, 0);
             std::memcpy(staged, &value, sizeof(T));
             return staged;
         }
 
         auto& storage = registry_->template assure_storage_for_entity<T>(entity);
-        auto pending = storage.stage_value(entity, tsn_, value);
-        T* staged = storage.staged_ptr(pending, tsn_);
+        auto pending = storage.stage_value(entity, 0, value);
+        T* staged = storage.staged_ptr(pending, 0);
         add_pending_write(entity, &storage, pending);
         return staged;
     }
@@ -614,12 +595,12 @@ public:
         require_open();
 
         if (auto* pending = find_pending_singleton<T>()) {
-            return pending->storage->staged_ptr(pending->pending, tsn_);
+            return pending->storage->staged_ptr(pending->pending, 0);
         }
 
         auto& storage = registry_->template assure_singleton_storage<T>();
-        auto pending = storage.stage_write(detail::singleton_entity, tsn_, active_at_open_, max_visible_tsn_);
-        T* staged = storage.staged_ptr(pending, tsn_);
+        auto pending = storage.stage_write(detail::singleton_entity, 0, active_at_open_, max_visible_tsn_);
+        T* staged = storage.staged_ptr(pending, 0);
         add_pending_write(detail::singleton_entity, &storage, pending, false);
         return staged;
     }
@@ -637,14 +618,14 @@ public:
 
         T value{std::forward<Args>(args)...};
         if (auto* pending = find_pending_singleton<T>()) {
-            T* staged = pending->storage->staged_ptr(pending->pending, tsn_);
+            T* staged = pending->storage->staged_ptr(pending->pending, 0);
             std::memcpy(staged, &value, sizeof(T));
             return staged;
         }
 
         auto& storage = registry_->template assure_singleton_storage<T>();
-        auto pending = storage.stage_value(detail::singleton_entity, tsn_, value);
-        T* staged = storage.staged_ptr(pending, tsn_);
+        auto pending = storage.stage_value(detail::singleton_entity, 0, value);
+        T* staged = storage.staged_ptr(pending, 0);
         add_pending_write(detail::singleton_entity, &storage, pending, false);
         return staged;
     }
@@ -659,11 +640,10 @@ public:
             return;
         }
 
-        if (!rollback_supported()) {
-            throw std::logic_error("direct-write component storage does not support transaction rollback");
+        if (pending_write_count_ != 0) {
+            throw std::logic_error("component storage does not support transaction rollback");
         }
-
-        finalize_writes(false);
+        finalize_writes(true);
     }
 
 private:
@@ -764,16 +744,6 @@ private:
         return find_pending<T>(detail::singleton_entity);
     }
 
-    bool rollback_supported() const {
-        bool supported = true;
-        for_each_pending_entry([&](const auto& entry) {
-            if (is_direct_write_storage_mode(entry.storage->storage_mode())) {
-                supported = false;
-            }
-        });
-        return supported;
-    }
-
     void finalize_writes(bool commit_writes) {
         require_open();
 
@@ -786,16 +756,29 @@ private:
             }
         });
 
-        for_each_pending_entry([&](auto& entry) {
-            if (commit_writes) {
-                entry.storage->commit_staged(entry.entity, entry.pending, tsn_, registry_->trace_commit_context_);
-                if (entry.requires_alive) {
-                    touched_entities.push_back(entry.entity);
+        try {
+            for_each_pending_entry([&](auto& entry) {
+                if (commit_writes) {
+                    entry.storage->commit_staged(entry.entity, entry.pending, 0, registry_->trace_commit_context_);
+                    if (entry.requires_alive) {
+                        touched_entities.push_back(entry.entity);
+                    }
+                } else {
+                    entry.storage->rollback_staged(entry.entity, entry.pending, 0);
                 }
-            } else {
-                entry.storage->rollback_staged(entry.entity, entry.pending, tsn_);
-            }
-        });
+            });
+        } catch (...) {
+            for_each_pending_entry([&](auto& entry) {
+                entry.storage->rollback_staged(entry.entity, entry.pending, 0);
+            });
+            std::apply([](auto&... stores) { (stores.clear(), ...); }, pending_write_stores_);
+            pending_write_count_ = 0;
+            pending_write_epoch_ = 0;
+            registry_->unregister_direct_access(direct_accesses_);
+            direct_accesses_.clear();
+            close();
+            throw;
+        }
 
         if (commit_writes && !touched_entities.empty()) {
             std::sort(touched_entities.begin(), touched_entities.end());
@@ -806,12 +789,8 @@ private:
         std::apply([](auto&... stores) { (stores.clear(), ...); }, pending_write_stores_);
         pending_write_count_ = 0;
         pending_write_epoch_ = 0;
-        registry_->unregister_classic_access(classic_accesses_);
-        classic_accesses_.clear();
-        if (tsn_ != 0) {
-            registry_->unregister_transaction(tsn_);
-        }
-        tsn_ = 0;
+        registry_->unregister_direct_access(direct_accesses_);
+        direct_accesses_.clear();
         close();
     }
 
@@ -858,14 +837,13 @@ public:
     void each_pending_write(Func&& func) const {
         const auto& store = pending_store<T>();
         for (const auto& pending : store.writes) {
-            const T* staged = pending.storage->staged_ptr(pending.pending, tsn_);
+            const T* staged = pending.storage->staged_ptr(pending.pending, 0);
             func(pending.entity, staged);
         }
     }
 
-    Timestamp tsn_ = 0;
     std::tuple<PendingWriteStore<detail::component_base_t<DeclaredComponents>>...> pending_write_stores_;
-    std::vector<typename Registry::ClassicAccessRegistration> classic_accesses_;
+    std::vector<typename Registry::DirectAccessRegistration> direct_accesses_;
     std::size_t pending_write_count_ = 0;
     std::size_t pending_write_reserve_hint_ = 0;
     std::size_t pending_write_epoch_ = 0;

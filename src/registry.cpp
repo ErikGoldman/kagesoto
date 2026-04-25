@@ -107,13 +107,10 @@ void Registry::clear() {
     entity_dense_indices_.clear();
     alive_entities_.clear();
     free_entities_.clear();
-    active_transactions_.clear();
     active_readers_ = 0;
-    classic_access_.clear();
-    snapshot_classic_readers_ = 0;
-    recompute_classic_mode_flag();
+    direct_access_.clear();
+    snapshot_direct_readers_ = 0;
     next_entity_index_ = 0;
-    next_tsn_ = 1;
 }
 
 bool Registry::alive(Entity entity) const {
@@ -133,6 +130,19 @@ std::size_t Registry::entity_count() const {
 
 const std::vector<Entity>& Registry::entities() const {
     return alive_entities_;
+}
+
+void Registry::set_tracing_enabled(bool enabled) {
+    require_no_readers();
+    if (trace_commit_context_.enabled == enabled) {
+        return;
+    }
+
+    trace_commit_context_.enabled = enabled;
+    if (enabled) {
+        initialize_trace_history();
+        compact_trace_history();
+    }
 }
 
 bool Registry::has(Entity entity, ComponentId component) const {
@@ -242,22 +252,18 @@ RawPagedSparseArray& Registry::assure_storage(
     ensure_component_slot(componentId);
 
     ComponentSlot& slot = components_[componentId];
-    if (!slot.mode_configured) {
-        slot.mode = resolved_storage_mode(componentId);
-        slot.mode_configured = true;
+    if (!slot.trace_storage_configured) {
+        slot.trace_storage = ComponentTraceStorage::copy_on_write;
+        slot.trace_storage_configured = true;
         slot.singleton = false;
-        recompute_classic_mode_flag();
     }
 
     RawPagedSparseArray* component = slot.storage;
     if (component == nullptr) {
-        if (slot.mode == ComponentStorageMode::trace_preallocate && !trace_max_history_configured_) {
-            throw std::logic_error("trace_preallocate storage requires set_trace_max_history before storage creation");
-        }
         component = new RawPagedSparseArray(
             component_size,
             component_alignment,
-            slot.mode,
+            slot.trace_storage,
             page_size_,
             trace_max_history_);
         slot.storage = component;
@@ -291,29 +297,8 @@ void Registry::ensure_component_slot(ComponentId componentId) {
     }
 }
 
-ComponentStorageMode Registry::resolved_storage_mode(ComponentId componentId) const {
-    if (componentId >= components_.size() || !components_[componentId].mode_configured) {
-        return ComponentStorageMode::mvcc;
-    }
-    return components_[componentId].mode;
-}
-
-void Registry::recompute_classic_mode_flag() {
-    has_classic_storage_mode_ = false;
-    for (const ComponentSlot& slot : components_) {
-        if (slot.mode_configured && is_direct_write_storage_mode(slot.mode)) {
-            has_classic_storage_mode_ = true;
-            return;
-        }
-    }
-}
-
 void Registry::compact_trace_history() {
     for (ComponentSlot& slot : components_) {
-        if (!is_trace_storage_mode(slot.mode)) {
-            continue;
-        }
-
         RawPagedSparseArray* target = slot.storage;
         if (slot.owner != nullptr) {
             target = slot.owner->storage(&slot - components_.data());
@@ -322,19 +307,13 @@ void Registry::compact_trace_history() {
             continue;
         }
 
-        if (slot.mode == ComponentStorageMode::trace_ondemand) {
-            target->compact_trace_history(trace_commit_context_.timestamp, trace_max_history_);
-        } else {
-            target->compact_preallocated_trace_history(trace_commit_context_.timestamp, trace_max_history_);
-        }
+        target->compact_trace_history(trace_commit_context_.timestamp, trace_max_history_);
+        target->compact_preallocated_trace_history(trace_commit_context_.timestamp, trace_max_history_);
     }
 }
 
 void Registry::capture_preallocated_trace_frames() {
     for (ComponentSlot& slot : components_) {
-        if (slot.mode != ComponentStorageMode::trace_preallocate) {
-            continue;
-        }
         RawPagedSparseArray* target = slot.storage;
         if (slot.owner != nullptr) {
             target = slot.owner->storage(&slot - components_.data());
@@ -345,25 +324,15 @@ void Registry::capture_preallocated_trace_frames() {
     }
 }
 
-Timestamp Registry::acquire_tsn() {
-    if (next_tsn_ == std::numeric_limits<Timestamp>::max()) {
-        throw std::overflow_error("transaction timestamp space exhausted");
-    }
-    return next_tsn_++;
-}
-
-std::vector<Timestamp> Registry::active_transactions_snapshot() const {
-    return active_transactions_;
-}
-
-void Registry::register_transaction(Timestamp tsn) {
-    active_transactions_.push_back(tsn);
-}
-
-void Registry::unregister_transaction(Timestamp tsn) {
-    const auto it = std::find(active_transactions_.begin(), active_transactions_.end(), tsn);
-    if (it != active_transactions_.end()) {
-        active_transactions_.erase(it);
+void Registry::initialize_trace_history() {
+    for (ComponentSlot& slot : components_) {
+        RawPagedSparseArray* target = slot.storage;
+        if (slot.owner != nullptr) {
+            target = slot.owner->storage(&slot - components_.data());
+        }
+        if (target != nullptr) {
+            target->initialize_trace(trace_commit_context_);
+        }
     }
 }
 
@@ -377,63 +346,46 @@ void Registry::unregister_reader() {
     }
 }
 
-void Registry::register_snapshot_classic_access() {
-    if (!has_classic_storage_mode_) {
-        return;
-    }
-
-    if (classic_access_.size() < components_.size()) {
-        classic_access_.resize(components_.size());
+void Registry::register_snapshot_direct_access() {
+    if (direct_access_.size() < components_.size()) {
+        direct_access_.resize(components_.size());
     }
 
     for (std::size_t i = 0; i < components_.size(); ++i) {
-        const ComponentSlot& slot = components_[i];
-        if (!slot.mode_configured || !is_direct_write_storage_mode(slot.mode)) {
-            continue;
-        }
-
-        ClassicAccessState& state = classic_access_[i];
+        DirectAccessState& state = direct_access_[i];
         if (state.writers != 0) {
-            throw std::logic_error("direct-write component storage mode does not allow snapshots while a writer is active");
+            throw std::logic_error("component storage does not allow snapshots while a writer is active");
         }
     }
 
     for (std::size_t i = 0; i < components_.size(); ++i) {
-        const ComponentSlot& slot = components_[i];
-        if (!slot.mode_configured || !is_direct_write_storage_mode(slot.mode)) {
-            continue;
-        }
-        ++classic_access_[i].readers;
+        ++direct_access_[i].readers;
     }
 
-    ++snapshot_classic_readers_;
+    ++snapshot_direct_readers_;
 }
 
-void Registry::unregister_snapshot_classic_access() {
-    if (snapshot_classic_readers_ == 0) {
+void Registry::unregister_snapshot_direct_access() {
+    if (snapshot_direct_readers_ == 0) {
         return;
     }
 
-    for (std::size_t i = 0; i < components_.size() && i < classic_access_.size(); ++i) {
-        const ComponentSlot& slot = components_[i];
-        if (!slot.mode_configured || !is_direct_write_storage_mode(slot.mode)) {
-            continue;
-        }
-        if (classic_access_[i].readers != 0) {
-            --classic_access_[i].readers;
+    for (std::size_t i = 0; i < components_.size() && i < direct_access_.size(); ++i) {
+        if (direct_access_[i].readers != 0) {
+            --direct_access_[i].readers;
         }
     }
 
-    --snapshot_classic_readers_;
+    --snapshot_direct_readers_;
 }
 
-void Registry::unregister_classic_access(const std::vector<ClassicAccessRegistration>& registrations) {
-    for (const ClassicAccessRegistration& registration : registrations) {
-        if (registration.component >= classic_access_.size()) {
+void Registry::unregister_direct_access(const std::vector<DirectAccessRegistration>& registrations) {
+    for (const DirectAccessRegistration& registration : registrations) {
+        if (registration.component >= direct_access_.size()) {
             continue;
         }
 
-        ClassicAccessState& state = classic_access_[registration.component];
+        DirectAccessState& state = direct_access_[registration.component];
         if (registration.writer) {
             if (state.writers != 0) {
                 --state.writers;

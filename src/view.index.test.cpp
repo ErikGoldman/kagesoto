@@ -40,10 +40,8 @@ struct TransientEffect {
 using XIndex = ecs::FlatIndex<&IndexedPosition::x>;
 using XYUniqueIndex = ecs::OptimizedUniqueIndex<&IndexedPosition::x, &IndexedPosition::y>;
 
-ecs::Registry make_index_mvcc_registry() {
+ecs::Registry make_index_registry() {
     ecs::Registry registry;
-    registry.set_storage_mode<IndexedPosition>(ecs::ComponentStorageMode::mvcc);
-    registry.set_storage_mode<Velocity>(ecs::ComponentStorageMode::mvcc);
     return registry;
 }
 
@@ -227,7 +225,7 @@ TEST_CASE("transaction storage lookup can scan non indexed fields and return fir
 }
 
 TEST_CASE("component indexes enforce uniqueness constraints") {
-    auto registry = make_index_mvcc_registry();
+    auto registry = make_index_registry();
 
     const ecs::Entity first = registry.create();
     {
@@ -401,30 +399,10 @@ TEST_CASE("component indexes stay consistent across many replacements beyond one
     REQUIRE(ranged == std::vector<ecs::Entity>{entities[8], entities[9], entities[10], entities[11]});
 }
 
-TEST_CASE("concurrent transactions enforce unique indexes against newly committed rows") {
-    auto registry = make_index_mvcc_registry();
-
-    const ecs::Entity first = registry.create();
-    const ecs::Entity second = registry.create();
-
-    auto older = registry.transaction<IndexedPosition, Velocity>();
-    auto newer = registry.transaction<IndexedPosition, Velocity>();
-
-    older.write<IndexedPosition>(first, IndexedPosition{90, 91});
-    newer.write<IndexedPosition>(second, IndexedPosition{90, 91});
-
-    newer.commit();
-    REQUIRE_THROWS_AS(older.commit(), std::invalid_argument);
-
-    auto tx = registry.transaction<IndexedPosition, Velocity>();
-    auto positions = tx.storage<IndexedPosition>();
-    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(90, 91) == second);
-}
-
 TEST_CASE("trace indexed components keep indexes in sync across rollback tombstones and compaction") {
     ecs::Registry registry(4);
-    registry.set_storage_mode<IndexedPosition>(ecs::ComponentStorageMode::trace_ondemand);
     registry.set_trace_max_history(5);
+    registry.set_tracing_enabled(true);
 
     const ecs::Entity entity = registry.create();
 
@@ -488,8 +466,8 @@ TEST_CASE("trace indexed components keep indexes in sync across rollback tombsto
 
 TEST_CASE("trace indexed components compact history independently per entity") {
     ecs::Registry registry(4);
-    registry.set_storage_mode<IndexedPosition>(ecs::ComponentStorageMode::trace_ondemand);
     registry.set_trace_max_history(2);
+    registry.set_tracing_enabled(true);
 
     const ecs::Entity first = registry.create();
     const ecs::Entity second = registry.create();
@@ -518,45 +496,6 @@ TEST_CASE("trace indexed components compact history independently per entity") {
     REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(2, 2) == ecs::null_entity);
 }
 
-TEST_CASE("preallocated trace indexed components update indexes after direct writes and rollback") {
-    ecs::Registry registry(4);
-    registry.set_trace_max_history(3);
-    registry.set_storage_mode<IndexedPosition>(ecs::ComponentStorageMode::trace_preallocate);
-
-    const ecs::Entity entity = registry.create();
-
-    registry.set_current_trace_time(1);
-    {
-        auto tx = registry.transaction<IndexedPosition>();
-        tx.write<IndexedPosition>(entity, IndexedPosition{10, 11});
-        tx.commit();
-    }
-
-    registry.set_current_trace_time(2);
-    {
-        auto tx = registry.transaction<IndexedPosition>();
-        IndexedPosition* value = tx.write<IndexedPosition>(entity);
-        REQUIRE(value != nullptr);
-        value->x = 20;
-        value->y = 21;
-        tx.commit();
-    }
-
-    {
-        auto tx = registry.transaction<IndexedPosition>();
-        auto positions = tx.storage<IndexedPosition>();
-        REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(10, 11) == ecs::null_entity);
-        REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(20, 21) == entity);
-    }
-
-    registry.set_current_trace_time(3);
-    REQUIRE(registry.rollback_to_timestamp<IndexedPosition>(entity, 1));
-
-    auto tx = registry.transaction<IndexedPosition>();
-    auto positions = tx.storage<IndexedPosition>();
-    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(10, 11) == entity);
-    REQUIRE(positions.find_one<&IndexedPosition::x, &IndexedPosition::y>(20, 21) == ecs::null_entity);
-}
 
 TEST_CASE("transaction storage explain prefers an index seek for keyed lookups") {
     ecs::Registry registry(4);

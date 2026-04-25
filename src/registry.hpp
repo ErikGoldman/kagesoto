@@ -28,8 +28,8 @@ ECS_API ComponentId next_component_id();
 }  // namespace detail
 
 template <typename T>
-struct ComponentStorageModeTraits {
-    static constexpr ComponentStorageMode value = ComponentStorageMode::mvcc;
+struct ComponentTraceStorageTraits {
+    static constexpr ComponentTraceStorage value = ComponentTraceStorage::copy_on_write;
 };
 
 template <typename T>
@@ -124,24 +124,10 @@ public:
     template <typename... Components>
     void group();
 
-    template <typename T>
-    void set_storage_mode(ComponentStorageMode mode) {
-        const ComponentId id = component_id<T>();
-        ensure_component_slot(id);
-        ComponentSlot& slot = components_[id];
-        if (slot.storage != nullptr && slot.mode != mode) {
-            throw std::logic_error("cannot change component storage mode after storage has been created");
-        }
-        if (slot.storage != nullptr && slot.singleton != detail::is_singleton_component_v<T>) {
-            throw std::logic_error("cannot change component storage kind after storage has been created");
-        }
-        if (slot.owner != nullptr && slot.mode != mode) {
-            throw std::logic_error("cannot change component storage mode after a group has been created");
-        }
-        slot.mode = mode;
-        slot.mode_configured = true;
-        slot.singleton = detail::is_singleton_component_v<T>;
-        recompute_classic_mode_flag();
+    void set_tracing_enabled(bool enabled);
+
+    bool tracing_enabled() const {
+        return trace_commit_context_.enabled;
     }
 
     void set_trace_max_history(Timestamp max_history) {
@@ -162,24 +148,17 @@ public:
         }
 
         require_no_readers();
-        if (timestamp > trace_commit_context_.timestamp) {
+        if (trace_commit_context_.enabled && timestamp > trace_commit_context_.timestamp) {
             capture_preallocated_trace_frames();
         }
         trace_commit_context_.timestamp = timestamp;
-        compact_trace_history();
+        if (trace_commit_context_.enabled) {
+            compact_trace_history();
+        }
     }
 
     Timestamp current_trace_time() const {
         return trace_commit_context_.timestamp;
-    }
-
-    template <typename T>
-    ComponentStorageMode storage_mode() const {
-        const ComponentId id = component_id<T>();
-        if (id >= components_.size() || !components_[id].mode_configured) {
-            return ComponentStorageModeTraits<T>::value;
-        }
-        return components_[id].mode;
     }
 
     template <typename T>
@@ -212,9 +191,6 @@ public:
     std::enable_if_t<!detail::is_singleton_component_v<T>, bool> rollback_to_timestamp(Entity entity, Timestamp timestamp) {
         require_no_readers();
         const ComponentId id = component_id<T>();
-        if (!is_trace_storage_mode(storage_mode<T>())) {
-            throw std::logic_error("trace rollback requires trace component storage mode");
-        }
         if (id >= components_.size()) {
             return false;
         }
@@ -231,9 +207,6 @@ public:
     std::enable_if_t<detail::is_singleton_component_v<T>, bool> rollback_to_timestamp(Timestamp timestamp) {
         require_no_readers();
         const ComponentId id = component_id<T>();
-        if (!is_trace_storage_mode(storage_mode<T>())) {
-            throw std::logic_error("trace rollback requires trace component storage mode");
-        }
         auto& raw = assure_singleton_storage<T>();
         return raw.rollback_to_trace_timestamp(detail::singleton_entity, timestamp, trace_commit_context_);
     }
@@ -248,18 +221,18 @@ private:
 
     struct ComponentSlot {
         RawPagedSparseArray* storage = nullptr;
-        ComponentStorageMode mode = ComponentStorageMode::mvcc;
-        bool mode_configured = false;
+        ComponentTraceStorage trace_storage = ComponentTraceStorage::copy_on_write;
+        bool trace_storage_configured = false;
         bool singleton = false;
         OwningGroupBase* owner = nullptr;
     };
 
-    struct ClassicAccessRegistration {
+    struct DirectAccessRegistration {
         ComponentId component = null_component;
         bool writer = false;
     };
 
-    struct ClassicAccessState {
+    struct DirectAccessState {
         std::size_t readers = 0;
         std::size_t writers = 0;
     };
@@ -278,24 +251,19 @@ private:
     void require_alive(Entity entity) const;
     void ensure_entity_slot(Entity index);
     void ensure_component_slot(ComponentId componentId);
-    ComponentStorageMode resolved_storage_mode(ComponentId componentId) const;
-    void recompute_classic_mode_flag();
     void compact_trace_history();
     void capture_preallocated_trace_frames();
+    void initialize_trace_history();
     RawPagedSparseArray& assure_storage(ComponentId componentId, std::size_t component_size, std::size_t component_alignment);
 
-    Timestamp acquire_tsn();
-    std::vector<Timestamp> active_transactions_snapshot() const;
-    void register_transaction(Timestamp tsn);
-    void unregister_transaction(Timestamp tsn);
     void register_reader();
     void unregister_reader();
-    void register_snapshot_classic_access();
-    void unregister_snapshot_classic_access();
+    void register_snapshot_direct_access();
+    void unregister_snapshot_direct_access();
 
     template <typename... DeclaredComponents>
-    std::vector<ClassicAccessRegistration> register_transaction_classic_access() {
-        std::vector<ClassicAccessRegistration> registrations;
+    std::vector<DirectAccessRegistration> register_transaction_direct_access() {
+        std::vector<DirectAccessRegistration> registrations;
         if constexpr (sizeof...(DeclaredComponents) == 0) {
             return registrations;
         }
@@ -304,43 +272,40 @@ private:
             using Declared = typename decltype(component_constant)::type;
             using Base = detail::component_base_t<Declared>;
             const ComponentId component = component_id<Base>();
-            if (!is_direct_write_storage_mode(storage_mode<Base>())) {
-                return;
-            }
 
             ensure_component_slot(component);
-            if (component >= classic_access_.size()) {
-                classic_access_.resize(static_cast<std::size_t>(component) + 1);
+            if (component >= direct_access_.size()) {
+                direct_access_.resize(static_cast<std::size_t>(component) + 1);
             }
 
-            ClassicAccessState& state = classic_access_[component];
+            DirectAccessState& state = direct_access_[component];
             const bool writer = !std::is_const_v<Declared>;
             if (writer) {
                 if (state.readers != 0 || state.writers != 0) {
-                    throw std::logic_error("direct-write component storage mode requires exclusive writer access per component");
+                    throw std::logic_error("component storage requires exclusive writer access per component");
                 }
                 ++state.writers;
             } else {
                 if (state.writers != 0) {
-                    throw std::logic_error("direct-write component storage mode does not allow readers while a writer is active");
+                    throw std::logic_error("component storage does not allow readers while a writer is active");
                 }
                 ++state.readers;
             }
 
-            registrations.push_back(ClassicAccessRegistration{component, writer});
+            registrations.push_back(DirectAccessRegistration{component, writer});
         };
 
         try {
             (register_component(detail::type_tag<DeclaredComponents>{}), ...);
         } catch (...) {
-            unregister_classic_access(registrations);
+            unregister_direct_access(registrations);
             throw;
         }
 
         return registrations;
     }
 
-    void unregister_classic_access(const std::vector<ClassicAccessRegistration>& registrations);
+    void unregister_direct_access(const std::vector<DirectAccessRegistration>& registrations);
 
     template <typename T>
     ComponentStorage<T>& assure_storage() {
@@ -349,20 +314,15 @@ private:
         ensure_component_slot(id);
 
         ComponentSlot& slot = components_[id];
-        if (!slot.mode_configured) {
-            slot.mode = ComponentStorageModeTraits<T>::value;
-            slot.mode_configured = true;
+        if (!slot.trace_storage_configured) {
+            slot.trace_storage = ComponentTraceStorageTraits<T>::value;
+            slot.trace_storage_configured = true;
             slot.singleton = false;
-            recompute_classic_mode_flag();
-        }
-
-        if (slot.mode == ComponentStorageMode::trace_preallocate && !trace_max_history_configured_) {
-            throw std::logic_error("trace_preallocate storage requires set_trace_max_history before storage creation");
         }
 
         RawPagedSparseArray* component = slot.storage;
         if (component == nullptr) {
-            component = new ComponentStorage<T>(slot.mode, page_size_, trace_max_history_);
+            component = new ComponentStorage<T>(slot.trace_storage, page_size_, trace_max_history_);
             slot.storage = component;
         }
 
@@ -381,24 +341,19 @@ private:
         ensure_component_slot(id);
 
         ComponentSlot& slot = components_[id];
-        if (!slot.mode_configured) {
-            slot.mode = ComponentStorageModeTraits<T>::value;
-            slot.mode_configured = true;
+        if (!slot.trace_storage_configured) {
+            slot.trace_storage = ComponentTraceStorageTraits<T>::value;
+            slot.trace_storage_configured = true;
             slot.singleton = true;
-            recompute_classic_mode_flag();
         }
 
         if (!slot.singleton) {
             throw std::logic_error("component storage was already created as entity storage");
         }
 
-        if (slot.mode == ComponentStorageMode::trace_preallocate && !trace_max_history_configured_) {
-            throw std::logic_error("trace_preallocate storage requires set_trace_max_history before storage creation");
-        }
-
         RawPagedSparseArray* component = slot.storage;
         if (component == nullptr) {
-            component = new ComponentStorage<T>(slot.mode, page_size_, trace_max_history_);
+            component = new ComponentStorage<T>(slot.trace_storage, page_size_, trace_max_history_);
             slot.storage = component;
 
             auto& typed = *static_cast<ComponentStorage<T>*>(component);
@@ -434,12 +389,9 @@ private:
     std::vector<Entity> free_entities_;
     std::vector<ComponentSlot> components_;
     std::vector<std::unique_ptr<OwningGroupBase>> groups_;
-    Timestamp next_tsn_ = 1;
-    std::vector<Timestamp> active_transactions_;
     std::size_t active_readers_ = 0;
-    bool has_classic_storage_mode_ = false;
-    std::vector<ClassicAccessState> classic_access_;
-    std::size_t snapshot_classic_readers_ = 0;
+    std::vector<DirectAccessState> direct_access_;
+    std::size_t snapshot_direct_readers_ = 0;
     TraceCommitContext trace_commit_context_{};
     Timestamp trace_max_history_ = RawPagedSparseArray::max_trace_time();
     bool trace_max_history_configured_ = false;
@@ -448,8 +400,8 @@ private:
 template <typename... Components>
 class OwningGroupStorage final : public OwningGroupBase {
 public:
-    OwningGroupStorage(ComponentStorageMode mode, std::size_t page_size, std::size_t trace_max_history)
-        : storages_(ComponentStorage<Components>(mode, page_size, trace_max_history)...),
+    OwningGroupStorage(std::size_t page_size, std::size_t trace_max_history)
+        : storages_(ComponentStorage<Components>(ComponentTraceStorageTraits<Components>::value, page_size, trace_max_history)...),
           component_infos_(make_component_infos(std::index_sequence_for<Components...>{})) {}
 
     bool owns(ComponentId component) const override {
@@ -702,38 +654,30 @@ inline void Registry::group() {
                   "groups cannot contain duplicate component types");
 
     std::array<ComponentId, sizeof...(Components)> ids{component_id<Components>()...};
-    ComponentStorageMode mode = ComponentStorageModeTraits<std::tuple_element_t<0, std::tuple<Components...>>>::value;
-
-    std::size_t index = 0;
-    auto resolve_mode = [&](auto component_tag) {
-        using Component = typename decltype(component_tag)::type;
-        const ComponentId id = ids[index++];
+    auto validate_component = [&](ComponentId id) {
         ensure_component_slot(id);
         ComponentSlot& slot = components_[id];
         if (slot.owner != nullptr) {
             throw std::logic_error("component already belongs to an owning group");
         }
-
-        const ComponentStorageMode resolved = slot.mode_configured ? slot.mode : ComponentStorageModeTraits<Component>::value;
-        if (id == ids.front()) {
-            mode = resolved;
-        } else if (resolved != mode) {
-            throw std::logic_error("grouped components must share the same storage mode");
-        }
     };
-    (resolve_mode(detail::type_tag<Components>{}), ...);
-
-    auto group_storage = std::make_unique<OwningGroupStorage<Components...>>(mode, page_size_, trace_max_history_);
-    OwningGroupBase* raw = group_storage.get();
     for (const ComponentId id : ids) {
-        ComponentSlot& slot = components_[id];
-        slot.mode = mode;
-        slot.mode_configured = true;
-        slot.owner = raw;
+        validate_component(id);
     }
+
+    auto group_storage = std::make_unique<OwningGroupStorage<Components...>>(page_size_, trace_max_history_);
+    OwningGroupBase* raw = group_storage.get();
+    auto configure_component = [&](auto component_tag) {
+        using Component = typename decltype(component_tag)::type;
+        const ComponentId id = component_id<Component>();
+        ComponentSlot& slot = components_[id];
+        slot.trace_storage = ComponentTraceStorageTraits<Component>::value;
+        slot.trace_storage_configured = true;
+        slot.owner = raw;
+    };
+    (configure_component(detail::type_tag<Components>{}), ...);
     groups_.push_back(std::move(group_storage));
     raw->build_from_registry(*this);
-    recompute_classic_mode_flag();
 }
 
 }  // namespace ecs
