@@ -1399,6 +1399,13 @@ private:
         std::unique_ptr<TypeErasedStorage> clone_filtered(
             const std::vector<bool>& excluded,
             bool dirty_only) const {
+            if (!dirty_only && !has_excluded_entries(excluded)) {
+                return clone();
+            }
+            if (info_.tag || info_.trivially_copyable) {
+                return clone_filtered_trivial(excluded, dirty_only);
+            }
+
             auto copy = std::unique_ptr<TypeErasedStorage>(new TypeErasedStorage(info_, lifecycle_));
             for (std::size_t dense = 0; dense < size_; ++dense) {
                 const std::uint32_t index = dense_indices_[dense];
@@ -1409,6 +1416,54 @@ private:
                 copy->emplace_or_replace_copy(index, get(index));
                 copy->dirty_[copy->sparse_[index]] = dirty_[dense];
             }
+            return copy;
+        }
+
+        bool has_excluded_entries(const std::vector<bool>& excluded) const {
+            const std::size_t limit = std::min(excluded.size(), sparse_.size());
+            for (std::size_t index = 0; index < limit; ++index) {
+                if (excluded[index]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        std::unique_ptr<TypeErasedStorage> clone_filtered_trivial(
+            const std::vector<bool>& excluded,
+            bool dirty_only) const {
+            auto copy = std::unique_ptr<TypeErasedStorage>(new TypeErasedStorage(info_, lifecycle_));
+            copy->sparse_.assign(sparse_.size(), npos);
+            copy->tombstones_.assign(tombstones_.size(), no_tombstone);
+            copy->dense_indices_.reserve(size_);
+            copy->dirty_.reserve(size_);
+
+            for (std::size_t dense = 0; dense < size_; ++dense) {
+                const std::uint32_t index = dense_indices_[dense];
+                if ((index < excluded.size() && excluded[index]) || (dirty_only && dirty_[dense] == 0)) {
+                    continue;
+                }
+
+                const std::uint32_t next_dense = static_cast<std::uint32_t>(copy->dense_indices_.size());
+                copy->dense_indices_.push_back(index);
+                copy->dirty_.push_back(dirty_[dense]);
+                copy->sparse_[index] = next_dense;
+            }
+
+            copy->size_ = copy->dense_indices_.size();
+            copy->capacity_ = copy->size_;
+
+            if (!info_.tag && copy->size_ != 0) {
+                copy->data_ = allocate(copy->capacity_, info_);
+                for (std::size_t dense = 0; dense < copy->size_; ++dense) {
+                    const std::uint32_t source_dense = sparse_[copy->dense_indices_[dense]];
+                    std::memcpy(
+                        copy->data_ + dense * info_.size,
+                        data_ + static_cast<std::size_t>(source_dense) * info_.size,
+                        info_.size);
+                }
+            }
+
             return copy;
         }
 
