@@ -1304,6 +1304,31 @@ TEST_CASE("orchestrator batches read-only jobs for parallel execution") {
     REQUIRE(schedule.stages[0].jobs == std::vector<ecs::Entity>{second, first});
 }
 
+TEST_CASE("orchestrator reuses stable schedules and invalidates them after job registration") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    const ecs::Entity reader = registry.job<const Position>(0).each([](ecs::Entity, const Position&) {});
+
+    const ecs::JobSchedule first_schedule = ecs::Orchestrator(registry).schedule();
+    const ecs::JobSchedule second_schedule = ecs::Orchestrator(registry).schedule();
+
+    REQUIRE(first_schedule.stages.size() == 1);
+    REQUIRE(first_schedule.stages[0].jobs == std::vector<ecs::Entity>{reader});
+    REQUIRE(second_schedule.stages.size() == first_schedule.stages.size());
+    REQUIRE(second_schedule.stages[0].jobs == first_schedule.stages[0].jobs);
+
+    const ecs::Entity writer = registry.job<Position>(1).access<Velocity>().each(
+        [](auto&, ecs::Entity, Position&) {});
+
+    const ecs::JobSchedule updated_schedule = ecs::Orchestrator(registry).schedule();
+
+    REQUIRE(updated_schedule.stages.size() == 2);
+    REQUIRE(updated_schedule.stages[0].jobs == std::vector<ecs::Entity>{reader});
+    REQUIRE(updated_schedule.stages[1].jobs == std::vector<ecs::Entity>{writer});
+}
+
 TEST_CASE("orchestrator orders conflicting read and write jobs by canonical job order") {
     ecs::Registry registry;
     registry.register_component<Position>("Position");

@@ -10,6 +10,7 @@
 #include <exception>
 #include <functional>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1546,6 +1547,9 @@ private:
         std::uint64_t sequence = 0;
         std::vector<std::uint32_t> reads;
         std::vector<std::uint32_t> writes;
+        std::uint64_t read_mask = 0;
+        std::uint64_t write_mask = 0;
+        bool access_masks_complete = true;
         std::function<void(Registry&)> run;
         std::function<std::vector<std::uint32_t>(Registry&)> collect_indices;
         std::function<void(Registry&, const std::vector<std::uint32_t>&, std::size_t, std::size_t)> run_range;
@@ -1558,23 +1562,49 @@ private:
     struct JobAccessMetadata {
         std::vector<std::uint32_t> reads;
         std::vector<std::uint32_t> writes;
+        std::uint64_t read_mask = 0;
+        std::uint64_t write_mask = 0;
+        bool masks_complete = true;
     };
+
+    static void canonicalize_components(std::vector<std::uint32_t>& components) {
+        std::sort(components.begin(), components.end());
+        components.erase(std::unique(components.begin(), components.end()), components.end());
+    }
+
+    static std::uint64_t make_component_mask(const std::vector<std::uint32_t>& components, bool& complete) {
+        std::uint64_t mask = 0;
+        for (std::uint32_t component : components) {
+            if (component >= 64) {
+                complete = false;
+                continue;
+            }
+            mask |= std::uint64_t{1} << component;
+        }
+        return mask;
+    }
+
+    static void canonicalize_job_metadata(JobAccessMetadata& metadata) {
+        canonicalize_components(metadata.reads);
+        canonicalize_components(metadata.writes);
+        std::vector<std::uint32_t> reads;
+        reads.reserve(metadata.reads.size());
+        std::set_difference(
+            metadata.reads.begin(),
+            metadata.reads.end(),
+            metadata.writes.begin(),
+            metadata.writes.end(),
+            std::back_inserter(reads));
+        metadata.reads = std::move(reads);
+        metadata.masks_complete = true;
+        metadata.read_mask = make_component_mask(metadata.reads, metadata.masks_complete);
+        metadata.write_mask = make_component_mask(metadata.writes, metadata.masks_complete);
+    }
 
     static void append_unique_component(std::vector<std::uint32_t>& components, std::uint32_t component) {
         if (std::find(components.begin(), components.end(), component) == components.end()) {
             components.push_back(component);
         }
-    }
-
-    static void remove_written_reads(JobAccessMetadata& metadata) {
-        metadata.reads.erase(
-            std::remove_if(
-                metadata.reads.begin(),
-                metadata.reads.end(),
-                [&](std::uint32_t read) {
-                    return std::find(metadata.writes.begin(), metadata.writes.end(), read) != metadata.writes.end();
-                }),
-            metadata.reads.end());
     }
 
     template <typename T>
@@ -1592,7 +1622,7 @@ private:
     JobAccessMetadata make_job_access_metadata() const {
         JobAccessMetadata metadata;
         (append_job_access_component<Components>(metadata), ...);
-        remove_written_reads(metadata);
+        canonicalize_job_metadata(metadata);
         return metadata;
     }
 
@@ -1602,7 +1632,7 @@ private:
              metadata.writes,
              entity_index(registered_component<detail::component_query_t<Components>>())),
          ...);
-        remove_written_reads(metadata);
+        canonicalize_job_metadata(metadata);
     }
 
     struct JobThreadingOptions {
@@ -1619,14 +1649,19 @@ private:
         std::function<void(Registry&, const std::vector<std::uint32_t>&, std::size_t, std::size_t)> run_range,
         JobThreadingOptions threading,
         bool structural) {
+        canonicalize_job_metadata(metadata);
         const Entity entity = create();
         add_system_tag(entity);
+        job_schedule_cache_valid_ = false;
         jobs_.push_back(JobRecord{
             entity,
             order,
             next_job_sequence_++,
             std::move(metadata.reads),
             std::move(metadata.writes),
+            metadata.read_mask,
+            metadata.write_mask,
+            metadata.masks_complete,
             std::move(run),
             std::move(collect_indices),
             std::move(run_range),
@@ -2295,6 +2330,8 @@ private:
     std::unordered_map<std::uint32_t, GroupRecord*> owned_component_groups_;
     std::vector<JobRecord> jobs_;
     JobThreadExecutor job_thread_executor_;
+    mutable JobSchedule cached_job_schedule_;
+    mutable bool job_schedule_cache_valid_ = false;
     std::uint64_t next_job_sequence_ = 0;
     std::uint64_t state_token_ = next_state_token();
     Entity singleton_entity_;
@@ -4135,63 +4172,102 @@ public:
         : registry_(&registry) {}
 
     JobSchedule schedule() const {
+        if (registry_->job_schedule_cache_valid_) {
+            return registry_->cached_job_schedule_;
+        }
+
         JobSchedule result;
 
-        std::vector<std::size_t> ordered(registry_->jobs_.size());
-        std::iota(ordered.begin(), ordered.end(), std::size_t{0});
-        std::sort(ordered.begin(), ordered.end(), [&](std::size_t lhs, std::size_t rhs) {
-            const Registry::JobRecord& left = registry_->jobs_[lhs];
-            const Registry::JobRecord& right = registry_->jobs_[rhs];
-            if (left.order != right.order) {
-                return left.order < right.order;
-            }
-            return left.sequence < right.sequence;
-        });
+        std::unordered_map<std::uint32_t, std::size_t> last_reader_stage;
+        std::unordered_map<std::uint32_t, std::size_t> last_writer_stage;
+        std::size_t latest_stage = 0;
+        std::size_t structural_barrier_stage = 0;
+        bool has_previous_job = false;
+        bool has_structural_barrier = false;
 
-        std::vector<std::size_t> job_stages(registry_->jobs_.size(), 0);
-        for (std::size_t ordered_position = 0; ordered_position < ordered.size(); ++ordered_position) {
-            const std::size_t job_index = ordered[ordered_position];
+        for (std::size_t job_index : registry_->ordered_job_indices(registry_->jobs_.size())) {
             const Registry::JobRecord& job = registry_->jobs_[job_index];
 
-            std::size_t stage_index = 0;
-            for (std::size_t previous_position = 0; previous_position < ordered_position; ++previous_position) {
-                const std::size_t previous_index = ordered[previous_position];
-                const Registry::JobRecord& previous = registry_->jobs_[previous_index];
-                if (conflicts(previous, job)) {
-                    stage_index = std::max(stage_index, job_stages[previous_index] + 1);
-                }
+            std::size_t stage_index = has_structural_barrier ? structural_barrier_stage + 1 : 0;
+            if (job.structural) {
+                stage_index = has_previous_job ? latest_stage + 1 : 0;
+            } else {
+                apply_read_dependencies(job.reads, last_writer_stage, stage_index);
+                apply_write_dependencies(job.writes, last_reader_stage, last_writer_stage, stage_index);
             }
 
             if (result.stages.size() <= stage_index) {
                 result.stages.resize(stage_index + 1);
             }
             result.stages[stage_index].jobs.push_back(job.entity);
-            job_stages[job_index] = stage_index;
+
+            latest_stage = has_previous_job ? std::max(latest_stage, stage_index) : stage_index;
+            has_previous_job = true;
+
+            if (job.structural) {
+                structural_barrier_stage = stage_index;
+                has_structural_barrier = true;
+                continue;
+            }
+
+            record_read_stage(job.reads, last_reader_stage, stage_index);
+            record_write_stage(job.writes, last_writer_stage, stage_index);
         }
 
+        registry_->cached_job_schedule_ = result;
+        registry_->job_schedule_cache_valid_ = true;
         return result;
     }
 
 private:
-    static bool contains_component(const std::vector<std::uint32_t>& components, std::uint32_t component) {
-        return std::find(components.begin(), components.end(), component) != components.end();
-    }
-
-    static bool any_overlap(const std::vector<std::uint32_t>& left, const std::vector<std::uint32_t>& right) {
-        for (std::uint32_t component : left) {
-            if (contains_component(right, component)) {
-                return true;
+    static void apply_read_dependencies(
+        const std::vector<std::uint32_t>& reads,
+        const std::unordered_map<std::uint32_t, std::size_t>& last_writer_stage,
+        std::size_t& stage_index) {
+        for (std::uint32_t component : reads) {
+            const auto found = last_writer_stage.find(component);
+            if (found != last_writer_stage.end()) {
+                stage_index = std::max(stage_index, found->second + 1);
             }
         }
-        return false;
     }
 
-    static bool conflicts(const Registry::JobRecord& left, const Registry::JobRecord& right) {
-        if (left.structural || right.structural) {
-            return true;
+    static void apply_write_dependencies(
+        const std::vector<std::uint32_t>& writes,
+        const std::unordered_map<std::uint32_t, std::size_t>& last_reader_stage,
+        const std::unordered_map<std::uint32_t, std::size_t>& last_writer_stage,
+        std::size_t& stage_index) {
+        for (std::uint32_t component : writes) {
+            const auto found_reader = last_reader_stage.find(component);
+            if (found_reader != last_reader_stage.end()) {
+                stage_index = std::max(stage_index, found_reader->second + 1);
+            }
+            const auto found_writer = last_writer_stage.find(component);
+            if (found_writer != last_writer_stage.end()) {
+                stage_index = std::max(stage_index, found_writer->second + 1);
+            }
         }
-        return any_overlap(left.writes, right.reads) || any_overlap(left.reads, right.writes) ||
-            any_overlap(left.writes, right.writes);
+    }
+
+    static void record_read_stage(
+        const std::vector<std::uint32_t>& reads,
+        std::unordered_map<std::uint32_t, std::size_t>& last_reader_stage,
+        std::size_t stage_index) {
+        for (std::uint32_t component : reads) {
+            auto inserted = last_reader_stage.emplace(component, stage_index);
+            if (!inserted.second) {
+                inserted.first->second = std::max(inserted.first->second, stage_index);
+            }
+        }
+    }
+
+    static void record_write_stage(
+        const std::vector<std::uint32_t>& writes,
+        std::unordered_map<std::uint32_t, std::size_t>& last_writer_stage,
+        std::size_t stage_index) {
+        for (std::uint32_t component : writes) {
+            last_writer_stage[component] = stage_index;
+        }
     }
 
     const Registry* registry_;
