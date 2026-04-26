@@ -172,7 +172,41 @@ registry.job<const Position>(20)
     });
 ```
 
-`Orchestrator` can inspect registered jobs and return the order in which they can be processed. The current orchestrator only reports the schedule; it is not wired into `run_jobs()`. Each stage contains jobs that can run in parallel, and stages must be processed in order.
+Jobs are single-threaded by default. Use `.max_threads(count)` to let a job split its matching entities into chunks, `.min_entities_per_thread(count)` to control chunk size, and `.single_thread()` to force one chunk:
+
+```cpp
+registry.job<Position>(0)
+    .max_threads(4)
+    .min_entities_per_thread(256)
+    .each([](ecs::Entity, Position& position) {
+        position.x += 1;
+    });
+```
+
+`run_jobs()` uses the orchestrator to run independent jobs in the same stage. Install an executor to hand stage tasks to a task system. The executor must run every task and return only after all tasks finish. If no executor is installed, tasks run inline.
+
+```cpp
+registry.set_job_thread_executor([](const std::vector<ecs::JobThreadTask>& tasks) {
+    for (const ecs::JobThreadTask& task : tasks) {
+        task.run();
+    }
+});
+
+registry.run_jobs();
+registry.run_jobs(ecs::RunJobsOptions{true}); // force serial execution
+```
+
+Structural changes from a job must be declared explicitly. Declaring structural access keeps that job single-threaded and isolates it in the orchestrator schedule because add/remove operations mutate registry bookkeeping.
+
+```cpp
+registry.job<const Position>(0)
+    .structural<Disabled>()
+    .each([](auto& job, ecs::Entity entity, const Position&) {
+        job.template add<Disabled>(entity);
+    });
+```
+
+`Orchestrator` can inspect registered jobs and return the order in which they can be processed. `run_jobs()` uses this schedule unless forced into single-threaded mode. Each stage contains jobs that can run in parallel, and stages must be processed in order.
 
 ```cpp
 ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
@@ -281,7 +315,14 @@ std::string text = registry.debug_print(entity, position_type);
 - `void Registry::restore(const Registry::DeltaSnapshot& snapshot)`
 - `Registry::View<Components...> Registry::view<Components...>()`
 - `Registry::JobView<Components...> Registry::job<Components...>(int order)`
-- `void Registry::run_jobs()`
+- `void Registry::set_job_thread_executor(JobThreadExecutor executor)`
+- `void Registry::run_jobs(RunJobsOptions options = {})`
+- `Registry::JobView<Components...>& Registry::JobView<Components...>::max_threads(std::size_t count)`
+- `Registry::JobView<Components...>& Registry::JobView<Components...>::single_thread()`
+- `Registry::JobView<Components...>& Registry::JobView<Components...>::min_entities_per_thread(std::size_t count)`
+- `Registry::JobStructuralView<...> Registry::JobView<Components...>::structural<StructuralComponents...>()`
+- `Registry::JobAccessView<...>& Registry::JobAccessView<...>::max_threads(std::size_t count)`
+- `Registry::JobStructuralAccessView<...> Registry::JobAccessView<...>::structural<StructuralComponents...>()`
 - `ecs::Orchestrator::Orchestrator(const Registry& registry)`
 - `ecs::JobSchedule ecs::Orchestrator::schedule() const`
 - `std::vector<ecs::JobScheduleStage> ecs::JobSchedule::stages`

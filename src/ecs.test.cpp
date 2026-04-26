@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -1335,6 +1336,172 @@ TEST_CASE("jobs added while jobs are running wait until the next run") {
     registry.run_jobs();
     REQUIRE(outer_calls == 2);
     REQUIRE(inner_calls == 1);
+}
+
+TEST_CASE("run jobs batches independent jobs through the executor") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(entity, Velocity{2.0f, 0.0f}) != nullptr);
+
+    registry.job<Position>(0).each([](ecs::Entity, Position&) {});
+    registry.job<Velocity>(1).each([](ecs::Entity, Velocity&) {});
+
+    std::vector<std::size_t> batch_sizes;
+    registry.set_job_thread_executor([&](const std::vector<ecs::JobThreadTask>& tasks) {
+        batch_sizes.push_back(tasks.size());
+        for (const ecs::JobThreadTask& task : tasks) {
+            task.run();
+        }
+    });
+
+    registry.run_jobs();
+
+    REQUIRE(batch_sizes == std::vector<std::size_t>{2});
+}
+
+TEST_CASE("threaded jobs split entity ranges using max threads and minimum entity counts") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    for (int i = 0; i < 5; ++i) {
+        const ecs::Entity entity = registry.create();
+        REQUIRE(registry.add<Position>(entity, Position{i, 0}) != nullptr);
+    }
+
+    registry.job<Position>(0).max_threads(3).min_entities_per_thread(2).each([](ecs::Entity, Position& position) {
+        position.y = position.x + 10;
+    });
+
+    std::vector<std::size_t> thread_indices;
+    std::vector<std::size_t> thread_counts;
+    registry.set_job_thread_executor([&](const std::vector<ecs::JobThreadTask>& tasks) {
+        for (const ecs::JobThreadTask& task : tasks) {
+            thread_indices.push_back(task.thread_index);
+            thread_counts.push_back(task.thread_count);
+            task.run();
+        }
+    });
+
+    registry.run_jobs();
+
+    REQUIRE(thread_indices == std::vector<std::size_t>{0, 1, 2});
+    REQUIRE(thread_counts == std::vector<std::size_t>{3, 3, 3});
+
+    int visited = 0;
+    registry.view<const Position>().each([&](ecs::Entity, const Position& position) {
+        REQUIRE(position.y == position.x + 10);
+        ++visited;
+    });
+    REQUIRE(visited == 5);
+}
+
+TEST_CASE("force single threaded run ignores executor chunking") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    for (int i = 0; i < 4; ++i) {
+        const ecs::Entity entity = registry.create();
+        REQUIRE(registry.add<Position>(entity, Position{i, 0}) != nullptr);
+    }
+
+    int calls = 0;
+    registry.job<Position>(0).max_threads(4).min_entities_per_thread(1).each([&](ecs::Entity, Position&) {
+        ++calls;
+    });
+
+    int executor_calls = 0;
+    registry.set_job_thread_executor([&](const std::vector<ecs::JobThreadTask>& tasks) {
+        ++executor_calls;
+        for (const ecs::JobThreadTask& task : tasks) {
+            task.run();
+        }
+    });
+
+    registry.run_jobs(ecs::RunJobsOptions{true});
+
+    REQUIRE(calls == 4);
+    REQUIRE(executor_calls == 0);
+}
+
+TEST_CASE("structural jobs expose declared add and remove operations and stay single threaded") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Disabled>("Disabled");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+
+    registry.job<const Position>(0).max_threads(4).min_entities_per_thread(1).structural<Disabled>().each(
+        [](auto& view, ecs::Entity current, const Position&) {
+            REQUIRE(view.template add<Disabled>(current));
+        });
+
+    std::vector<std::size_t> batch_sizes;
+    registry.set_job_thread_executor([&](const std::vector<ecs::JobThreadTask>& tasks) {
+        batch_sizes.push_back(tasks.size());
+        for (const ecs::JobThreadTask& task : tasks) {
+            REQUIRE(task.thread_count == 1);
+            task.run();
+        }
+    });
+
+    registry.run_jobs();
+
+    REQUIRE(batch_sizes == std::vector<std::size_t>{1});
+    REQUIRE(registry.has<Disabled>(entity));
+
+    registry.job<const Position>(1).structural<Disabled>().each([](auto& view, ecs::Entity current, const Position&) {
+        REQUIRE(view.template remove<Disabled>(current));
+    });
+
+    registry.run_jobs();
+
+    REQUIRE_FALSE(registry.has<Disabled>(entity));
+}
+
+TEST_CASE("structural jobs are isolated from otherwise independent jobs") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+    registry.register_component<Disabled>("Disabled");
+
+    const ecs::Entity structural =
+        registry.job<const Position>(0).structural<Disabled>().each([](auto&, ecs::Entity, const Position&) {});
+    const ecs::Entity independent = registry.job<Velocity>(1).each([](ecs::Entity, Velocity&) {});
+
+    const ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
+
+    REQUIRE(schedule.stages.size() == 2);
+    REQUIRE(schedule.stages[0].jobs == std::vector<ecs::Entity>{structural});
+    REQUIRE(schedule.stages[1].jobs == std::vector<ecs::Entity>{independent});
+}
+
+TEST_CASE("structural access jobs can use access views and declared structural operations") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+    registry.register_component<Disabled>("Disabled");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(entity, Velocity{2.0f, 0.0f}) != nullptr);
+
+    registry.job<const Position>(0).access<Velocity>().structural<Disabled>().each(
+        [](auto& view, ecs::Entity current, const Position& position) {
+            Velocity* velocity = view.template write<Velocity>(current);
+            REQUIRE(velocity != nullptr);
+            velocity->dx += static_cast<float>(position.x);
+            REQUIRE(view.template add<Disabled>(current));
+        });
+
+    registry.run_jobs();
+
+    REQUIRE(registry.get<Velocity>(entity)->dx == 3.0f);
+    REQUIRE(registry.has<Disabled>(entity));
 }
 
 TEST_CASE("declared owned groups are used by matching views and track membership") {

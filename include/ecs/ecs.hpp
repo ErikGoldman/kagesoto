@@ -6,10 +6,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <numeric>
 #include <sstream>
@@ -183,6 +185,19 @@ struct JobSchedule {
     std::vector<JobScheduleStage> stages;
 };
 
+struct RunJobsOptions {
+    bool force_single_threaded = false;
+};
+
+struct JobThreadTask {
+    Entity job;
+    std::size_t thread_index = 0;
+    std::size_t thread_count = 1;
+    std::function<void()> run;
+};
+
+using JobThreadExecutor = std::function<void(const std::vector<JobThreadTask>&)>;
+
 enum class PrimitiveType {
     Bool,
     I32,
@@ -213,6 +228,15 @@ public:
 
     template <typename IterList, typename... AccessComponents>
     class JobAccessView;
+
+    template <typename IterList, typename StructuralList>
+    class JobStructuralView;
+
+    template <typename IterList, typename AccessList, typename StructuralList>
+    class JobStructuralAccessView;
+
+    template <typename ViewType, typename... StructuralComponents>
+    class JobStructuralContext;
 
     class Snapshot;
     class DeltaSnapshot;
@@ -647,22 +671,11 @@ public:
     template <typename... Components>
     JobView<Components...> job(int order);
 
-    void run_jobs() {
-        std::vector<std::size_t> ordered(jobs_.size());
-        std::iota(ordered.begin(), ordered.end(), std::size_t{0});
-        std::sort(ordered.begin(), ordered.end(), [&](std::size_t lhs, std::size_t rhs) {
-            const JobRecord& left = jobs_[lhs];
-            const JobRecord& right = jobs_[rhs];
-            if (left.order != right.order) {
-                return left.order < right.order;
-            }
-            return left.sequence < right.sequence;
-        });
-
-        for (std::size_t index : ordered) {
-            jobs_[index].run(*this);
-        }
+    void set_job_thread_executor(JobThreadExecutor executor) {
+        job_thread_executor_ = std::move(executor);
     }
+
+    void run_jobs(RunJobsOptions options = {});
 
     template <typename... Owned>
     void declare_owned_group();
@@ -710,6 +723,7 @@ public:
 
 private:
     static constexpr std::size_t npos_type_id = std::numeric_limits<std::size_t>::max();
+    static constexpr std::size_t default_min_entities_per_thread = 1024;
 
     enum class PrimitiveKind {
         None,
@@ -819,7 +833,7 @@ private:
             validate_type<T>();
 
             if (void* existing = get(index)) {
-                dirty_[sparse_[index]] = true;
+                dirty_[sparse_[index]] = 1;
 
                 if constexpr (std::is_trivially_copyable<T>::value) {
                     T replacement(std::forward<Args>(args)...);
@@ -839,7 +853,7 @@ private:
 
             const std::uint32_t dense = static_cast<std::uint32_t>(size_);
             dense_indices_.push_back(index);
-            dirty_.push_back(true);
+            dirty_.push_back(1);
             sparse_[index] = dense;
             void* target = data_ + size_ * info_.size;
             new (target) T(std::forward<Args>(args)...);
@@ -854,7 +868,7 @@ private:
             }
 
             if (contains(index)) {
-                dirty_[sparse_[index]] = true;
+                dirty_[sparse_[index]] = 1;
                 return;
             }
 
@@ -863,7 +877,7 @@ private:
 
             const std::uint32_t dense = static_cast<std::uint32_t>(size_);
             dense_indices_.push_back(index);
-            dirty_.push_back(true);
+            dirty_.push_back(1);
             sparse_[index] = dense;
             ++size_;
         }
@@ -877,7 +891,7 @@ private:
             }
 
             if (void* existing = get(index)) {
-                dirty_[sparse_[index]] = true;
+                dirty_[sparse_[index]] = 1;
                 assign_bytes(existing, value);
                 return existing;
             }
@@ -888,7 +902,7 @@ private:
 
             const std::uint32_t dense = static_cast<std::uint32_t>(size_);
             dense_indices_.push_back(index);
-            dirty_.push_back(true);
+            dirty_.push_back(1);
             sparse_[index] = dense;
             void* target = data_ + size_ * info_.size;
             assign_bytes(target, value);
@@ -902,7 +916,7 @@ private:
                 return;
             }
             if (void* existing = get(index)) {
-                dirty_[sparse_[index]] = true;
+                dirty_[sparse_[index]] = 1;
                 replace_copy(existing, value);
                 return;
             }
@@ -913,7 +927,7 @@ private:
 
             const std::uint32_t dense = static_cast<std::uint32_t>(size_);
             dense_indices_.push_back(index);
-            dirty_.push_back(true);
+            dirty_.push_back(1);
             sparse_[index] = dense;
             construct_copy(data_ + size_ * info_.size, value);
             ++size_;
@@ -981,7 +995,7 @@ private:
             }
 
             const std::uint32_t dense = sparse_[index];
-            dirty_[dense] = true;
+            dirty_[dense] = 1;
             if (info_.tag) {
                 return nullptr;
             }
@@ -997,7 +1011,7 @@ private:
                 return false;
             }
 
-            dirty_[sparse_[index]] = false;
+            dirty_[sparse_[index]] = 0;
             return true;
         }
 
@@ -1006,11 +1020,11 @@ private:
                 return has_tombstone(index);
             }
 
-            return dirty_[sparse_[index]];
+            return dirty_[sparse_[index]] != 0;
         }
 
         void clear_all_dirty() {
-            std::fill(dirty_.begin(), dirty_.end(), false);
+            std::fill(dirty_.begin(), dirty_.end(), 0);
             std::fill(tombstones_.begin(), tombstones_.end(), no_tombstone);
         }
 
@@ -1031,8 +1045,8 @@ private:
         }
 
         bool has_dirty_entries() const {
-            for (bool dirty : dirty_) {
-                if (dirty) {
+            for (unsigned char dirty : dirty_) {
+                if (dirty != 0) {
                     return true;
                 }
             }
@@ -1096,7 +1110,7 @@ private:
             dense_indices_[rhs] = lhs_index;
             sparse_[lhs_index] = rhs;
             sparse_[rhs_index] = lhs;
-            const bool lhs_dirty = dirty_[lhs];
+            const unsigned char lhs_dirty = dirty_[lhs];
             dirty_[lhs] = dirty_[rhs];
             dirty_[rhs] = lhs_dirty;
         }
@@ -1117,7 +1131,7 @@ private:
             auto copy = std::make_unique<TypeErasedStorage>(*this);
             for (std::size_t dense = copy->size_; dense > 0; --dense) {
                 const std::uint32_t position = static_cast<std::uint32_t>(dense - 1);
-                if (!copy->dirty_[position]) {
+                if (copy->dirty_[position] == 0) {
                     copy->erase_at(position);
                 }
             }
@@ -1337,7 +1351,7 @@ private:
             auto copy = std::unique_ptr<TypeErasedStorage>(new TypeErasedStorage(info_, lifecycle_));
             for (std::size_t dense = 0; dense < size_; ++dense) {
                 const std::uint32_t index = dense_indices_[dense];
-                if ((index < excluded.size() && excluded[index]) || (dirty_only && !dirty_[dense])) {
+                if ((index < excluded.size() && excluded[index]) || (dirty_only && dirty_[dense] == 0)) {
                     continue;
                 }
 
@@ -1402,7 +1416,7 @@ private:
 
         std::vector<std::uint32_t> dense_indices_;
         std::vector<std::uint32_t> sparse_;
-        std::vector<bool> dirty_;
+        std::vector<unsigned char> dirty_;
         std::vector<unsigned char> tombstones_;
         unsigned char* data_ = nullptr;
         std::size_t size_ = 0;
@@ -1427,6 +1441,12 @@ private:
         std::vector<std::uint32_t> reads;
         std::vector<std::uint32_t> writes;
         std::function<void(Registry&)> run;
+        std::function<std::vector<std::uint32_t>(Registry&)> collect_indices;
+        std::function<void(Registry&, const std::vector<std::uint32_t>&, std::size_t, std::size_t)> run_range;
+        std::size_t max_threads = 1;
+        std::size_t min_entities_per_thread = default_min_entities_per_thread;
+        bool single_thread = true;
+        bool structural = false;
     };
 
     struct JobAccessMetadata {
@@ -1470,7 +1490,29 @@ private:
         return metadata;
     }
 
-    Entity add_job(int order, JobAccessMetadata metadata, std::function<void(Registry&)> run) {
+    template <typename... Components>
+    void append_job_structural_metadata(JobAccessMetadata& metadata) const {
+        (append_unique_component(
+             metadata.writes,
+             entity_index(registered_component<detail::component_query_t<Components>>())),
+         ...);
+        remove_written_reads(metadata);
+    }
+
+    struct JobThreadingOptions {
+        std::size_t max_threads = 1;
+        std::size_t min_entities_per_thread = default_min_entities_per_thread;
+        bool single_thread = true;
+    };
+
+    Entity add_job(
+        int order,
+        JobAccessMetadata metadata,
+        std::function<void(Registry&)> run,
+        std::function<std::vector<std::uint32_t>(Registry&)> collect_indices,
+        std::function<void(Registry&, const std::vector<std::uint32_t>&, std::size_t, std::size_t)> run_range,
+        JobThreadingOptions threading,
+        bool structural) {
         const Entity entity = create();
         add_system_tag(entity);
         jobs_.push_back(JobRecord{
@@ -1479,7 +1521,13 @@ private:
             next_job_sequence_++,
             std::move(metadata.reads),
             std::move(metadata.writes),
-            std::move(run)});
+            std::move(run),
+            std::move(collect_indices),
+            std::move(run_range),
+            std::max<std::size_t>(threading.max_threads, 1),
+            std::max<std::size_t>(threading.min_entities_per_thread, 1),
+            threading.single_thread,
+            structural});
         return entity;
     }
 
@@ -2080,6 +2128,30 @@ private:
         }
     }
 
+    std::vector<std::size_t> ordered_job_indices(std::size_t job_count) const {
+        std::vector<std::size_t> ordered(job_count);
+        std::iota(ordered.begin(), ordered.end(), std::size_t{0});
+        std::sort(ordered.begin(), ordered.end(), [&](std::size_t lhs, std::size_t rhs) {
+            const JobRecord& left = jobs_[lhs];
+            const JobRecord& right = jobs_[rhs];
+            if (left.order != right.order) {
+                return left.order < right.order;
+            }
+            return left.sequence < right.sequence;
+        });
+        return ordered;
+    }
+
+    std::size_t job_index(Entity job) const {
+        const auto found = std::find_if(jobs_.begin(), jobs_.end(), [&](const JobRecord& record) {
+            return record.entity == job;
+        });
+        if (found == jobs_.end()) {
+            throw std::logic_error("ecs job is not registered");
+        }
+        return static_cast<std::size_t>(std::distance(jobs_.begin(), found));
+    }
+
     std::vector<std::uint64_t> entities_;
     std::uint32_t free_head_ = invalid_index;
     std::unordered_map<std::uint32_t, ComponentRecord> components_;
@@ -2088,6 +2160,7 @@ private:
     std::vector<Entity> typed_components_;
     std::vector<std::unique_ptr<GroupRecord>> groups_;
     std::vector<JobRecord> jobs_;
+    JobThreadExecutor job_thread_executor_;
     std::uint64_t next_job_sequence_ = 0;
     std::uint64_t state_token_ = next_state_token();
     Entity singleton_entity_;
@@ -2376,6 +2449,39 @@ public:
         }
     }
 
+    std::vector<std::uint32_t> matching_indices() const {
+        std::vector<std::uint32_t> indices;
+        TypeErasedStorage* driver = driver_storage();
+        if (driver == nullptr) {
+            if constexpr (!detail::contains_non_singleton_component<Components...>::value) {
+                indices.push_back(entity_index(registry_->singleton_entity_));
+            }
+            return indices;
+        }
+
+        const std::size_t dense_size = group_ != nullptr ? group_->size : driver->dense_size();
+        indices.reserve(dense_size);
+        for (std::size_t dense = 0; dense < dense_size; ++dense) {
+            const std::uint32_t index = driver->dense_index_at(dense);
+            if (contains_all(index)) {
+                indices.push_back(index);
+            }
+        }
+        return indices;
+    }
+
+    template <typename Fn>
+    void each_index_range(Fn&& fn, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end) {
+        Fn& callback = fn;
+        for (std::size_t position = begin; position < end; ++position) {
+            const std::uint32_t index = indices[position];
+            if (!contains_all(index)) {
+                continue;
+            }
+            call_each(callback, Entity{registry_->entities_[index]}, index);
+        }
+    }
+
     template <typename... AccessComponents>
     AccessView<detail::type_list<Components...>, AccessComponents...> access() const {
         return AccessView<detail::type_list<Components...>, AccessComponents...>(*registry_, storages_);
@@ -2646,6 +2752,39 @@ public:
                 continue;
             }
 
+            call_each(callback, Entity{registry_->entities_[index]}, index);
+        }
+    }
+
+    std::vector<std::uint32_t> matching_indices() const {
+        std::vector<std::uint32_t> indices;
+        TypeErasedStorage* driver = driver_storage();
+        if (driver == nullptr) {
+            if constexpr (!detail::contains_non_singleton_component<IterComponents...>::value) {
+                indices.push_back(entity_index(registry_->singleton_entity_));
+            }
+            return indices;
+        }
+
+        const std::size_t dense_size = group_ != nullptr ? group_->size : driver->dense_size();
+        indices.reserve(dense_size);
+        for (std::size_t dense = 0; dense < dense_size; ++dense) {
+            const std::uint32_t index = driver->dense_index_at(dense);
+            if (contains_all(index)) {
+                indices.push_back(index);
+            }
+        }
+        return indices;
+    }
+
+    template <typename Fn>
+    void each_index_range(Fn&& fn, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end) {
+        Fn& callback = fn;
+        for (std::size_t position = begin; position < end; ++position) {
+            const std::uint32_t index = indices[position];
+            if (!contains_all(index)) {
+                continue;
+            }
             call_each(callback, Entity{registry_->entities_[index]}, index);
         }
     }
@@ -3376,6 +3515,67 @@ private:
     std::vector<Entity> mutable_runtime_tags_;
 };
 
+template <typename ViewType, typename... StructuralComponents>
+class Registry::JobStructuralContext {
+public:
+    JobStructuralContext(Registry& registry, ViewType& view)
+        : registry_(&registry), view_(&view) {}
+
+    template <typename T>
+    const detail::component_query_t<T>* get(Entity entity) const {
+        return view_->template get<T>(entity);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<detail::is_singleton_query<T>::value, int>::type = 0>
+    const detail::component_query_t<T>* get() const {
+        return view_->template get<T>();
+    }
+
+    template <typename T>
+    detail::component_query_t<T>* write(Entity entity) {
+        return view_->template write<T>(entity);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<detail::is_singleton_query<T>::value, int>::type = 0>
+    detail::component_query_t<T>* write() {
+        return view_->template write<T>();
+    }
+
+    template <
+        typename T,
+        typename... Args,
+        typename std::enable_if<
+            !detail::is_tag_query<T>::value && detail::contains_component<T, StructuralComponents...>::value,
+            int>::type = 0>
+    detail::component_query_t<T>* add(Entity entity, Args&&... args) {
+        return registry_->template add<detail::component_query_t<T>>(entity, std::forward<Args>(args)...);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::is_tag_query<T>::value && detail::contains_component<T, StructuralComponents...>::value,
+            int>::type = 0>
+    bool add(Entity entity) {
+        return registry_->template add<detail::component_query_t<T>>(entity);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<detail::contains_component<T, StructuralComponents...>::value, int>::type = 0>
+    bool remove(Entity entity) {
+        return registry_->template remove<detail::component_query_t<T>>(entity);
+    }
+
+private:
+    Registry* registry_;
+    ViewType* view_;
+};
+
 template <typename... Components>
 class Registry::JobView {
     static_assert(sizeof...(Components) > 0, "ecs jobs require at least one component");
@@ -3384,16 +3584,42 @@ public:
     JobView(Registry& registry, int order)
         : registry_(&registry), order_(order), view_(registry) {}
 
+    JobView& max_threads(std::size_t count) {
+        threading_.max_threads = std::max<std::size_t>(count, 1);
+        threading_.single_thread = false;
+        return *this;
+    }
+
+    JobView& single_thread() {
+        threading_.max_threads = 1;
+        threading_.single_thread = true;
+        return *this;
+    }
+
+    JobView& min_entities_per_thread(std::size_t count) {
+        threading_.min_entities_per_thread = std::max<std::size_t>(count, 1);
+        return *this;
+    }
+
     template <typename Fn>
     Entity each(Fn&& fn) {
         using Callback = typename std::decay<Fn>::type;
-        Callback callback(std::forward<Fn>(fn));
+        auto callback = std::make_shared<Callback>(std::forward<Fn>(fn));
         return registry_->add_job(
             order_,
             registry_->template make_job_access_metadata<Components...>(),
-            [callback = std::move(callback)](Registry& registry) mutable {
-                registry.template view<Components...>().each(callback);
-            });
+            [callback](Registry& registry) mutable {
+                registry.template view<Components...>().each(*callback);
+            },
+            [](Registry& registry) {
+                return registry.template view<Components...>().matching_indices();
+            },
+            [callback](Registry& registry, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end)
+                mutable {
+                    registry.template view<Components...>().each_index_range(*callback, indices, begin, end);
+                },
+            threading_,
+            false);
     }
 
     template <typename... AccessComponents>
@@ -3402,6 +3628,17 @@ public:
             *registry_,
             order_,
             view_.template access<AccessComponents...>());
+    }
+
+    template <typename... StructuralComponents>
+    JobStructuralView<detail::type_list<Components...>, detail::type_list<StructuralComponents...>> structural() const {
+        static_assert(
+            detail::unique_components<StructuralComponents...>::value,
+            "ecs structural components cannot repeat types");
+        return JobStructuralView<detail::type_list<Components...>, detail::type_list<StructuralComponents...>>(
+            *registry_,
+            order_,
+            threading_);
     }
 
     template <typename T, typename std::enable_if<detail::contains_component<T, Components...>::value, int>::type = 0>
@@ -3441,6 +3678,7 @@ private:
     Registry* registry_;
     int order_ = 0;
     View<Components...> view_;
+    JobThreadingOptions threading_;
 };
 
 template <typename... IterComponents, typename... AccessComponents>
@@ -3452,16 +3690,61 @@ public:
         AccessView<detail::type_list<IterComponents...>, AccessComponents...> view)
         : registry_(&registry), order_(order), view_(std::move(view)) {}
 
+    JobAccessView& max_threads(std::size_t count) {
+        threading_.max_threads = std::max<std::size_t>(count, 1);
+        threading_.single_thread = false;
+        return *this;
+    }
+
+    JobAccessView& single_thread() {
+        threading_.max_threads = 1;
+        threading_.single_thread = true;
+        return *this;
+    }
+
+    JobAccessView& min_entities_per_thread(std::size_t count) {
+        threading_.min_entities_per_thread = std::max<std::size_t>(count, 1);
+        return *this;
+    }
+
     template <typename Fn>
     Entity each(Fn&& fn) {
         using Callback = typename std::decay<Fn>::type;
-        Callback callback(std::forward<Fn>(fn));
+        auto callback = std::make_shared<Callback>(std::forward<Fn>(fn));
         return registry_->add_job(
             order_,
             registry_->template make_job_access_metadata<IterComponents..., AccessComponents...>(),
-            [callback = std::move(callback)](Registry& registry) mutable {
-                registry.template view<IterComponents...>().template access<AccessComponents...>().each(callback);
-            });
+            [callback](Registry& registry) mutable {
+                registry.template view<IterComponents...>().template access<AccessComponents...>().each(*callback);
+            },
+            [](Registry& registry) {
+                return registry.template view<IterComponents...>()
+                    .template access<AccessComponents...>()
+                    .matching_indices();
+            },
+            [callback](Registry& registry, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end)
+                mutable {
+                    registry.template view<IterComponents...>()
+                        .template access<AccessComponents...>()
+                        .each_index_range(*callback, indices, begin, end);
+                },
+            threading_,
+            false);
+    }
+
+    template <typename... StructuralComponents>
+    JobStructuralAccessView<
+        detail::type_list<IterComponents...>,
+        detail::type_list<AccessComponents...>,
+        detail::type_list<StructuralComponents...>>
+    structural() const {
+        static_assert(
+            detail::unique_components<StructuralComponents...>::value,
+            "ecs structural components cannot repeat types");
+        return JobStructuralAccessView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<StructuralComponents...>>(*registry_, order_, threading_);
     }
 
     template <
@@ -3507,6 +3790,131 @@ private:
     Registry* registry_;
     int order_ = 0;
     AccessView<detail::type_list<IterComponents...>, AccessComponents...> view_;
+    JobThreadingOptions threading_;
+};
+
+template <typename... IterComponents, typename... StructuralComponents>
+class Registry::JobStructuralView<detail::type_list<IterComponents...>, detail::type_list<StructuralComponents...>> {
+public:
+    JobStructuralView(Registry& registry, int order, JobThreadingOptions threading)
+        : registry_(&registry), order_(order), threading_(threading) {}
+
+    template <typename Fn>
+    Entity each(Fn&& fn) {
+        using Callback = typename std::decay<Fn>::type;
+        auto callback = std::make_shared<Callback>(std::forward<Fn>(fn));
+        JobAccessMetadata metadata = registry_->template make_job_access_metadata<IterComponents...>();
+        registry_->template append_job_structural_metadata<StructuralComponents...>(metadata);
+        threading_.single_thread = true;
+        threading_.max_threads = 1;
+        return registry_->add_job(
+            order_,
+            std::move(metadata),
+            [callback](Registry& registry) mutable {
+                auto view = registry.template view<IterComponents...>();
+                auto adapter = [callback, &registry](auto& active_view, Entity entity, auto&... components) mutable {
+                    using ActiveView = typename std::remove_reference<decltype(active_view)>::type;
+                    using Context = JobStructuralContext<ActiveView, StructuralComponents...>;
+                    Context context(registry, active_view);
+                    if constexpr (std::is_invocable<Callback&, Context&, Entity, decltype(components)...>::value) {
+                        (*callback)(context, entity, components...);
+                    } else {
+                        (*callback)(entity, components...);
+                    }
+                };
+                view.each(adapter);
+            },
+            [](Registry& registry) {
+                return registry.template view<IterComponents...>().matching_indices();
+            },
+            [callback](Registry& registry, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end)
+                mutable {
+                    auto view = registry.template view<IterComponents...>();
+                    auto adapter = [callback, &registry](auto& active_view, Entity entity, auto&... components) mutable {
+                        using ActiveView = typename std::remove_reference<decltype(active_view)>::type;
+                        using Context = JobStructuralContext<ActiveView, StructuralComponents...>;
+                        Context context(registry, active_view);
+                        if constexpr (std::is_invocable<Callback&, Context&, Entity, decltype(components)...>::value) {
+                            (*callback)(context, entity, components...);
+                        } else {
+                            (*callback)(entity, components...);
+                        }
+                    };
+                    view.each_index_range(adapter, indices, begin, end);
+                },
+            threading_,
+            true);
+    }
+
+private:
+    Registry* registry_;
+    int order_ = 0;
+    JobThreadingOptions threading_;
+};
+
+template <typename... IterComponents, typename... AccessComponents, typename... StructuralComponents>
+class Registry::JobStructuralAccessView<
+    detail::type_list<IterComponents...>,
+    detail::type_list<AccessComponents...>,
+    detail::type_list<StructuralComponents...>> {
+public:
+    JobStructuralAccessView(Registry& registry, int order, JobThreadingOptions threading)
+        : registry_(&registry), order_(order), threading_(threading) {}
+
+    template <typename Fn>
+    Entity each(Fn&& fn) {
+        using Callback = typename std::decay<Fn>::type;
+        auto callback = std::make_shared<Callback>(std::forward<Fn>(fn));
+        JobAccessMetadata metadata =
+            registry_->template make_job_access_metadata<IterComponents..., AccessComponents...>();
+        registry_->template append_job_structural_metadata<StructuralComponents...>(metadata);
+        threading_.single_thread = true;
+        threading_.max_threads = 1;
+        return registry_->add_job(
+            order_,
+            std::move(metadata),
+            [callback](Registry& registry) mutable {
+                auto view = registry.template view<IterComponents...>().template access<AccessComponents...>();
+                auto adapter = [callback, &registry](auto& active_view, Entity entity, auto&... components) mutable {
+                    using ActiveView = typename std::remove_reference<decltype(active_view)>::type;
+                    using Context = JobStructuralContext<ActiveView, StructuralComponents...>;
+                    Context context(registry, active_view);
+                    if constexpr (std::is_invocable<Callback&, Context&, Entity, decltype(components)...>::value) {
+                        (*callback)(context, entity, components...);
+                    } else {
+                        (*callback)(entity, components...);
+                    }
+                };
+                view.each(adapter);
+            },
+            [](Registry& registry) {
+                return registry.template view<IterComponents...>()
+                    .template access<AccessComponents...>()
+                    .matching_indices();
+            },
+            [callback](Registry& registry, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end)
+                mutable {
+                    auto view = registry.template view<IterComponents...>().template access<AccessComponents...>();
+                    auto adapter = [callback, &registry](auto& active_view, Entity entity, auto&... components) mutable {
+                        using ActiveView = typename std::remove_reference<decltype(active_view)>::type;
+                        using Context = JobStructuralContext<ActiveView, StructuralComponents...>;
+                        Context context(registry, active_view);
+                        if constexpr (std::is_invocable<Callback&, Context&, Entity, decltype(components)...>::value) {
+                            (*callback)(context, entity, components...);
+                        } else {
+                            (*callback)(entity, components...);
+                        }
+                    };
+                    view.each_index_range(adapter, indices, begin, end);
+                },
+            threading_,
+            true);
+    }
+
+private:
+    Registry* registry_;
+    int order_ = 0;
+    JobThreadingOptions threading_;
 };
 
 template <typename... Components>
@@ -3577,12 +3985,104 @@ private:
     }
 
     static bool conflicts(const Registry::JobRecord& left, const Registry::JobRecord& right) {
+        if (left.structural || right.structural) {
+            return true;
+        }
         return any_overlap(left.writes, right.reads) || any_overlap(left.reads, right.writes) ||
             any_overlap(left.writes, right.writes);
     }
 
     const Registry* registry_;
 };
+
+inline void Registry::run_jobs(RunJobsOptions options) {
+    const std::size_t job_count = jobs_.size();
+    if (options.force_single_threaded) {
+        for (std::size_t index : ordered_job_indices(job_count)) {
+            jobs_[index].run(*this);
+        }
+        return;
+    }
+
+    std::exception_ptr first_exception;
+    std::mutex exception_mutex;
+    auto make_safe_task = [&](JobThreadTask task) {
+        task.run = [run = std::move(task.run), &first_exception, &exception_mutex]() mutable {
+            try {
+                run();
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(exception_mutex);
+                if (first_exception == nullptr) {
+                    first_exception = std::current_exception();
+                }
+            }
+        };
+        return task;
+    };
+
+    const JobSchedule schedule = Orchestrator(*this).schedule();
+    for (const JobScheduleStage& stage : schedule.stages) {
+        std::vector<JobThreadTask> tasks;
+        for (Entity job_entity : stage.jobs) {
+            const std::size_t index = job_index(job_entity);
+            if (index >= job_count) {
+                continue;
+            }
+
+            JobRecord& job = jobs_[index];
+            if (job.single_thread || job.structural || job.max_threads <= 1) {
+                tasks.push_back(make_safe_task(JobThreadTask{
+                    job.entity,
+                    0,
+                    1,
+                    [this, index]() {
+                        jobs_[index].run(*this);
+                    }}));
+                continue;
+            }
+
+            auto indices = std::make_shared<std::vector<std::uint32_t>>(job.collect_indices(*this));
+            const std::size_t entity_count = indices->size();
+            if (entity_count == 0) {
+                tasks.push_back(make_safe_task(JobThreadTask{
+                    job.entity,
+                    0,
+                    1,
+                    [this, index]() {
+                        jobs_[index].run(*this);
+                    }}));
+                continue;
+            }
+
+            const std::size_t desired_threads =
+                std::max<std::size_t>(1, (entity_count + job.min_entities_per_thread - 1) / job.min_entities_per_thread);
+            const std::size_t thread_count = std::min(job.max_threads, desired_threads);
+            for (std::size_t thread_index = 0; thread_index < thread_count; ++thread_index) {
+                const std::size_t begin = entity_count * thread_index / thread_count;
+                const std::size_t end = entity_count * (thread_index + 1) / thread_count;
+                tasks.push_back(make_safe_task(JobThreadTask{
+                    job.entity,
+                    thread_index,
+                    thread_count,
+                    [this, index, indices, begin, end]() {
+                        jobs_[index].run_range(*this, *indices, begin, end);
+                    }}));
+            }
+        }
+
+        if (job_thread_executor_) {
+            job_thread_executor_(tasks);
+        } else {
+            for (const JobThreadTask& task : tasks) {
+                task.run();
+            }
+        }
+
+        if (first_exception != nullptr) {
+            std::rethrow_exception(first_exception);
+        }
+    }
+}
 
 template <typename... Owned>
 void Registry::declare_owned_group() {
