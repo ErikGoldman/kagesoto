@@ -757,6 +757,297 @@ TEST_CASE("view iteration tolerates removing non-driver components from current 
     REQUIRE(registry.get<Velocity>(second) == nullptr);
 }
 
+TEST_CASE("view iteration tolerates later entities gaining non-driver components") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    const ecs::Entity first = registry.create();
+    const ecs::Entity later = registry.create();
+    REQUIRE(registry.add<Position>(first, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(first, Velocity{1.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Position>(later, Position{2, 0}) != nullptr);
+
+    std::vector<ecs::Entity> visited;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        visited.push_back(entity);
+        if (entity == first) {
+            REQUIRE(registry.add<Velocity>(later, Velocity{2.0f, 0.0f}) != nullptr);
+        }
+    });
+
+    REQUIRE(visited.size() <= 2);
+    std::vector<ecs::Entity> after;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        after.push_back(entity);
+    });
+    REQUIRE(after.size() == 2);
+    REQUIRE(std::find(after.begin(), after.end(), first) != after.end());
+    REQUIRE(std::find(after.begin(), after.end(), later) != after.end());
+    REQUIRE(registry.get<Velocity>(later)->dx == 2.0f);
+}
+
+TEST_CASE("view iteration tolerates later entities losing non-driver components") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    const ecs::Entity first = registry.create();
+    const ecs::Entity second = registry.create();
+    const ecs::Entity later = registry.create();
+    REQUIRE(registry.add<Position>(first, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(first, Velocity{1.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Position>(second, Position{2, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(second, Velocity{2.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Position>(later, Position{3, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(later, Velocity{3.0f, 0.0f}) != nullptr);
+
+    std::vector<ecs::Entity> visited;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        visited.push_back(entity);
+        if (entity == first) {
+            REQUIRE(registry.remove<Velocity>(later));
+        }
+    });
+
+    REQUIRE(visited.size() <= 3);
+    std::vector<ecs::Entity> after;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        after.push_back(entity);
+    });
+    REQUIRE(after.size() == 2);
+    REQUIRE(std::find(after.begin(), after.end(), first) != after.end());
+    REQUIRE(std::find(after.begin(), after.end(), second) != after.end());
+    REQUIRE(std::find(after.begin(), after.end(), later) == after.end());
+    REQUIRE(registry.get<Position>(later) != nullptr);
+    REQUIRE(registry.get<Velocity>(later) == nullptr);
+}
+
+TEST_CASE("view iteration tolerates later entities gaining driver components") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    const ecs::Entity first = registry.create();
+    const ecs::Entity later = registry.create();
+    REQUIRE(registry.add<Position>(first, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(first, Velocity{1.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Velocity>(later, Velocity{2.0f, 0.0f}) != nullptr);
+
+    std::vector<ecs::Entity> visited;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        visited.push_back(entity);
+        if (entity == first) {
+            REQUIRE(registry.add<Position>(later, Position{2, 0}) != nullptr);
+        }
+    });
+
+    REQUIRE(visited.size() <= 2);
+    std::vector<ecs::Entity> after;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        after.push_back(entity);
+    });
+    REQUIRE(after.size() == 2);
+    REQUIRE(std::find(after.begin(), after.end(), first) != after.end());
+    REQUIRE(std::find(after.begin(), after.end(), later) != after.end());
+    REQUIRE(registry.get<Position>(later)->x == 2);
+}
+
+TEST_CASE("view iteration tolerates removing driver components from current entity") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    const ecs::Entity first = registry.create();
+    const ecs::Entity second = registry.create();
+    REQUIRE(registry.add<Position>(first, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(first, Velocity{1.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Position>(second, Position{2, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(second, Velocity{2.0f, 0.0f}) != nullptr);
+
+    std::vector<ecs::Entity> visited;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        visited.push_back(entity);
+        REQUIRE(registry.remove<Position>(entity));
+    });
+
+    REQUIRE_FALSE(visited.empty());
+    REQUIRE(visited.size() <= 2);
+    for (ecs::Entity entity : visited) {
+        REQUIRE(registry.get<Position>(entity) == nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+    }
+
+    std::vector<ecs::Entity> after;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        after.push_back(entity);
+    });
+    for (ecs::Entity entity : after) {
+        REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+    }
+}
+
+TEST_CASE("view iteration tolerates later entities losing driver components") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    const ecs::Entity first = registry.create();
+    const ecs::Entity second = registry.create();
+    const ecs::Entity later = registry.create();
+    REQUIRE(registry.add<Position>(first, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(first, Velocity{1.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Position>(second, Position{2, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(second, Velocity{2.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Position>(later, Position{3, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(later, Velocity{3.0f, 0.0f}) != nullptr);
+
+    std::vector<ecs::Entity> visited;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        visited.push_back(entity);
+        if (entity == first) {
+            REQUIRE(registry.remove<Position>(later));
+        }
+    });
+
+    REQUIRE(visited.size() <= 3);
+    std::vector<ecs::Entity> after;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        after.push_back(entity);
+    });
+    REQUIRE(after.size() == 2);
+    REQUIRE(std::find(after.begin(), after.end(), first) != after.end());
+    REQUIRE(std::find(after.begin(), after.end(), second) != after.end());
+    REQUIRE(std::find(after.begin(), after.end(), later) == after.end());
+    REQUIRE(registry.get<Position>(later) == nullptr);
+    REQUIRE(registry.get<Velocity>(later) != nullptr);
+}
+
+TEST_CASE("jobs run views in order and preserve insertion order for ties") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+
+    std::vector<int> calls;
+    registry.job<Position>(10).each([&](ecs::Entity current, Position&) {
+        REQUIRE(current == entity);
+        calls.push_back(10);
+    });
+    registry.job<Position>(-1).each([&](ecs::Entity current, Position&) {
+        REQUIRE(current == entity);
+        calls.push_back(-1);
+    });
+    registry.job<Position>(10).each([&](ecs::Entity current, Position&) {
+        REQUIRE(current == entity);
+        calls.push_back(11);
+    });
+
+    REQUIRE(calls.empty());
+    registry.run_jobs();
+
+    REQUIRE(calls == std::vector<int>{-1, 10, 11});
+}
+
+TEST_CASE("jobs are persistent and use access views") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{2, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(entity, Velocity{1.0f, 0.0f}) != nullptr);
+
+    registry.job<const Position>(0).access<Velocity>().each(
+        [&](auto& active_view, ecs::Entity current, const Position& position) {
+            Velocity* velocity = active_view.template write<Velocity>(current);
+            REQUIRE(velocity != nullptr);
+            velocity->dx += static_cast<float>(position.x);
+        });
+
+    registry.run_jobs();
+    registry.run_jobs();
+
+    REQUIRE(registry.get<Velocity>(entity)->dx == 5.0f);
+}
+
+TEST_CASE("jobs use live views when they run") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    int calls = 0;
+    registry.job<Position>(0).each([&](ecs::Entity, Position&) {
+        ++calls;
+    });
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+
+    registry.run_jobs();
+    REQUIRE(calls == 1);
+}
+
+TEST_CASE("mutable job views mark iterated components dirty") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{3, 0}) != nullptr);
+    registry.clear_all_dirty<Position>();
+
+    registry.job<Position>(0).each([&](ecs::Entity current, Position& position) {
+        REQUIRE(current == entity);
+        REQUIRE(position.x == 3);
+    });
+
+    REQUIRE_FALSE(registry.is_dirty<Position>(entity));
+    registry.run_jobs();
+    REQUIRE(registry.is_dirty<Position>(entity));
+}
+
+TEST_CASE("jobs added while jobs are running wait until the next run") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+
+    int outer_calls = 0;
+    int inner_calls = 0;
+    registry.job<Position>(0).each([&](ecs::Entity, Position&) {
+        ++outer_calls;
+        registry.job<Position>(-1).each([&](ecs::Entity, Position&) {
+            ++inner_calls;
+        });
+    });
+
+    registry.run_jobs();
+    REQUIRE(outer_calls == 1);
+    REQUIRE(inner_calls == 0);
+
+    registry.run_jobs();
+    REQUIRE(outer_calls == 2);
+    REQUIRE(inner_calls == 1);
+}
+
 TEST_CASE("declared owned groups are used by matching views and track membership") {
     ecs::Registry registry;
     registry.register_component<Position>("Position");
@@ -801,6 +1092,288 @@ TEST_CASE("declared owned groups are used by matching views and track membership
     REQUIRE(after_changes.size() == 2);
     REQUIRE(std::find(after_changes.begin(), after_changes.end(), position_only) != after_changes.end());
     REQUIRE(std::find(after_changes.begin(), after_changes.end(), both_b) != after_changes.end());
+}
+
+TEST_CASE("owned group view iteration tolerates later entities gaining components") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    registry.declare_owned_group<Position, Velocity>();
+
+    const ecs::Entity first = registry.create();
+    const ecs::Entity later = registry.create();
+    REQUIRE(registry.add<Position>(first, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(first, Velocity{1.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Position>(later, Position{2, 0}) != nullptr);
+
+    std::vector<ecs::Entity> visited;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        visited.push_back(entity);
+        if (entity == first) {
+            REQUIRE(registry.add<Velocity>(later, Velocity{2.0f, 0.0f}) != nullptr);
+        }
+    });
+
+    REQUIRE(visited.size() <= 2);
+    std::vector<ecs::Entity> after;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        after.push_back(entity);
+    });
+    REQUIRE(after.size() == 2);
+    REQUIRE(std::find(after.begin(), after.end(), first) != after.end());
+    REQUIRE(std::find(after.begin(), after.end(), later) != after.end());
+    REQUIRE(registry.get<Velocity>(later)->dx == 2.0f);
+}
+
+TEST_CASE("owned group view iteration tolerates later entities losing components") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    registry.declare_owned_group<Position, Velocity>();
+
+    const ecs::Entity first = registry.create();
+    const ecs::Entity second = registry.create();
+    const ecs::Entity later = registry.create();
+    REQUIRE(registry.add<Position>(first, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(first, Velocity{1.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Position>(second, Position{2, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(second, Velocity{2.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Position>(later, Position{3, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(later, Velocity{3.0f, 0.0f}) != nullptr);
+
+    std::vector<ecs::Entity> visited;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        visited.push_back(entity);
+        if (entity == first) {
+            REQUIRE(registry.remove<Velocity>(later));
+        }
+    });
+
+    REQUIRE(visited.size() <= 3);
+    std::vector<ecs::Entity> after;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        after.push_back(entity);
+    });
+    REQUIRE(after.size() == 2);
+    REQUIRE(std::find(after.begin(), after.end(), first) != after.end());
+    REQUIRE(std::find(after.begin(), after.end(), second) != after.end());
+    REQUIRE(std::find(after.begin(), after.end(), later) == after.end());
+    REQUIRE(registry.get<Position>(later) != nullptr);
+    REQUIRE(registry.get<Velocity>(later) == nullptr);
+}
+
+TEST_CASE("owned group view iteration tolerates removing components from current entity") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    registry.declare_owned_group<Position, Velocity>();
+
+    const ecs::Entity first = registry.create();
+    const ecs::Entity second = registry.create();
+    REQUIRE(registry.add<Position>(first, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(first, Velocity{1.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Position>(second, Position{2, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(second, Velocity{2.0f, 0.0f}) != nullptr);
+
+    std::vector<ecs::Entity> visited;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        visited.push_back(entity);
+        REQUIRE(registry.remove<Velocity>(entity));
+    });
+
+    REQUIRE_FALSE(visited.empty());
+    REQUIRE(visited.size() <= 2);
+    for (ecs::Entity entity : visited) {
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) == nullptr);
+    }
+
+    std::vector<ecs::Entity> after;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        after.push_back(entity);
+    });
+    for (ecs::Entity entity : after) {
+        REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+    }
+}
+
+TEST_CASE("nested owned groups tolerate later entities joining the most specific view") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+    registry.register_component<Health>("Health");
+
+    registry.declare_owned_group<Position>();
+    registry.declare_owned_group<Position, Velocity>();
+    registry.declare_owned_group<Position, Velocity, Health>();
+    registry.declare_owned_group<Velocity, Position>();
+
+    const ecs::Entity first = registry.create();
+    const ecs::Entity later = registry.create();
+    REQUIRE(registry.add<Position>(first, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(first, Velocity{1.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Health>(first, Health{10}) != nullptr);
+    REQUIRE(registry.add<Position>(later, Position{2, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(later, Velocity{2.0f, 0.0f}) != nullptr);
+
+    std::vector<ecs::Entity> visited;
+    registry.view<Position, Velocity, Health>().each([&](ecs::Entity entity, Position&, Velocity&, Health&) {
+        REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE(registry.get<Health>(entity) != nullptr);
+        visited.push_back(entity);
+        if (entity == first) {
+            REQUIRE(registry.add<Health>(later, Health{20}) != nullptr);
+        }
+    });
+
+    REQUIRE(visited.size() <= 2);
+    std::vector<ecs::Entity> full_group;
+    registry.view<Position, Velocity, Health>().each([&](ecs::Entity entity, Position&, Velocity&, Health&) {
+        full_group.push_back(entity);
+    });
+    REQUIRE(full_group.size() == 2);
+    REQUIRE(std::find(full_group.begin(), full_group.end(), first) != full_group.end());
+    REQUIRE(std::find(full_group.begin(), full_group.end(), later) != full_group.end());
+    REQUIRE(registry.get<Health>(later)->value == 20);
+}
+
+TEST_CASE("nested owned groups tolerate later entities leaving the most specific view") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+    registry.register_component<Health>("Health");
+
+    registry.declare_owned_group<Position>();
+    registry.declare_owned_group<Position, Velocity>();
+    registry.declare_owned_group<Position, Velocity, Health>();
+    registry.declare_owned_group<Velocity, Position>();
+
+    const ecs::Entity first = registry.create();
+    const ecs::Entity second = registry.create();
+    const ecs::Entity loses_health = registry.create();
+    const ecs::Entity loses_velocity = registry.create();
+    REQUIRE(registry.add<Position>(first, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(first, Velocity{1.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Health>(first, Health{10}) != nullptr);
+    REQUIRE(registry.add<Position>(second, Position{2, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(second, Velocity{2.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Health>(second, Health{20}) != nullptr);
+    REQUIRE(registry.add<Position>(loses_health, Position{3, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(loses_health, Velocity{3.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Health>(loses_health, Health{30}) != nullptr);
+    REQUIRE(registry.add<Position>(loses_velocity, Position{4, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(loses_velocity, Velocity{4.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Health>(loses_velocity, Health{40}) != nullptr);
+
+    std::vector<ecs::Entity> visited;
+    registry.view<Position, Velocity, Health>().each([&](ecs::Entity entity, Position&, Velocity&, Health&) {
+        REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE(registry.get<Health>(entity) != nullptr);
+        visited.push_back(entity);
+        if (entity == first) {
+            REQUIRE(registry.remove<Health>(loses_health));
+            REQUIRE(registry.remove<Velocity>(loses_velocity));
+        }
+    });
+
+    REQUIRE(visited.size() <= 4);
+    std::vector<ecs::Entity> positions;
+    registry.view<Position>().each([&](ecs::Entity entity, Position&) {
+        positions.push_back(entity);
+    });
+    REQUIRE(positions.size() == 4);
+    REQUIRE(std::find(positions.begin(), positions.end(), first) != positions.end());
+    REQUIRE(std::find(positions.begin(), positions.end(), second) != positions.end());
+    REQUIRE(std::find(positions.begin(), positions.end(), loses_health) != positions.end());
+    REQUIRE(std::find(positions.begin(), positions.end(), loses_velocity) != positions.end());
+
+    std::vector<ecs::Entity> lower_group;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        lower_group.push_back(entity);
+    });
+    REQUIRE(lower_group.size() == 3);
+    REQUIRE(std::find(lower_group.begin(), lower_group.end(), first) != lower_group.end());
+    REQUIRE(std::find(lower_group.begin(), lower_group.end(), second) != lower_group.end());
+    REQUIRE(std::find(lower_group.begin(), lower_group.end(), loses_health) != lower_group.end());
+    REQUIRE(std::find(lower_group.begin(), lower_group.end(), loses_velocity) == lower_group.end());
+
+    std::vector<ecs::Entity> full_group;
+    registry.view<Position, Velocity, Health>().each([&](ecs::Entity entity, Position&, Velocity&, Health&) {
+        full_group.push_back(entity);
+    });
+    REQUIRE(full_group.size() == 2);
+    REQUIRE(std::find(full_group.begin(), full_group.end(), first) != full_group.end());
+    REQUIRE(std::find(full_group.begin(), full_group.end(), second) != full_group.end());
+    REQUIRE(std::find(full_group.begin(), full_group.end(), loses_health) == full_group.end());
+    REQUIRE(std::find(full_group.begin(), full_group.end(), loses_velocity) == full_group.end());
+}
+
+TEST_CASE("nested owned groups keep lower group membership after current entity leaves full view") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+    registry.register_component<Health>("Health");
+
+    registry.declare_owned_group<Position>();
+    registry.declare_owned_group<Position, Velocity>();
+    registry.declare_owned_group<Position, Velocity, Health>();
+    registry.declare_owned_group<Velocity, Position>();
+
+    const ecs::Entity first = registry.create();
+    const ecs::Entity second = registry.create();
+    REQUIRE(registry.add<Position>(first, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(first, Velocity{1.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Health>(first, Health{10}) != nullptr);
+    REQUIRE(registry.add<Position>(second, Position{2, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(second, Velocity{2.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Health>(second, Health{20}) != nullptr);
+
+    std::vector<ecs::Entity> visited;
+    registry.view<Position, Velocity, Health>().each([&](ecs::Entity entity, Position&, Velocity&, Health&) {
+        REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
+        REQUIRE(registry.get<Position>(entity) != nullptr);
+        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE(registry.get<Health>(entity) != nullptr);
+        visited.push_back(entity);
+        if (entity == first) {
+            REQUIRE(registry.remove<Health>(entity));
+        }
+    });
+
+    REQUIRE_FALSE(visited.empty());
+    REQUIRE(visited.size() <= 2);
+
+    std::vector<ecs::Entity> lower_group;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        lower_group.push_back(entity);
+    });
+    REQUIRE(lower_group.size() == 2);
+    REQUIRE(std::find(lower_group.begin(), lower_group.end(), first) != lower_group.end());
+    REQUIRE(std::find(lower_group.begin(), lower_group.end(), second) != lower_group.end());
+
+    std::vector<ecs::Entity> full_group;
+    registry.view<Position, Velocity, Health>().each([&](ecs::Entity entity, Position&, Velocity&, Health&) {
+        full_group.push_back(entity);
+    });
+    REQUIRE(full_group == std::vector<ecs::Entity>{second});
 }
 
 TEST_CASE("owned group declarations allow identical and nested groups but reject partial overlap") {

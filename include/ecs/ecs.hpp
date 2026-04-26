@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -178,6 +179,12 @@ public:
 
     template <typename IterList, typename... AccessComponents>
     class AccessView;
+
+    template <typename... Components>
+    class JobView;
+
+    template <typename IterList, typename... AccessComponents>
+    class JobAccessView;
 
     Registry() {
         register_primitive_types();
@@ -530,6 +537,26 @@ public:
 
     template <typename... Components>
     View<Components...> view();
+
+    template <typename... Components>
+    JobView<Components...> job(int order);
+
+    void run_jobs() {
+        std::vector<std::size_t> ordered(jobs_.size());
+        std::iota(ordered.begin(), ordered.end(), std::size_t{0});
+        std::sort(ordered.begin(), ordered.end(), [&](std::size_t lhs, std::size_t rhs) {
+            const JobRecord& left = jobs_[lhs];
+            const JobRecord& right = jobs_[rhs];
+            if (left.order != right.order) {
+                return left.order < right.order;
+            }
+            return left.sequence < right.sequence;
+        });
+
+        for (std::size_t index : ordered) {
+            jobs_[index].run(*this);
+        }
+    }
 
     template <typename... Owned>
     void declare_owned_group();
@@ -982,6 +1009,16 @@ private:
         std::vector<std::uint32_t> owned;
         std::size_t size = 0;
     };
+
+    struct JobRecord {
+        int order = 0;
+        std::uint64_t sequence = 0;
+        std::function<void(Registry&)> run;
+    };
+
+    void add_job(int order, std::function<void(Registry&)> run) {
+        jobs_.push_back(JobRecord{order, next_job_sequence_++, std::move(run)});
+    }
 
     template <typename... Owned>
     static std::vector<std::uint32_t> make_group_key(const Registry& registry) {
@@ -1458,6 +1495,8 @@ private:
     std::unordered_map<std::uint32_t, std::unique_ptr<TypeErasedStorage>> storages_;
     std::vector<Entity> typed_components_;
     std::vector<std::unique_ptr<GroupRecord>> groups_;
+    std::vector<JobRecord> jobs_;
+    std::uint64_t next_job_sequence_ = 0;
     Entity singleton_entity_;
     Entity primitive_types_[7]{};
 };
@@ -1910,8 +1949,140 @@ private:
 };
 
 template <typename... Components>
+class Registry::JobView {
+    static_assert(sizeof...(Components) > 0, "ecs jobs require at least one component");
+
+public:
+    JobView(Registry& registry, int order)
+        : registry_(&registry), order_(order), view_(registry) {}
+
+    template <typename Fn>
+    void each(Fn&& fn) {
+        using Callback = typename std::decay<Fn>::type;
+        Callback callback(std::forward<Fn>(fn));
+        registry_->add_job(order_, [callback = std::move(callback)](Registry& registry) mutable {
+            registry.template view<Components...>().each(callback);
+        });
+    }
+
+    template <typename... AccessComponents>
+    JobAccessView<detail::type_list<Components...>, AccessComponents...> access() const {
+        return JobAccessView<detail::type_list<Components...>, AccessComponents...>(
+            *registry_,
+            order_,
+            view_.template access<AccessComponents...>());
+    }
+
+    template <typename T, typename std::enable_if<detail::contains_component<T, Components...>::value, int>::type = 0>
+    const detail::component_query_t<T>* get(Entity entity) const {
+        return view_.template get<T>(entity);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::is_singleton_query<T>::value && detail::contains_component<T, Components...>::value,
+            int>::type = 0>
+    const detail::component_query_t<T>* get() const {
+        return view_.template get<T>();
+    }
+
+    template <typename T, typename std::enable_if<
+                              !std::is_const<typename std::remove_reference<T>::type>::value &&
+                                  detail::contains_mutable_component<T, Components...>::value,
+                              int>::type = 0>
+    detail::component_query_t<T>* write(Entity entity) {
+        return view_.template write<T>(entity);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::is_singleton_query<T>::value &&
+                !std::is_const<typename std::remove_reference<T>::type>::value &&
+                detail::contains_mutable_component<T, Components...>::value,
+            int>::type = 0>
+    detail::component_query_t<T>* write() {
+        return view_.template write<T>();
+    }
+
+private:
+    Registry* registry_;
+    int order_ = 0;
+    View<Components...> view_;
+};
+
+template <typename... IterComponents, typename... AccessComponents>
+class Registry::JobAccessView<detail::type_list<IterComponents...>, AccessComponents...> {
+public:
+    JobAccessView(
+        Registry& registry,
+        int order,
+        AccessView<detail::type_list<IterComponents...>, AccessComponents...> view)
+        : registry_(&registry), order_(order), view_(std::move(view)) {}
+
+    template <typename Fn>
+    void each(Fn&& fn) {
+        using Callback = typename std::decay<Fn>::type;
+        Callback callback(std::forward<Fn>(fn));
+        registry_->add_job(order_, [callback = std::move(callback)](Registry& registry) mutable {
+            registry.template view<IterComponents...>().template access<AccessComponents...>().each(callback);
+        });
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<detail::contains_component<T, IterComponents..., AccessComponents...>::value, int>::
+            type = 0>
+    const detail::component_query_t<T>* get(Entity entity) const {
+        return view_.template get<T>(entity);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::is_singleton_query<T>::value &&
+                detail::contains_component<T, IterComponents..., AccessComponents...>::value,
+            int>::type = 0>
+    const detail::component_query_t<T>* get() const {
+        return view_.template get<T>();
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            !std::is_const<typename std::remove_reference<T>::type>::value &&
+                detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
+            int>::type = 0>
+    detail::component_query_t<T>* write(Entity entity) {
+        return view_.template write<T>(entity);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::is_singleton_query<T>::value &&
+                !std::is_const<typename std::remove_reference<T>::type>::value &&
+                detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
+            int>::type = 0>
+    detail::component_query_t<T>* write() {
+        return view_.template write<T>();
+    }
+
+private:
+    Registry* registry_;
+    int order_ = 0;
+    AccessView<detail::type_list<IterComponents...>, AccessComponents...> view_;
+};
+
+template <typename... Components>
 Registry::View<Components...> Registry::view() {
     return View<Components...>(*this);
+}
+
+template <typename... Components>
+Registry::JobView<Components...> Registry::job(int order) {
+    return JobView<Components...>(*this, order);
 }
 
 template <typename... Owned>

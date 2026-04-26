@@ -111,6 +111,32 @@ view.each([&](auto& active_view, ecs::Entity entity, Position& position) {
 });
 ```
 
+## Jobs
+
+Jobs are persistent view callbacks with an integer order. Register jobs with `Registry::job<Components...>(order)`, then call `.each()` on the returned job view. Jobs run only when `run_jobs()` is called. Lower order values run first, and jobs with the same order run in the order they were added.
+
+```cpp
+registry.job<const Position, Velocity>(10).each(
+    [](ecs::Entity entity, const Position& position, Velocity& velocity) {
+        velocity.dx += position.x;
+        velocity.dy += position.y;
+    });
+
+registry.run_jobs();
+```
+
+Job views support the same access pattern as ordinary views:
+
+```cpp
+registry.job<const Position>(20)
+    .access<Velocity>()
+    .each([](auto& active_view, ecs::Entity entity, const Position& position) {
+        if (Velocity* velocity = active_view.template write<Velocity>(entity)) {
+            velocity->dx += position.x;
+        }
+    });
+```
+
 ## Owned Groups and Sorting
 
 Fully owned groups are declared as layout hints. After declaration, matching views automatically use the owned group prefix as their iteration driver while the normal `view`, `get`, and `write` APIs stay unchanged.
@@ -196,6 +222,8 @@ std::string text = registry.debug_print(entity, position_type);
 - `void Registry::clear_all_dirty<T>()`
 - `void Registry::clear_all_dirty(Entity component)`
 - `Registry::View<Components...> Registry::view<Components...>()`
+- `Registry::JobView<Components...> Registry::job<Components...>(int order)`
+- `void Registry::run_jobs()`
 - `void Registry::declare_owned_group<Owned...>()`
 - `void View<Components...>::each(Fn&& callback)`
 - `auto View<Components...>::access<AccessComponents...>() const`
