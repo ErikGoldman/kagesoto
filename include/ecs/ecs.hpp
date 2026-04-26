@@ -175,6 +175,14 @@ struct ComponentDesc {
     std::vector<ComponentField> fields;
 };
 
+struct JobScheduleStage {
+    std::vector<Entity> jobs;
+};
+
+struct JobSchedule {
+    std::vector<JobScheduleStage> stages;
+};
+
 enum class PrimitiveType {
     Bool,
     I32,
@@ -186,6 +194,8 @@ enum class PrimitiveType {
 };
 
 class Registry {
+    friend class Orchestrator;
+
 public:
     static constexpr std::uint32_t invalid_index = std::numeric_limits<std::uint32_t>::max();
 
@@ -208,6 +218,7 @@ public:
     class DeltaSnapshot;
 
     Registry() {
+        register_system_tag();
         register_primitive_types();
     }
 
@@ -342,6 +353,10 @@ public:
 
     Entity primitive_type(PrimitiveType type) const {
         return primitive_types_[static_cast<std::size_t>(type)];
+    }
+
+    Entity system_tag() const {
+        return system_tag_;
     }
 
     const ComponentInfo* component_info(Entity component) const {
@@ -1109,7 +1124,22 @@ private:
             return copy;
         }
 
+        std::unique_ptr<TypeErasedStorage> clone_excluding(const std::vector<bool>& excluded) const {
+            auto copy = clone_filtered(excluded, false);
+            copy->copy_tombstones_excluding(tombstones_, excluded);
+            return copy;
+        }
+
+        std::unique_ptr<TypeErasedStorage> clone_dirty_excluding(const std::vector<bool>& excluded) const {
+            auto copy = clone_filtered(excluded, true);
+            copy->copy_tombstones_excluding(tombstones_, excluded);
+            return copy;
+        }
+
     private:
+        TypeErasedStorage(ComponentInfo info, ComponentLifecycle lifecycle)
+            : info_(info), lifecycle_(lifecycle) {}
+
         template <typename T>
         void validate_type() const {
             if (sizeof(T) != info_.size || alignof(T) != info_.alignment) {
@@ -1301,6 +1331,33 @@ private:
             return index < tombstones_.size() && tombstones_[index] != no_tombstone;
         }
 
+        std::unique_ptr<TypeErasedStorage> clone_filtered(
+            const std::vector<bool>& excluded,
+            bool dirty_only) const {
+            auto copy = std::unique_ptr<TypeErasedStorage>(new TypeErasedStorage(info_, lifecycle_));
+            for (std::size_t dense = 0; dense < size_; ++dense) {
+                const std::uint32_t index = dense_indices_[dense];
+                if ((index < excluded.size() && excluded[index]) || (dirty_only && !dirty_[dense])) {
+                    continue;
+                }
+
+                copy->emplace_or_replace_copy(index, get(index));
+                copy->dirty_[copy->sparse_[index]] = dirty_[dense];
+            }
+            return copy;
+        }
+
+        void copy_tombstones_excluding(
+            const std::vector<unsigned char>& tombstones,
+            const std::vector<bool>& excluded) {
+            tombstones_ = tombstones;
+            for (std::size_t index = 0; index < tombstones_.size() && index < excluded.size(); ++index) {
+                if (excluded[index]) {
+                    tombstones_[index] = no_tombstone;
+                }
+            }
+        }
+
         void copy_from(const TypeErasedStorage& other) {
             size_ = other.size_;
             capacity_ = other.capacity_;
@@ -1364,13 +1421,66 @@ private:
     };
 
     struct JobRecord {
+        Entity entity;
         int order = 0;
         std::uint64_t sequence = 0;
+        std::vector<std::uint32_t> reads;
+        std::vector<std::uint32_t> writes;
         std::function<void(Registry&)> run;
     };
 
-    void add_job(int order, std::function<void(Registry&)> run) {
-        jobs_.push_back(JobRecord{order, next_job_sequence_++, std::move(run)});
+    struct JobAccessMetadata {
+        std::vector<std::uint32_t> reads;
+        std::vector<std::uint32_t> writes;
+    };
+
+    static void append_unique_component(std::vector<std::uint32_t>& components, std::uint32_t component) {
+        if (std::find(components.begin(), components.end(), component) == components.end()) {
+            components.push_back(component);
+        }
+    }
+
+    static void remove_written_reads(JobAccessMetadata& metadata) {
+        metadata.reads.erase(
+            std::remove_if(
+                metadata.reads.begin(),
+                metadata.reads.end(),
+                [&](std::uint32_t read) {
+                    return std::find(metadata.writes.begin(), metadata.writes.end(), read) != metadata.writes.end();
+                }),
+            metadata.reads.end());
+    }
+
+    template <typename T>
+    void append_job_access_component(JobAccessMetadata& metadata) const {
+        const Entity component = registered_component<detail::component_query_t<T>>();
+        const std::uint32_t component_index = entity_index(component);
+        if constexpr (std::is_const<typename std::remove_reference<T>::type>::value) {
+            append_unique_component(metadata.reads, component_index);
+        } else {
+            append_unique_component(metadata.writes, component_index);
+        }
+    }
+
+    template <typename... Components>
+    JobAccessMetadata make_job_access_metadata() const {
+        JobAccessMetadata metadata;
+        (append_job_access_component<Components>(metadata), ...);
+        remove_written_reads(metadata);
+        return metadata;
+    }
+
+    Entity add_job(int order, JobAccessMetadata metadata, std::function<void(Registry&)> run) {
+        const Entity entity = create();
+        add_system_tag(entity);
+        jobs_.push_back(JobRecord{
+            entity,
+            order,
+            next_job_sequence_++,
+            std::move(metadata.reads),
+            std::move(metadata.writes),
+            std::move(run)});
+        return entity;
     }
 
     template <typename... Owned>
@@ -1822,7 +1932,117 @@ private:
 
         const Entity type = register_component_impl(std::move(desc), lifecycle, true, false, false, npos_type_id);
         components_[entity_index(type)].primitive = kind;
+        add_system_tag(type);
         return type;
+    }
+
+    void register_system_tag() {
+        ComponentDesc desc;
+        desc.name = "ecs.system";
+        desc.size = 0;
+        desc.alignment = 1;
+
+        ComponentLifecycle lifecycle;
+        lifecycle.trivially_copyable = true;
+
+        system_tag_ = register_component_impl(std::move(desc), lifecycle, true, false, true, npos_type_id);
+        add_system_tag(system_tag_);
+    }
+
+    void add_system_tag(Entity entity) {
+        if (!system_tag_ || !alive(entity)) {
+            return;
+        }
+        storage_for(system_tag_).emplace_or_replace_tag(entity_index(entity));
+    }
+
+    bool is_snapshot_excluded_index(std::uint32_t index) const {
+        if (!system_tag_ || components_.find(index) != components_.end()) {
+            return false;
+        }
+
+        const TypeErasedStorage* system_storage = find_storage(system_tag_);
+        return system_storage != nullptr && system_storage->contains_index(index);
+    }
+
+    std::vector<bool> make_snapshot_exclusion_mask() const {
+        std::vector<bool> excluded(entities_.size(), false);
+        for (std::uint32_t index = 0; index < excluded.size(); ++index) {
+            excluded[index] = is_snapshot_excluded_index(index);
+        }
+        return excluded;
+    }
+
+    std::vector<std::uint64_t> make_snapshot_entities(const std::vector<bool>& excluded) const {
+        std::vector<std::uint64_t> entities = entities_;
+        for (std::size_t index = 0; index < entities.size() && index < excluded.size(); ++index) {
+            if (excluded[index]) {
+                entities[index] = 0;
+            }
+        }
+        return entities;
+    }
+
+    std::vector<Entity> current_snapshot_excluded_entities() const {
+        std::vector<Entity> entities;
+        const TypeErasedStorage* system_storage = system_tag_ ? find_storage(system_tag_) : nullptr;
+        if (system_storage != nullptr) {
+            for (std::size_t dense = 0; dense < system_storage->dense_size(); ++dense) {
+                const std::uint32_t index = system_storage->dense_index_at(dense);
+                if (is_snapshot_excluded_index(index) && index < entities_.size()) {
+                    entities.push_back(Entity{entities_[index]});
+                }
+            }
+        }
+
+        for (const JobRecord& job : jobs_) {
+            if (alive(job.entity) && std::find(entities.begin(), entities.end(), job.entity) == entities.end()) {
+                entities.push_back(job.entity);
+            }
+        }
+        return entities;
+    }
+
+    static bool slot_is_alive_at(std::uint32_t index, std::uint64_t slot) {
+        return slot_index(slot) == index && slot_version(slot) != 0;
+    }
+
+    static std::uint32_t rebuild_free_list(std::vector<std::uint64_t>& entities) {
+        std::uint32_t free_head = invalid_index;
+        for (std::size_t offset = entities.size(); offset > 0; --offset) {
+            const std::uint32_t index = static_cast<std::uint32_t>(offset - 1);
+            if (slot_is_alive_at(index, entities[index])) {
+                continue;
+            }
+
+            std::uint32_t version = slot_version(entities[index]);
+            if (version == 0) {
+                version = 1;
+            }
+            entities[index] = pack(free_head, version);
+            free_head = index;
+        }
+        return free_head;
+    }
+
+    void merge_current_system_entities(std::vector<std::uint64_t>& entities) const {
+        for (Entity entity : current_snapshot_excluded_entities()) {
+            const std::uint32_t index = entity_index(entity);
+            if (index >= entities.size()) {
+                entities.resize(static_cast<std::size_t>(index) + 1, 0);
+            }
+            entities[index] = entity.value;
+        }
+    }
+
+    void restore_internal_bookkeeping_tags() {
+        add_system_tag(system_tag_);
+        for (Entity primitive : primitive_types_) {
+            add_system_tag(primitive);
+        }
+        for (const JobRecord& job : jobs_) {
+            add_system_tag(job.entity);
+        }
     }
 
     void print_field(std::ostringstream& out, const unsigned char* data, const ComponentField& field) const {
@@ -1872,6 +2092,7 @@ private:
     std::uint64_t state_token_ = next_state_token();
     Entity singleton_entity_;
     Entity primitive_types_[7]{};
+    Entity system_tag_;
 };
 
 class Registry::Snapshot {
@@ -1895,6 +2116,7 @@ private:
     std::vector<std::unique_ptr<GroupRecord>> groups_;
     Entity singleton_entity_;
     Entity primitive_types_[7]{};
+    Entity system_tag_;
     std::uint64_t state_token_ = 0;
 };
 
@@ -1920,18 +2142,23 @@ private:
 
 inline Registry::Snapshot Registry::snapshot() const {
     Snapshot result;
-    result.entities_ = entities_;
-    result.free_head_ = free_head_;
+    const std::vector<bool> excluded = make_snapshot_exclusion_mask();
+    result.entities_ = make_snapshot_entities(excluded);
+    result.free_head_ = rebuild_free_list(result.entities_);
     result.components_ = components_;
     result.component_names_ = component_names_;
     result.typed_components_ = typed_components_;
     result.singleton_entity_ = singleton_entity_;
+    result.system_tag_ = system_tag_;
     result.state_token_ = state_token_;
     std::copy(std::begin(primitive_types_), std::end(primitive_types_), std::begin(result.primitive_types_));
 
     result.storages_.reserve(storages_.size());
     for (const auto& storage : storages_) {
-        result.storages_.emplace(storage.first, storage.second->clone());
+        if (system_tag_ && storage.first == entity_index(system_tag_)) {
+            continue;
+        }
+        result.storages_.emplace(storage.first, storage.second->clone_excluding(excluded));
     }
 
     result.groups_.reserve(groups_.size());
@@ -1944,12 +2171,16 @@ inline Registry::Snapshot Registry::snapshot() const {
 
 inline Registry::DeltaSnapshot Registry::delta_snapshot(const Snapshot& baseline) const {
     DeltaSnapshot result;
-    result.entities_ = entities_;
-    result.free_head_ = free_head_;
+    const std::vector<bool> excluded = make_snapshot_exclusion_mask();
+    result.entities_ = make_snapshot_entities(excluded);
+    result.free_head_ = rebuild_free_list(result.entities_);
     result.baseline_token_ = baseline.state_token_;
     result.state_token_ = next_state_token();
 
     for (const auto& storage : storages_) {
+        if (system_tag_ && storage.first == entity_index(system_tag_)) {
+            continue;
+        }
         if (!storage.second->has_dirty_entries()) {
             continue;
         }
@@ -1957,8 +2188,12 @@ inline Registry::DeltaSnapshot Registry::delta_snapshot(const Snapshot& baseline
         if (found_component == components_.end()) {
             continue;
         }
+        auto dirty = storage.second->clone_dirty_excluding(excluded);
+        if (!dirty->has_dirty_entries()) {
+            continue;
+        }
         result.components_.emplace(found_component->first, found_component->second);
-        result.storages_.emplace(storage.first, storage.second->clone_dirty());
+        result.storages_.emplace(storage.first, std::move(dirty));
     }
 
     return result;
@@ -1966,12 +2201,16 @@ inline Registry::DeltaSnapshot Registry::delta_snapshot(const Snapshot& baseline
 
 inline Registry::DeltaSnapshot Registry::delta_snapshot(const DeltaSnapshot& baseline) const {
     DeltaSnapshot result;
-    result.entities_ = entities_;
-    result.free_head_ = free_head_;
+    const std::vector<bool> excluded = make_snapshot_exclusion_mask();
+    result.entities_ = make_snapshot_entities(excluded);
+    result.free_head_ = rebuild_free_list(result.entities_);
     result.baseline_token_ = baseline.state_token_;
     result.state_token_ = next_state_token();
 
     for (const auto& storage : storages_) {
+        if (system_tag_ && storage.first == entity_index(system_tag_)) {
+            continue;
+        }
         if (!storage.second->has_dirty_entries()) {
             continue;
         }
@@ -1979,8 +2218,12 @@ inline Registry::DeltaSnapshot Registry::delta_snapshot(const DeltaSnapshot& bas
         if (found_component == components_.end()) {
             continue;
         }
+        auto dirty = storage.second->clone_dirty_excluding(excluded);
+        if (!dirty->has_dirty_entries()) {
+            continue;
+        }
         result.components_.emplace(found_component->first, found_component->second);
-        result.storages_.emplace(storage.first, storage.second->clone_dirty());
+        result.storages_.emplace(storage.first, std::move(dirty));
     }
 
     return result;
@@ -1999,16 +2242,22 @@ inline void Registry::restore(const Snapshot& snapshot) {
         groups.push_back(std::make_unique<GroupRecord>(*group));
     }
 
-    entities_ = snapshot.entities_;
-    free_head_ = snapshot.free_head_;
+    std::vector<std::uint64_t> entities = snapshot.entities_;
+    merge_current_system_entities(entities);
+    const std::uint32_t free_head = rebuild_free_list(entities);
+
+    entities_ = std::move(entities);
+    free_head_ = free_head;
     components_ = snapshot.components_;
     component_names_ = snapshot.component_names_;
     storages_ = std::move(storages);
     typed_components_ = snapshot.typed_components_;
     groups_ = std::move(groups);
     singleton_entity_ = snapshot.singleton_entity_;
+    system_tag_ = snapshot.system_tag_;
     state_token_ = snapshot.state_token_;
     std::copy(std::begin(snapshot.primitive_types_), std::end(snapshot.primitive_types_), std::begin(primitive_types_));
+    restore_internal_bookkeeping_tags();
 }
 
 inline void Registry::restore(const DeltaSnapshot& snapshot) {
@@ -2034,8 +2283,10 @@ inline void Registry::restore(const DeltaSnapshot& snapshot) {
         }
     }
 
-    entities_ = snapshot.entities_;
-    free_head_ = snapshot.free_head_;
+    std::vector<std::uint64_t> entities = snapshot.entities_;
+    merge_current_system_entities(entities);
+    entities_ = std::move(entities);
+    free_head_ = rebuild_free_list(entities_);
 
     std::vector<std::uint32_t> destroyed_indices;
     for (const auto& storage : snapshot.storages_) {
@@ -2088,6 +2339,7 @@ inline void Registry::restore(const DeltaSnapshot& snapshot) {
     }
 
     state_token_ = snapshot.state_token_;
+    restore_internal_bookkeeping_tags();
 }
 
 template <typename... Components>
@@ -3133,12 +3385,15 @@ public:
         : registry_(&registry), order_(order), view_(registry) {}
 
     template <typename Fn>
-    void each(Fn&& fn) {
+    Entity each(Fn&& fn) {
         using Callback = typename std::decay<Fn>::type;
         Callback callback(std::forward<Fn>(fn));
-        registry_->add_job(order_, [callback = std::move(callback)](Registry& registry) mutable {
-            registry.template view<Components...>().each(callback);
-        });
+        return registry_->add_job(
+            order_,
+            registry_->template make_job_access_metadata<Components...>(),
+            [callback = std::move(callback)](Registry& registry) mutable {
+                registry.template view<Components...>().each(callback);
+            });
     }
 
     template <typename... AccessComponents>
@@ -3198,12 +3453,15 @@ public:
         : registry_(&registry), order_(order), view_(std::move(view)) {}
 
     template <typename Fn>
-    void each(Fn&& fn) {
+    Entity each(Fn&& fn) {
         using Callback = typename std::decay<Fn>::type;
         Callback callback(std::forward<Fn>(fn));
-        registry_->add_job(order_, [callback = std::move(callback)](Registry& registry) mutable {
-            registry.template view<IterComponents...>().template access<AccessComponents...>().each(callback);
-        });
+        return registry_->add_job(
+            order_,
+            registry_->template make_job_access_metadata<IterComponents..., AccessComponents...>(),
+            [callback = std::move(callback)](Registry& registry) mutable {
+                registry.template view<IterComponents...>().template access<AccessComponents...>().each(callback);
+            });
     }
 
     template <
@@ -3260,6 +3518,71 @@ template <typename... Components>
 Registry::JobView<Components...> Registry::job(int order) {
     return JobView<Components...>(*this, order);
 }
+
+class Orchestrator {
+public:
+    explicit Orchestrator(const Registry& registry)
+        : registry_(&registry) {}
+
+    JobSchedule schedule() const {
+        JobSchedule result;
+
+        std::vector<std::size_t> ordered(registry_->jobs_.size());
+        std::iota(ordered.begin(), ordered.end(), std::size_t{0});
+        std::sort(ordered.begin(), ordered.end(), [&](std::size_t lhs, std::size_t rhs) {
+            const Registry::JobRecord& left = registry_->jobs_[lhs];
+            const Registry::JobRecord& right = registry_->jobs_[rhs];
+            if (left.order != right.order) {
+                return left.order < right.order;
+            }
+            return left.sequence < right.sequence;
+        });
+
+        std::vector<std::size_t> job_stages(registry_->jobs_.size(), 0);
+        for (std::size_t ordered_position = 0; ordered_position < ordered.size(); ++ordered_position) {
+            const std::size_t job_index = ordered[ordered_position];
+            const Registry::JobRecord& job = registry_->jobs_[job_index];
+
+            std::size_t stage_index = 0;
+            for (std::size_t previous_position = 0; previous_position < ordered_position; ++previous_position) {
+                const std::size_t previous_index = ordered[previous_position];
+                const Registry::JobRecord& previous = registry_->jobs_[previous_index];
+                if (conflicts(previous, job)) {
+                    stage_index = std::max(stage_index, job_stages[previous_index] + 1);
+                }
+            }
+
+            if (result.stages.size() <= stage_index) {
+                result.stages.resize(stage_index + 1);
+            }
+            result.stages[stage_index].jobs.push_back(job.entity);
+            job_stages[job_index] = stage_index;
+        }
+
+        return result;
+    }
+
+private:
+    static bool contains_component(const std::vector<std::uint32_t>& components, std::uint32_t component) {
+        return std::find(components.begin(), components.end(), component) != components.end();
+    }
+
+    static bool any_overlap(const std::vector<std::uint32_t>& left, const std::vector<std::uint32_t>& right) {
+        for (std::uint32_t component : left) {
+            if (contains_component(right, component)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool conflicts(const Registry::JobRecord& left, const Registry::JobRecord& right) {
+        return any_overlap(left.writes, right.reads) || any_overlap(left.reads, right.writes) ||
+            any_overlap(left.writes, right.writes);
+    }
+
+    const Registry* registry_;
+};
 
 template <typename... Owned>
 void Registry::declare_owned_group() {

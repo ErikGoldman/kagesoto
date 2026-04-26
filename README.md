@@ -148,10 +148,10 @@ view.each([&](auto& active_view, ecs::Entity entity, Position& position) {
 
 ## Jobs
 
-Jobs are persistent view callbacks with an integer order. Register jobs with `Registry::job<Components...>(order)`, then call `.each()` on the returned job view. Jobs run only when `run_jobs()` is called. Lower order values run first, and jobs with the same order run in the order they were added.
+Jobs are persistent view callbacks with an integer order. Register jobs with `Registry::job<Components...>(order)`, then call `.each()` on the returned job view. `each()` returns an entity that identifies the registered job. Job entities are identity-only for now: they are useful in schedule output, but destroying them is not a supported job-removal API. Jobs run only when `run_jobs()` is called. Lower order values run first, and jobs with the same order run in the order they were added.
 
 ```cpp
-registry.job<const Position, Velocity>(10).each(
+ecs::Entity move_job = registry.job<const Position, Velocity>(10).each(
     [](ecs::Entity entity, const Position& position, Velocity& velocity) {
         velocity.dx += position.x;
         velocity.dy += position.y;
@@ -170,6 +170,17 @@ registry.job<const Position>(20)
             velocity->dx += position.x;
         }
     });
+```
+
+`Orchestrator` can inspect registered jobs and return the order in which they can be processed. The current orchestrator only reports the schedule; it is not wired into `run_jobs()`. Each stage contains jobs that can run in parallel, and stages must be processed in order.
+
+```cpp
+ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
+for (const ecs::JobScheduleStage& stage : schedule.stages) {
+    for (ecs::Entity job : stage.jobs) {
+        // job identifies a registered job in this parallel stage.
+    }
+}
 ```
 
 ## Owned Groups and Sorting
@@ -262,6 +273,7 @@ std::string text = registry.debug_print(entity, position_type);
 - `bool Registry::is_dirty(Entity entity, Entity component) const`
 - `void Registry::clear_all_dirty<T>()`
 - `void Registry::clear_all_dirty(Entity component)`
+- `Entity Registry::system_tag() const`
 - `Registry::Snapshot Registry::snapshot() const`
 - `Registry::DeltaSnapshot Registry::delta_snapshot(const Registry::Snapshot& baseline) const`
 - `Registry::DeltaSnapshot Registry::delta_snapshot(const Registry::DeltaSnapshot& baseline) const`
@@ -270,6 +282,10 @@ std::string text = registry.debug_print(entity, position_type);
 - `Registry::View<Components...> Registry::view<Components...>()`
 - `Registry::JobView<Components...> Registry::job<Components...>(int order)`
 - `void Registry::run_jobs()`
+- `ecs::Orchestrator::Orchestrator(const Registry& registry)`
+- `ecs::JobSchedule ecs::Orchestrator::schedule() const`
+- `std::vector<ecs::JobScheduleStage> ecs::JobSchedule::stages`
+- `std::vector<ecs::Entity> ecs::JobScheduleStage::jobs`
 - `void Registry::declare_owned_group<Owned...>()`
 - `void View<Components...>::each(Fn&& callback)`
 - `auto View<Components...>::access<AccessComponents...>() const`
@@ -308,7 +324,7 @@ Component pointers remain valid until that component storage is removed or mutat
 
 `add<T>()`, runtime `add()`, `ensure()`, and `write()` mark the component dirty because they return writable storage. Tag add/remove marks tag membership dirty. `get()` and `has()` are read-only and do not modify dirty state.
 
-Snapshots capture entity/component world state for later restoration. Delta snapshots validate against a baseline snapshot token, copy current entity slot state, and save only dirty component values plus dirty component-removal tombstones. Trivially copyable component storage is byte-copied, copy-constructible typed components are cloned through their lifecycle hook, and move-only non-trivial component storage rejects snapshot creation when captured. Registered jobs are not part of snapshots.
+Snapshots capture entity/component world state for later restoration. Delta snapshots validate against a baseline snapshot token, copy current entity slot state, and save only dirty component values plus dirty component-removal tombstones. Trivially copyable component storage is byte-copied, copy-constructible typed components are cloned through their lifecycle hook, and move-only non-trivial component storage rejects snapshot creation when captured. Registered job callbacks are not part of snapshots. Internal bookkeeping entities are tagged with `Registry::system_tag()` and excluded from snapshot payloads.
 
 View callbacks mark non-const listed components dirty before passing mutable references. Structurally mutating viewed component storage during `each()` is unsupported.
 

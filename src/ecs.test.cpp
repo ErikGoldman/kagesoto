@@ -203,8 +203,8 @@ TEST_CASE("entities are created, destroyed, and recycled with versions") {
 
     REQUIRE(registry.alive(first));
     REQUIRE(registry.alive(second));
-    REQUIRE(ecs::Registry::entity_index(first) == 7);
-    REQUIRE(ecs::Registry::entity_index(second) == 8);
+    REQUIRE(ecs::Registry::entity_index(first) == 8);
+    REQUIRE(ecs::Registry::entity_index(second) == 9);
     REQUIRE(ecs::Registry::entity_version(first) == 1);
 
     REQUIRE(registry.destroy(first));
@@ -1173,6 +1173,89 @@ TEST_CASE("jobs run views in order and preserve insertion order for ties") {
     REQUIRE(calls == std::vector<int>{-1, 10, 11});
 }
 
+TEST_CASE("job registration returns alive entities and the orchestrator schedules them") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ecs::Entity job = registry.job<const Position>(0).each([](ecs::Entity, const Position&) {});
+
+    REQUIRE(registry.alive(job));
+    REQUIRE(registry.has(job, registry.system_tag()));
+
+    const ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
+    REQUIRE(schedule.stages.size() == 1);
+    REQUIRE(schedule.stages[0].jobs == std::vector<ecs::Entity>{job});
+}
+
+TEST_CASE("orchestrator returns no stages when no jobs are registered") {
+    ecs::Registry registry;
+
+    const ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
+
+    REQUIRE(schedule.stages.empty());
+}
+
+TEST_CASE("orchestrator batches read-only jobs for parallel execution") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ecs::Entity first = registry.job<const Position>(10).each([](ecs::Entity, const Position&) {});
+    const ecs::Entity second = registry.job<const Position>(-1).each([](ecs::Entity, const Position&) {});
+
+    const ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
+
+    REQUIRE(schedule.stages.size() == 1);
+    REQUIRE(schedule.stages[0].jobs == std::vector<ecs::Entity>{second, first});
+}
+
+TEST_CASE("orchestrator orders conflicting read and write jobs by canonical job order") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ecs::Entity writer = registry.job<Position>(10).each([](ecs::Entity, Position&) {});
+    const ecs::Entity reader = registry.job<const Position>(20).each([](ecs::Entity, const Position&) {});
+    const ecs::Entity later_writer = registry.job<Position>(20).each([](ecs::Entity, Position&) {});
+
+    const ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
+
+    REQUIRE(schedule.stages.size() == 3);
+    REQUIRE(schedule.stages[0].jobs == std::vector<ecs::Entity>{writer});
+    REQUIRE(schedule.stages[1].jobs == std::vector<ecs::Entity>{reader});
+    REQUIRE(schedule.stages[2].jobs == std::vector<ecs::Entity>{later_writer});
+}
+
+TEST_CASE("orchestrator batches independent writes") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    const ecs::Entity position_writer = registry.job<Position>(0).each([](ecs::Entity, Position&) {});
+    const ecs::Entity velocity_writer = registry.job<Velocity>(1).each([](ecs::Entity, Velocity&) {});
+
+    const ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
+
+    REQUIRE(schedule.stages.size() == 1);
+    REQUIRE(schedule.stages[0].jobs == std::vector<ecs::Entity>{position_writer, velocity_writer});
+}
+
+TEST_CASE("orchestrator includes access view components in job conflicts") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    const ecs::Entity velocity_writer = registry.job<const Position>(0).access<Velocity>().each(
+        [](auto&, ecs::Entity, const Position&) {});
+    const ecs::Entity velocity_reader = registry.job<const Velocity>(1).each([](ecs::Entity, const Velocity&) {});
+    const ecs::Entity position_reader = registry.job<const Position>(2).access<const Velocity>().each(
+        [](auto&, ecs::Entity, const Position&) {});
+
+    const ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
+
+    REQUIRE(schedule.stages.size() == 2);
+    REQUIRE(schedule.stages[0].jobs == std::vector<ecs::Entity>{velocity_writer});
+    REQUIRE(schedule.stages[1].jobs == std::vector<ecs::Entity>{velocity_reader, position_reader});
+}
+
 TEST_CASE("jobs are persistent and use access views") {
     ecs::Registry registry;
     registry.register_component<Position>("Position");
@@ -1915,6 +1998,40 @@ TEST_CASE("restoring a registry snapshot leaves registered jobs unchanged") {
     REQUIRE(registry.get<Position>(entity)->x == 2);
 }
 
+TEST_CASE("registry snapshots exclude system-tagged job bookkeeping entities") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+
+    int calls = 0;
+    const ecs::Entity job = registry.job<Position>(0).each([&](ecs::Entity, Position&) {
+        ++calls;
+    });
+    REQUIRE(registry.add<Position>(job, Position{99, 0}) != nullptr);
+
+    auto snapshot = registry.snapshot();
+
+    REQUIRE(registry.write<Position>(entity) != nullptr);
+    registry.write<Position>(entity)->x = 7;
+    registry.write<Position>(job)->x = 100;
+
+    registry.restore(snapshot);
+
+    REQUIRE(registry.alive(job));
+    REQUIRE(registry.has(job, registry.system_tag()));
+    REQUIRE(registry.get<Position>(entity)->x == 1);
+    REQUIRE(registry.get<Position>(job) == nullptr);
+
+    const ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
+    REQUIRE(schedule.stages.size() == 1);
+    REQUIRE(schedule.stages[0].jobs == std::vector<ecs::Entity>{job});
+
+    registry.run_jobs();
+    REQUIRE(calls == 1);
+}
+
 TEST_CASE("delta snapshots restore dirty values additions removals and destroyed entities") {
     ecs::Registry source;
     source.register_component<Position>("Position");
@@ -2032,6 +2149,33 @@ TEST_CASE("delta snapshots restore singleton dirty values") {
 
     REQUIRE(replay.get<GameTime>()->tick == 55);
     REQUIRE(replay.is_dirty<GameTime>());
+}
+
+TEST_CASE("delta snapshots exclude system-tagged job bookkeeping entities") {
+    ecs::Registry source;
+    source.register_component<Position>("Position");
+
+    const ecs::Entity entity = source.create();
+    REQUIRE(source.add<Position>(entity, Position{1, 0}) != nullptr);
+
+    const ecs::Entity job = source.job<Position>(0).each([](ecs::Entity, Position&) {});
+    REQUIRE(source.add<Position>(job, Position{99, 0}) != nullptr);
+    source.clear_all_dirty<Position>();
+
+    auto baseline = source.snapshot();
+    ecs::Registry replay;
+    replay.register_component<Position>("Position");
+    replay.restore(baseline);
+
+    source.write<Position>(entity)->x = 5;
+    source.write<Position>(job)->x = 100;
+
+    auto delta = source.delta_snapshot(baseline);
+    replay.restore(delta);
+
+    REQUIRE(replay.get<Position>(entity)->x == 5);
+    REQUIRE_FALSE(replay.alive(job));
+    REQUIRE(replay.get<Position>(job) == nullptr);
 }
 
 TEST_CASE("delta restore validates baseline token component metadata and removal state") {

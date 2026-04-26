@@ -53,3 +53,8 @@ build-bench/benchmarks/basic_operations_benchmark \
 - If a number looks extreme, rerun that exact case in isolation before treating it as real.
 - If a suite is long, use isolated exact-case reruns to validate the interesting regressions or wins.
 - Do not mix `Debug` smoke-test timings with `RelWithDebInfo` benchmark numbers.
+
+## Job Orchestrator Notes
+
+- The orchestrator is schedule-output only for now; do not wire it into `run_jobs()` unless explicitly requested.
+- Registered jobs are represented by entities for schedule identity. These job entities are identity-only in the current design and are not a job-removal/lifecycle API.
