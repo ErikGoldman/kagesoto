@@ -1745,6 +1745,9 @@ private:
         const Entity entity = create();
         add_system_tag(entity);
         job_schedule_cache_valid_ = false;
+        ordered_job_indices_cache_valid_ = false;
+        const std::size_t job_index = jobs_.size();
+        job_index_by_entity_[entity.value] = job_index;
         jobs_.push_back(JobRecord{
             entity,
             order,
@@ -2402,28 +2405,34 @@ private:
         }
     }
 
-    std::vector<std::size_t> ordered_job_indices(std::size_t job_count) const {
-        std::vector<std::size_t> ordered(job_count);
-        std::iota(ordered.begin(), ordered.end(), std::size_t{0});
-        std::sort(ordered.begin(), ordered.end(), [&](std::size_t lhs, std::size_t rhs) {
-            const JobRecord& left = jobs_[lhs];
-            const JobRecord& right = jobs_[rhs];
-            if (left.order != right.order) {
-                return left.order < right.order;
-            }
-            return left.sequence < right.sequence;
-        });
-        return ordered;
+    const std::vector<std::size_t>& ordered_job_indices() const {
+        if (ordered_job_indices_cache_valid_) {
+            return ordered_job_indices_cache_;
+        }
+
+        ordered_job_indices_cache_.resize(jobs_.size());
+        std::iota(ordered_job_indices_cache_.begin(), ordered_job_indices_cache_.end(), std::size_t{0});
+        std::sort(
+            ordered_job_indices_cache_.begin(),
+            ordered_job_indices_cache_.end(),
+            [&](std::size_t lhs, std::size_t rhs) {
+                const JobRecord& left = jobs_[lhs];
+                const JobRecord& right = jobs_[rhs];
+                if (left.order != right.order) {
+                    return left.order < right.order;
+                }
+                return left.sequence < right.sequence;
+            });
+        ordered_job_indices_cache_valid_ = true;
+        return ordered_job_indices_cache_;
     }
 
     std::size_t job_index(Entity job) const {
-        const auto found = std::find_if(jobs_.begin(), jobs_.end(), [&](const JobRecord& record) {
-            return record.entity == job;
-        });
-        if (found == jobs_.end()) {
+        const auto found = job_index_by_entity_.find(job.value);
+        if (found == job_index_by_entity_.end()) {
             throw std::logic_error("ecs job is not registered");
         }
-        return static_cast<std::size_t>(std::distance(jobs_.begin(), found));
+        return found->second;
     }
 
     std::vector<std::uint64_t> entities_;
@@ -2436,9 +2445,12 @@ private:
     std::vector<std::unique_ptr<GroupRecord>> groups_;
     std::unordered_map<std::uint32_t, GroupRecord*> owned_component_groups_;
     std::vector<JobRecord> jobs_;
+    std::unordered_map<std::uint64_t, std::size_t> job_index_by_entity_;
     JobThreadExecutor job_thread_executor_;
     mutable JobSchedule cached_job_schedule_;
     mutable bool job_schedule_cache_valid_ = false;
+    mutable std::vector<std::size_t> ordered_job_indices_cache_;
+    mutable bool ordered_job_indices_cache_valid_ = false;
     std::uint64_t next_job_sequence_ = 0;
     std::uint64_t state_token_ = next_state_token();
     Entity singleton_entity_;
@@ -4312,7 +4324,7 @@ public:
         bool has_previous_job = false;
         bool has_structural_barrier = false;
 
-        for (std::size_t job_index : registry_->ordered_job_indices(registry_->jobs_.size())) {
+        for (std::size_t job_index : registry_->ordered_job_indices()) {
             const Registry::JobRecord& job = registry_->jobs_[job_index];
 
             std::size_t stage_index = has_structural_barrier ? structural_barrier_stage + 1 : 0;
@@ -4403,7 +4415,7 @@ private:
 inline void Registry::run_jobs(RunJobsOptions options) {
     const std::size_t job_count = jobs_.size();
     if (options.force_single_threaded) {
-        for (std::size_t index : ordered_job_indices(job_count)) {
+        for (std::size_t index : ordered_job_indices()) {
             jobs_[index].run(*this);
         }
         return;
