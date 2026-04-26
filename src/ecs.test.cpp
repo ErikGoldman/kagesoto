@@ -120,6 +120,26 @@ struct HasViewWrite<
     : std::true_type {};
 
 template <typename View, typename T, typename = void>
+struct HasViewTryGet : std::false_type {};
+
+template <typename View, typename T>
+struct HasViewTryGet<
+    View,
+    T,
+    std::void_t<decltype(std::declval<View&>().template try_get<T>(std::declval<ecs::Entity>()))>>
+    : std::true_type {};
+
+template <typename View, typename T, typename = void>
+struct HasViewContains : std::false_type {};
+
+template <typename View, typename T>
+struct HasViewContains<
+    View,
+    T,
+    std::void_t<decltype(std::declval<View&>().template contains<T>(std::declval<ecs::Entity>()))>>
+    : std::true_type {};
+
+template <typename View, typename T, typename = void>
 struct HasViewTagAdd : std::false_type {};
 
 template <typename View, typename T>
@@ -151,6 +171,26 @@ struct HasSingletonWrite : std::false_type {};
 
 template <typename Registry, typename T>
 struct HasSingletonWrite<Registry, T, std::void_t<decltype(std::declval<Registry&>().template write<T>())>>
+    : std::true_type {};
+
+template <typename Registry, typename T, typename = void>
+struct HasRegistryTryGet : std::false_type {};
+
+template <typename Registry, typename T>
+struct HasRegistryTryGet<
+    Registry,
+    T,
+    std::void_t<decltype(std::declval<Registry&>().template try_get<T>(std::declval<ecs::Entity>()))>>
+    : std::true_type {};
+
+template <typename Registry, typename T, typename = void>
+struct HasRegistryContains : std::false_type {};
+
+template <typename Registry, typename T>
+struct HasRegistryContains<
+    Registry,
+    T,
+    std::void_t<decltype(std::declval<Registry&>().template contains<T>(std::declval<ecs::Entity>()))>>
     : std::true_type {};
 
 template <typename Registry, typename T, typename = void>
@@ -347,29 +387,37 @@ TEST_CASE("trivial components can be added, read, written, replaced, and removed
     registry.register_component<Position>("Position");
     const ecs::Entity entity = registry.create();
 
+    static_assert(HasRegistryContains<ecs::Registry, Position>::value, "regular components support contains");
+    static_assert(HasRegistryTryGet<ecs::Registry, Position>::value, "regular components support optional reads");
+    static_assert(!HasRegistryContains<ecs::Registry, GameTime>::value, "singletons do not need contains");
+    static_assert(!HasRegistryTryGet<ecs::Registry, GameTime>::value, "singletons do not have optional reads");
+
+    REQUIRE_FALSE(registry.contains<Position>(entity));
+    REQUIRE(registry.try_get<Position>(entity) == nullptr);
+
     Position* added = registry.add<Position>(entity, Position{1, 2});
     REQUIRE(added != nullptr);
     REQUIRE(added->x == 1);
     REQUIRE(added->y == 2);
+    REQUIRE(registry.contains<Position>(entity));
+    REQUIRE(registry.try_get<Position>(entity)->x == 1);
     REQUIRE(registry.clear_dirty<Position>(entity));
 
-    Position* writable = registry.write<Position>(entity);
-    REQUIRE(writable != nullptr);
-    writable->x = 10;
+    Position& writable = registry.write<Position>(entity);
+    writable.x = 10;
 
-    const Position* read = registry.get<Position>(entity);
-    REQUIRE(read != nullptr);
-    REQUIRE(read->x == 10);
-    REQUIRE(read->y == 2);
+    const Position& read = registry.get<Position>(entity);
+    REQUIRE(read.x == 10);
+    REQUIRE(read.y == 2);
     REQUIRE(registry.clear_dirty<Position>(entity));
 
     Position* replaced = registry.add<Position>(entity, Position{7, 8});
-    REQUIRE(replaced == writable);
+    REQUIRE(replaced == &writable);
     REQUIRE(replaced->x == 7);
     REQUIRE(replaced->y == 8);
 
     REQUIRE(registry.remove<Position>(entity));
-    REQUIRE(registry.get<Position>(entity) == nullptr);
+    REQUIRE_FALSE(registry.contains<Position>(entity));
     REQUIRE(registry.is_dirty<Position>(entity));
     REQUIRE(registry.clear_dirty<Position>(entity));
     REQUIRE_FALSE(registry.clear_dirty<Position>(entity));
@@ -442,10 +490,10 @@ TEST_CASE("runtime ensure uses singleton storage for singleton component entitie
     REQUIRE(registry.clear_dirty<GameTime>());
 
     GameTime* ensured = static_cast<GameTime*>(registry.ensure(entity, game_time_component));
-    REQUIRE(ensured == registry.write<GameTime>());
+    REQUIRE(ensured == &registry.write<GameTime>());
     ensured->tick = 17;
 
-    REQUIRE(registry.get<GameTime>()->tick == 17);
+    REQUIRE(registry.get<GameTime>().tick == 17);
     REQUIRE(registry.is_dirty<GameTime>());
 }
 
@@ -471,10 +519,10 @@ TEST_CASE("dirty bits move with components in dense storage") {
 
     registry.clear_all_dirty<Position>();
 
-    REQUIRE(registry.write<Position>(second) != nullptr);
+    registry.write<Position>(second);
 
     REQUIRE(registry.remove<Position>(first));
-    REQUIRE(registry.get<Position>(second)->x == 2);
+    REQUIRE(registry.get<Position>(second).x == 2);
     REQUIRE(registry.is_dirty<Position>(second));
     REQUIRE(registry.is_dirty<Position>(first));
     REQUIRE(registry.clear_dirty<Position>(first));
@@ -492,10 +540,10 @@ TEST_CASE("dirty bits are preserved for clean moved components during dense remo
     REQUIRE(registry.add<Position>(second, Position{2, 2}) != nullptr);
 
     registry.clear_all_dirty<Position>();
-    REQUIRE(registry.write<Position>(first) != nullptr);
+    registry.write<Position>(first);
 
     REQUIRE(registry.remove<Position>(first));
-    REQUIRE(registry.get<Position>(second)->x == 2);
+    REQUIRE(registry.get<Position>(second).x == 2);
     REQUIRE_FALSE(registry.is_dirty<Position>(second));
 }
 
@@ -512,27 +560,24 @@ TEST_CASE("singleton components are created at registration and expose no-entity
     ecs::Registry registry;
     const ecs::Entity game_time_component = registry.register_component<GameTime>("GameTime");
 
-    const GameTime* initial = registry.get<GameTime>();
-    REQUIRE(initial != nullptr);
-    REQUIRE(initial->tick == 0);
+    const GameTime& initial = registry.get<GameTime>();
+    REQUIRE(initial.tick == 0);
     REQUIRE(registry.is_dirty<GameTime>());
 
     REQUIRE(registry.clear_dirty<GameTime>());
     REQUIRE_FALSE(registry.is_dirty<GameTime>());
 
-    GameTime* writable = registry.write<GameTime>();
-    REQUIRE(writable != nullptr);
-    writable->tick = 42;
+    GameTime& writable = registry.write<GameTime>();
+    writable.tick = 42;
 
-    REQUIRE(registry.get<GameTime>()->tick == 42);
+    REQUIRE(registry.get<GameTime>().tick == 42);
     REQUIRE(registry.is_dirty<GameTime>());
 
     const ecs::Entity entity = registry.create();
     const GameTime replacement{99};
     REQUIRE(registry.add(entity, game_time_component, &replacement) != nullptr);
-    REQUIRE(registry.get<GameTime>()->tick == 99);
+    REQUIRE(registry.get<GameTime>().tick == 99);
     REQUIRE_FALSE(registry.remove(entity, game_time_component));
-    REQUIRE(registry.get<GameTime>() != nullptr);
 }
 
 TEST_CASE("views iterate entities that contain every requested component") {
@@ -562,8 +607,8 @@ TEST_CASE("views iterate entities that contain every requested component") {
     REQUIRE(visited.size() == 2);
     REQUIRE(visited[0] == both_a);
     REQUIRE(visited[1] == both_b);
-    REQUIRE(registry.get<Velocity>(both_a)->dy == 5.0f);
-    REQUIRE(registry.get<Velocity>(both_b)->dy == 9.0f);
+    REQUIRE(registry.get<Velocity>(both_a).dy == 5.0f);
+    REQUIRE(registry.get<Velocity>(both_b).dy == 9.0f);
 }
 
 TEST_CASE("views filter on included and excluded typed tags") {
@@ -679,14 +724,13 @@ TEST_CASE("access views preserve access components while filtering tags") {
         .access<Velocity>()
         .with_tags<const Active>()
         .each([&](auto& view, ecs::Entity current, const Position& position) {
-            Velocity* velocity = view.template write<Velocity>(current);
-            REQUIRE(velocity != nullptr);
-            velocity->dx += static_cast<float>(position.x);
+            Velocity& velocity = view.template write<Velocity>(current);
+            velocity.dx += static_cast<float>(position.x);
             ++calls;
         });
 
     REQUIRE(calls == 1);
-    REQUIRE(registry.get<Velocity>(entity)->dx == 3.0f);
+    REQUIRE(registry.get<Velocity>(entity).dx == 3.0f);
 }
 
 TEST_CASE("views expose gated get and write access for listed components") {
@@ -699,6 +743,8 @@ TEST_CASE("views expose gated get and write access for listed components") {
     static_assert(HasViewGet<View, Position>::value, "listed readonly component can be read");
     static_assert(HasViewGet<View, const Position>::value, "listed readonly component can be read as const");
     static_assert(HasViewGet<View, Velocity>::value, "listed mutable component can be read");
+    static_assert(HasViewContains<View, Position>::value, "listed regular component can be checked");
+    static_assert(HasViewTryGet<View, Position>::value, "listed regular component can be read optionally");
     static_assert(!HasViewGet<View, Tracker>::value, "absent component cannot be read through the view");
     static_assert(!HasViewWrite<View, Position>::value, "readonly component cannot be written through the view");
     static_assert(!HasViewWrite<View, const Velocity>::value, "const write query is not writable");
@@ -717,6 +763,8 @@ TEST_CASE("views expose gated get and write access for listed components") {
     static_assert(!HasViewSingletonGet<SingletonView, Position>::value, "regular listed component still requires entity");
     static_assert(HasViewSingletonGet<SingletonAccessView, GameTime>::value, "access singleton can be read without entity");
     static_assert(HasViewSingletonWrite<SingletonAccessView, GameTime>::value, "access singleton can be written without entity");
+    static_assert(!HasViewContains<SingletonView, GameTime>::value, "singletons do not need view contains");
+    static_assert(!HasViewTryGet<SingletonView, GameTime>::value, "singletons do not have view optional reads");
     static_assert(
         ecs::detail::access_components_allowed<ecs::detail::type_list<const Position>>::template with<Position>::value,
         "readonly iteration can overlap mutable access");
@@ -737,12 +785,13 @@ TEST_CASE("views expose gated get and write access for listed components") {
     REQUIRE(registry.add<Velocity>(entity, Velocity{1.0f, 2.0f}) != nullptr);
 
     auto view = registry.view<const Position, Velocity>();
-    REQUIRE(view.get<Position>(entity)->x == 8);
+    REQUIRE(view.contains<Position>(entity));
+    REQUIRE(view.try_get<Position>(entity)->x == 8);
+    REQUIRE(view.get<Position>(entity).x == 8);
 
-    Velocity* writable = view.write<Velocity>(entity);
-    REQUIRE(writable != nullptr);
-    writable->dx = 6.0f;
-    REQUIRE(registry.get<Velocity>(entity)->dx == 6.0f);
+    Velocity& writable = view.write<Velocity>(entity);
+    writable.dx = 6.0f;
+    REQUIRE(registry.get<Velocity>(entity).dx == 6.0f);
 }
 
 TEST_CASE("singleton components in views are callback arguments without filtering entities") {
@@ -766,7 +815,7 @@ TEST_CASE("singleton components in views are callback arguments without filterin
     REQUIRE(visited.size() == 2);
     REQUIRE(visited[0] == first);
     REQUIRE(visited[1] == second);
-    REQUIRE(registry.get<GameTime>()->tick == 5);
+    REQUIRE(registry.get<GameTime>().tick == 5);
     REQUIRE(registry.is_dirty<GameTime>());
 }
 
@@ -782,7 +831,7 @@ TEST_CASE("singleton-only views call once with an invalid entity") {
     });
 
     REQUIRE(calls == 1);
-    REQUIRE(registry.get<GameTime>()->tick == 7);
+    REQUIRE(registry.get<GameTime>().tick == 7);
 }
 
 TEST_CASE("mutable view iteration marks listed components dirty automatically") {
@@ -840,20 +889,18 @@ TEST_CASE("views can access extra components without changing iteration") {
     int calls = 0;
     auto view = registry.view<Position>().access<const Velocity, Health, GameTime>();
     view.each([&](auto& active_view, ecs::Entity entity, Position& position) {
-        REQUIRE(active_view.template get<Velocity>(target)->dx == 4.0f);
-        REQUIRE(active_view.template get<Health>(entity) == nullptr);
-        REQUIRE(active_view.template get<GameTime>() != nullptr);
+        REQUIRE(active_view.template get<Velocity>(target).dx == 4.0f);
+        REQUIRE_FALSE(active_view.template contains<Health>(entity));
 
-        Health* health = active_view.template write<Health>(target);
-        REQUIRE(health != nullptr);
-        health->value += position.x;
-        active_view.template write<GameTime>()->tick += position.x;
+        Health& health = active_view.template write<Health>(target);
+        health.value += position.x;
+        active_view.template write<GameTime>().tick += position.x;
         ++calls;
     });
 
     REQUIRE(calls == 2);
-    REQUIRE(registry.get<Health>(target)->value == 15);
-    REQUIRE(registry.get<GameTime>()->tick == 5);
+    REQUIRE(registry.get<Health>(target).value == 15);
+    REQUIRE(registry.get<GameTime>().tick == 5);
 }
 
 TEST_CASE("const iterated components can be explicitly written through access") {
@@ -874,7 +921,7 @@ TEST_CASE("const iterated components can be explicitly written through access") 
 
         REQUIRE(current == entity);
         REQUIRE(position.x == 2);
-        REQUIRE(active_view.template get<Position>(current)->y == 3);
+        REQUIRE(active_view.template get<Position>(current).y == 3);
         REQUIRE_FALSE(registry.is_dirty<Position>(current));
         ++read_calls;
     });
@@ -884,14 +931,13 @@ TEST_CASE("const iterated components can be explicitly written through access") 
 
     int write_calls = 0;
     view.each([&](auto& active_view, ecs::Entity current, const Position& position) {
-        Position* writable = active_view.template write<Position>(current);
-        REQUIRE(writable != nullptr);
-        writable->x = position.x + 5;
+        Position& writable = active_view.template write<Position>(current);
+        writable.x = position.x + 5;
         ++write_calls;
     });
 
     REQUIRE(write_calls == 1);
-    REQUIRE(registry.get<Position>(entity)->x == 7);
+    REQUIRE(registry.get<Position>(entity).x == 7);
     REQUIRE(registry.is_dirty<Position>(entity));
 }
 
@@ -905,7 +951,7 @@ TEST_CASE("missing access-only storage does not suppress view iteration") {
 
     int calls = 0;
     registry.view<Position>().access<Health>().each([&](auto& active_view, ecs::Entity current, Position&) {
-        REQUIRE(active_view.template write<Health>(current) == nullptr);
+        REQUIRE_FALSE(active_view.template contains<Health>(current));
         ++calls;
     });
 
@@ -958,10 +1004,10 @@ TEST_CASE("view iteration tolerates removing non-driver components from current 
     REQUIRE(visited.size() == 2);
     REQUIRE(visited[0] == first);
     REQUIRE(visited[1] == second);
-    REQUIRE(registry.get<Position>(first) != nullptr);
-    REQUIRE(registry.get<Position>(second) != nullptr);
-    REQUIRE(registry.get<Velocity>(first) == nullptr);
-    REQUIRE(registry.get<Velocity>(second) == nullptr);
+    REQUIRE(registry.contains<Position>(first));
+    REQUIRE(registry.contains<Position>(second));
+    REQUIRE_FALSE(registry.contains<Velocity>(first));
+    REQUIRE_FALSE(registry.contains<Velocity>(second));
 }
 
 TEST_CASE("view iteration tolerates later entities gaining non-driver components") {
@@ -978,8 +1024,8 @@ TEST_CASE("view iteration tolerates later entities gaining non-driver components
     std::vector<ecs::Entity> visited;
     registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
         REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
         visited.push_back(entity);
         if (entity == first) {
             REQUIRE(registry.add<Velocity>(later, Velocity{2.0f, 0.0f}) != nullptr);
@@ -994,7 +1040,7 @@ TEST_CASE("view iteration tolerates later entities gaining non-driver components
     REQUIRE(after.size() == 2);
     REQUIRE(std::find(after.begin(), after.end(), first) != after.end());
     REQUIRE(std::find(after.begin(), after.end(), later) != after.end());
-    REQUIRE(registry.get<Velocity>(later)->dx == 2.0f);
+    REQUIRE(registry.get<Velocity>(later).dx == 2.0f);
 }
 
 TEST_CASE("view iteration tolerates later entities losing non-driver components") {
@@ -1015,8 +1061,8 @@ TEST_CASE("view iteration tolerates later entities losing non-driver components"
     std::vector<ecs::Entity> visited;
     registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
         REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
         visited.push_back(entity);
         if (entity == first) {
             REQUIRE(registry.remove<Velocity>(later));
@@ -1032,8 +1078,8 @@ TEST_CASE("view iteration tolerates later entities losing non-driver components"
     REQUIRE(std::find(after.begin(), after.end(), first) != after.end());
     REQUIRE(std::find(after.begin(), after.end(), second) != after.end());
     REQUIRE(std::find(after.begin(), after.end(), later) == after.end());
-    REQUIRE(registry.get<Position>(later) != nullptr);
-    REQUIRE(registry.get<Velocity>(later) == nullptr);
+    REQUIRE(registry.contains<Position>(later));
+    REQUIRE_FALSE(registry.contains<Velocity>(later));
 }
 
 TEST_CASE("view iteration tolerates later entities gaining driver components") {
@@ -1050,8 +1096,8 @@ TEST_CASE("view iteration tolerates later entities gaining driver components") {
     std::vector<ecs::Entity> visited;
     registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
         REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
         visited.push_back(entity);
         if (entity == first) {
             REQUIRE(registry.add<Position>(later, Position{2, 0}) != nullptr);
@@ -1066,7 +1112,7 @@ TEST_CASE("view iteration tolerates later entities gaining driver components") {
     REQUIRE(after.size() == 2);
     REQUIRE(std::find(after.begin(), after.end(), first) != after.end());
     REQUIRE(std::find(after.begin(), after.end(), later) != after.end());
-    REQUIRE(registry.get<Position>(later)->x == 2);
+    REQUIRE(registry.get<Position>(later).x == 2);
 }
 
 TEST_CASE("view iteration tolerates removing driver components from current entity") {
@@ -1084,8 +1130,8 @@ TEST_CASE("view iteration tolerates removing driver components from current enti
     std::vector<ecs::Entity> visited;
     registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
         REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
         visited.push_back(entity);
         REQUIRE(registry.remove<Position>(entity));
     });
@@ -1093,8 +1139,8 @@ TEST_CASE("view iteration tolerates removing driver components from current enti
     REQUIRE_FALSE(visited.empty());
     REQUIRE(visited.size() <= 2);
     for (ecs::Entity entity : visited) {
-        REQUIRE(registry.get<Position>(entity) == nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE_FALSE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
     }
 
     std::vector<ecs::Entity> after;
@@ -1103,8 +1149,8 @@ TEST_CASE("view iteration tolerates removing driver components from current enti
     });
     for (ecs::Entity entity : after) {
         REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
     }
 }
 
@@ -1126,8 +1172,8 @@ TEST_CASE("view iteration tolerates later entities losing driver components") {
     std::vector<ecs::Entity> visited;
     registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
         REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
         visited.push_back(entity);
         if (entity == first) {
             REQUIRE(registry.remove<Position>(later));
@@ -1143,8 +1189,8 @@ TEST_CASE("view iteration tolerates later entities losing driver components") {
     REQUIRE(std::find(after.begin(), after.end(), first) != after.end());
     REQUIRE(std::find(after.begin(), after.end(), second) != after.end());
     REQUIRE(std::find(after.begin(), after.end(), later) == after.end());
-    REQUIRE(registry.get<Position>(later) == nullptr);
-    REQUIRE(registry.get<Velocity>(later) != nullptr);
+    REQUIRE_FALSE(registry.contains<Position>(later));
+    REQUIRE(registry.contains<Velocity>(later));
 }
 
 TEST_CASE("jobs run views in order and preserve insertion order for ties") {
@@ -1268,15 +1314,14 @@ TEST_CASE("jobs are persistent and use access views") {
 
     registry.job<const Position>(0).access<Velocity>().each(
         [&](auto& active_view, ecs::Entity current, const Position& position) {
-            Velocity* velocity = active_view.template write<Velocity>(current);
-            REQUIRE(velocity != nullptr);
-            velocity->dx += static_cast<float>(position.x);
+            Velocity& velocity = active_view.template write<Velocity>(current);
+            velocity.dx += static_cast<float>(position.x);
         });
 
     registry.run_jobs();
     registry.run_jobs();
 
-    REQUIRE(registry.get<Velocity>(entity)->dx == 5.0f);
+    REQUIRE(registry.get<Velocity>(entity).dx == 5.0f);
 }
 
 TEST_CASE("jobs use live views when they run") {
@@ -1492,15 +1537,14 @@ TEST_CASE("structural access jobs can use access views and declared structural o
 
     registry.job<const Position>(0).access<Velocity>().structural<Disabled>().each(
         [](auto& view, ecs::Entity current, const Position& position) {
-            Velocity* velocity = view.template write<Velocity>(current);
-            REQUIRE(velocity != nullptr);
-            velocity->dx += static_cast<float>(position.x);
+            Velocity& velocity = view.template write<Velocity>(current);
+            velocity.dx += static_cast<float>(position.x);
             REQUIRE(view.template add<Disabled>(current));
         });
 
     registry.run_jobs();
 
-    REQUIRE(registry.get<Velocity>(entity)->dx == 3.0f);
+    REQUIRE(registry.get<Velocity>(entity).dx == 3.0f);
     REQUIRE(registry.has<Disabled>(entity));
 }
 
@@ -1531,12 +1575,12 @@ TEST_CASE("declared owned groups are used by matching views and track membership
     });
 
     REQUIRE(visited.size() == 2);
-    REQUIRE(registry.view<Position, Velocity>().get<Position>(both_a)->x == 2);
-    REQUIRE(registry.view<Position, Velocity>().write<Velocity>(both_b)->dx == 30.0f);
+    REQUIRE(registry.view<Position, Velocity>().get<Position>(both_a).x == 2);
+    REQUIRE(registry.view<Position, Velocity>().write<Velocity>(both_b).dx == 30.0f);
     REQUIRE(registry.is_dirty<Position>(both_a));
     REQUIRE(registry.is_dirty<Velocity>(both_a));
-    REQUIRE(registry.get<Velocity>(both_a)->dy == 2.0f);
-    REQUIRE(registry.get<Velocity>(both_b)->dy == 3.0f);
+    REQUIRE(registry.get<Velocity>(both_a).dy == 2.0f);
+    REQUIRE(registry.get<Velocity>(both_b).dy == 3.0f);
 
     REQUIRE(registry.remove<Velocity>(both_a));
     REQUIRE(registry.add<Velocity>(position_only, Velocity{10.0f, 0.0f}) != nullptr);
@@ -1566,8 +1610,8 @@ TEST_CASE("owned group view iteration tolerates later entities gaining component
     std::vector<ecs::Entity> visited;
     registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
         REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
         visited.push_back(entity);
         if (entity == first) {
             REQUIRE(registry.add<Velocity>(later, Velocity{2.0f, 0.0f}) != nullptr);
@@ -1582,7 +1626,7 @@ TEST_CASE("owned group view iteration tolerates later entities gaining component
     REQUIRE(after.size() == 2);
     REQUIRE(std::find(after.begin(), after.end(), first) != after.end());
     REQUIRE(std::find(after.begin(), after.end(), later) != after.end());
-    REQUIRE(registry.get<Velocity>(later)->dx == 2.0f);
+    REQUIRE(registry.get<Velocity>(later).dx == 2.0f);
 }
 
 TEST_CASE("owned group view iteration tolerates later entities losing components") {
@@ -1605,8 +1649,8 @@ TEST_CASE("owned group view iteration tolerates later entities losing components
     std::vector<ecs::Entity> visited;
     registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
         REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
         visited.push_back(entity);
         if (entity == first) {
             REQUIRE(registry.remove<Velocity>(later));
@@ -1622,8 +1666,8 @@ TEST_CASE("owned group view iteration tolerates later entities losing components
     REQUIRE(std::find(after.begin(), after.end(), first) != after.end());
     REQUIRE(std::find(after.begin(), after.end(), second) != after.end());
     REQUIRE(std::find(after.begin(), after.end(), later) == after.end());
-    REQUIRE(registry.get<Position>(later) != nullptr);
-    REQUIRE(registry.get<Velocity>(later) == nullptr);
+    REQUIRE(registry.contains<Position>(later));
+    REQUIRE_FALSE(registry.contains<Velocity>(later));
 }
 
 TEST_CASE("owned group view iteration tolerates removing components from current entity") {
@@ -1643,8 +1687,8 @@ TEST_CASE("owned group view iteration tolerates removing components from current
     std::vector<ecs::Entity> visited;
     registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
         REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
         visited.push_back(entity);
         REQUIRE(registry.remove<Velocity>(entity));
     });
@@ -1652,8 +1696,8 @@ TEST_CASE("owned group view iteration tolerates removing components from current
     REQUIRE_FALSE(visited.empty());
     REQUIRE(visited.size() <= 2);
     for (ecs::Entity entity : visited) {
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) == nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE_FALSE(registry.contains<Velocity>(entity));
     }
 
     std::vector<ecs::Entity> after;
@@ -1662,8 +1706,8 @@ TEST_CASE("owned group view iteration tolerates removing components from current
     });
     for (ecs::Entity entity : after) {
         REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
     }
 }
 
@@ -1689,9 +1733,9 @@ TEST_CASE("nested owned groups tolerate later entities joining the most specific
     std::vector<ecs::Entity> visited;
     registry.view<Position, Velocity, Health>().each([&](ecs::Entity entity, Position&, Velocity&, Health&) {
         REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
-        REQUIRE(registry.get<Health>(entity) != nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
+        REQUIRE(registry.contains<Health>(entity));
         visited.push_back(entity);
         if (entity == first) {
             REQUIRE(registry.add<Health>(later, Health{20}) != nullptr);
@@ -1706,7 +1750,7 @@ TEST_CASE("nested owned groups tolerate later entities joining the most specific
     REQUIRE(full_group.size() == 2);
     REQUIRE(std::find(full_group.begin(), full_group.end(), first) != full_group.end());
     REQUIRE(std::find(full_group.begin(), full_group.end(), later) != full_group.end());
-    REQUIRE(registry.get<Health>(later)->value == 20);
+    REQUIRE(registry.get<Health>(later).value == 20);
 }
 
 TEST_CASE("nested owned groups tolerate later entities leaving the most specific view") {
@@ -1740,9 +1784,9 @@ TEST_CASE("nested owned groups tolerate later entities leaving the most specific
     std::vector<ecs::Entity> visited;
     registry.view<Position, Velocity, Health>().each([&](ecs::Entity entity, Position&, Velocity&, Health&) {
         REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
-        REQUIRE(registry.get<Health>(entity) != nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
+        REQUIRE(registry.contains<Health>(entity));
         visited.push_back(entity);
         if (entity == first) {
             REQUIRE(registry.remove<Health>(loses_health));
@@ -1805,9 +1849,9 @@ TEST_CASE("nested owned groups keep lower group membership after current entity 
     std::vector<ecs::Entity> visited;
     registry.view<Position, Velocity, Health>().each([&](ecs::Entity entity, Position&, Velocity&, Health&) {
         REQUIRE(std::find(visited.begin(), visited.end(), entity) == visited.end());
-        REQUIRE(registry.get<Position>(entity) != nullptr);
-        REQUIRE(registry.get<Velocity>(entity) != nullptr);
-        REQUIRE(registry.get<Health>(entity) != nullptr);
+        REQUIRE(registry.contains<Position>(entity));
+        REQUIRE(registry.contains<Velocity>(entity));
+        REQUIRE(registry.contains<Health>(entity));
         visited.push_back(entity);
         if (entity == first) {
             REQUIRE(registry.remove<Health>(entity));
@@ -1914,12 +1958,12 @@ TEST_CASE("non-trivial components are constructed, moved, and destroyed explicit
 
     REQUIRE(registry.add<Tracker>(first, counts, 1) != nullptr);
     REQUIRE(registry.add<Tracker>(second, counts, 2) != nullptr);
-    REQUIRE(registry.get<Tracker>(first)->value == 1);
-    REQUIRE(registry.get<Tracker>(second)->value == 2);
+    REQUIRE(registry.get<Tracker>(first).value == 1);
+    REQUIRE(registry.get<Tracker>(second).value == 2);
 
     REQUIRE(registry.remove<Tracker>(first));
-    REQUIRE(registry.get<Tracker>(first) == nullptr);
-    REQUIRE(registry.get<Tracker>(second)->value == 2);
+    REQUIRE_FALSE(registry.contains<Tracker>(first));
+    REQUIRE(registry.get<Tracker>(second).value == 2);
 
     REQUIRE(registry.destroy(second));
     REQUIRE(counts.constructed == counts.destroyed);
@@ -1932,11 +1976,11 @@ TEST_CASE("non-trivial component replacement destroys the old value") {
 
     const ecs::Entity entity = registry.create();
     REQUIRE(registry.add<Tracker>(entity, counts, 1) != nullptr);
-    REQUIRE(registry.get<Tracker>(entity)->value == 1);
+    REQUIRE(registry.get<Tracker>(entity).value == 1);
 
     Tracker* replacement = registry.add<Tracker>(entity, counts, 2);
     REQUIRE(replacement != nullptr);
-    REQUIRE(replacement == registry.get<Tracker>(entity));
+    REQUIRE(replacement == &registry.get<Tracker>(entity));
     REQUIRE(replacement->value == 2);
     REQUIRE(counts.constructed > counts.destroyed);
 
@@ -1959,16 +2003,16 @@ TEST_CASE("non-trivial storage growth and middle removal preserve live values") 
         }
 
         for (int i = 0; i < 10; ++i) {
-            REQUIRE(registry.get<Tracker>(entities[static_cast<std::size_t>(i)])->value == i);
+            REQUIRE(registry.get<Tracker>(entities[static_cast<std::size_t>(i)]).value == i);
         }
 
         REQUIRE(registry.remove<Tracker>(entities[4]));
-        REQUIRE(registry.get<Tracker>(entities[4]) == nullptr);
+        REQUIRE_FALSE(registry.contains<Tracker>(entities[4]));
         for (int i = 0; i < 10; ++i) {
             if (i == 4) {
                 continue;
             }
-            REQUIRE(registry.get<Tracker>(entities[static_cast<std::size_t>(i)])->value == i);
+            REQUIRE(registry.get<Tracker>(entities[static_cast<std::size_t>(i)]).value == i);
         }
     }
 
@@ -1985,8 +2029,8 @@ TEST_CASE("destroying an entity removes all of its components") {
     REQUIRE(registry.add<std::unique_ptr<int>>(entity, new int(9)) != nullptr);
 
     REQUIRE(registry.destroy(entity));
-    REQUIRE(registry.get<Position>(entity) == nullptr);
-    REQUIRE(registry.write<std::unique_ptr<int>>(entity) == nullptr);
+    REQUIRE_FALSE(registry.contains<Position>(entity));
+    REQUIRE_FALSE(registry.contains<std::unique_ptr<int>>(entity));
     REQUIRE_FALSE(registry.remove<Position>(entity));
 }
 
@@ -2011,21 +2055,21 @@ TEST_CASE("moved registries retain entities components metadata singletons and d
 
     REQUIRE(source.add<Position>(entity, Position{5, 6}) != nullptr);
     REQUIRE(source.clear_dirty<Position>(entity));
-    REQUIRE(source.write<Position>(entity) != nullptr);
+    (void)source.write<Position>(entity);
     REQUIRE(source.set_component_fields(
         position_component,
         {ecs::ComponentField{"x", offsetof(Position, x), source.primitive_type(ecs::PrimitiveType::I32), 1}}));
-    source.write<GameTime>()->tick = 12;
+    source.write<GameTime>().tick = 12;
 
     ecs::Registry moved(std::move(source));
 
     REQUIRE(moved.alive(entity));
     REQUIRE(moved.component<Position>() == position_component);
     REQUIRE(moved.component<GameTime>() == game_time_component);
-    REQUIRE(moved.get<Position>(entity)->x == 5);
-    REQUIRE(moved.get<Position>(entity)->y == 6);
+    REQUIRE(moved.get<Position>(entity).x == 5);
+    REQUIRE(moved.get<Position>(entity).y == 6);
     REQUIRE(moved.is_dirty<Position>(entity));
-    REQUIRE(moved.get<GameTime>()->tick == 12);
+    REQUIRE(moved.get<GameTime>().tick == 12);
     REQUIRE(moved.is_dirty<GameTime>());
 
     const std::vector<ecs::ComponentField>* fields = moved.component_fields(position_component);
@@ -2051,7 +2095,7 @@ TEST_CASE("registry snapshots restore entities components metadata groups single
     REQUIRE(registry.add<Position>(kept, Position{1, 2}) != nullptr);
     REQUIRE(registry.add<Velocity>(kept, Velocity{3.0f, 4.0f}) != nullptr);
     REQUIRE(registry.clear_dirty<Position>(kept));
-    registry.write<GameTime>()->tick = 7;
+    registry.write<GameTime>().tick = 7;
     REQUIRE(registry.destroy(removed_before_snapshot));
 
     auto snapshot = registry.snapshot();
@@ -2060,23 +2104,23 @@ TEST_CASE("registry snapshots restore entities components metadata groups single
     REQUIRE(ecs::Registry::entity_index(reused_after_snapshot) == ecs::Registry::entity_index(removed_before_snapshot));
     REQUIRE(registry.add<Position>(reused_after_snapshot, Position{9, 9}) != nullptr);
     REQUIRE(registry.remove<Velocity>(kept));
-    registry.write<Position>(kept)->x = 42;
-    registry.write<GameTime>()->tick = 99;
+    registry.write<Position>(kept).x = 42;
+    registry.write<GameTime>().tick = 99;
     registry.register_component<Health>("Health");
 
     registry.restore(snapshot);
 
     REQUIRE(registry.alive(kept));
     REQUIRE_FALSE(registry.alive(reused_after_snapshot));
-    REQUIRE(registry.get<Position>(kept)->x == 1);
-    REQUIRE(registry.get<Position>(kept)->y == 2);
-    REQUIRE(registry.get<Velocity>(kept)->dx == 3.0f);
-    REQUIRE(registry.get<Velocity>(kept)->dy == 4.0f);
+    REQUIRE(registry.get<Position>(kept).x == 1);
+    REQUIRE(registry.get<Position>(kept).y == 2);
+    REQUIRE(registry.get<Velocity>(kept).dx == 3.0f);
+    REQUIRE(registry.get<Velocity>(kept).dy == 4.0f);
     REQUIRE_FALSE(registry.is_dirty<Position>(kept));
     REQUIRE(registry.is_dirty<Velocity>(kept));
     REQUIRE(registry.component<Position>() == position_component);
     REQUIRE(registry.component<GameTime>() == game_time_component);
-    REQUIRE(registry.get<GameTime>()->tick == 7);
+    REQUIRE(registry.get<GameTime>().tick == 7);
     REQUIRE(registry.is_dirty<GameTime>());
     REQUIRE_THROWS_AS(registry.component<Health>(), std::logic_error);
 
@@ -2122,14 +2166,14 @@ TEST_CASE("registry snapshots deep copy copyable non-trivial component storage")
     REQUIRE(registry.add<CopyableName>(entity, CopyableName{"before"}) != nullptr);
 
     auto snapshot = registry.snapshot();
-    registry.write<CopyableName>(entity)->value = "after";
+    registry.write<CopyableName>(entity).value = "after";
 
     registry.restore(snapshot);
 
-    REQUIRE(registry.get<CopyableName>(entity)->value == "before");
-    registry.write<CopyableName>(entity)->value = "restored";
+    REQUIRE(registry.get<CopyableName>(entity).value == "before");
+    registry.write<CopyableName>(entity).value = "restored";
     registry.restore(snapshot);
-    REQUIRE(registry.get<CopyableName>(entity)->value == "before");
+    REQUIRE(registry.get<CopyableName>(entity).value == "before");
 }
 
 TEST_CASE("registry snapshots reject move-only non-trivial component storage") {
@@ -2152,7 +2196,7 @@ TEST_CASE("restoring a registry snapshot leaves registered jobs unchanged") {
     int calls = 0;
     registry.job<Position>(0).each([&](ecs::Registry::View<Position>& view, ecs::Entity current, Position&) {
         ++calls;
-        view.write<Position>(current)->x += 1;
+        view.write<Position>(current).x += 1;
     });
 
     auto snapshot = registry.snapshot();
@@ -2162,7 +2206,7 @@ TEST_CASE("restoring a registry snapshot leaves registered jobs unchanged") {
     registry.run_jobs();
 
     REQUIRE(calls == 1);
-    REQUIRE(registry.get<Position>(entity)->x == 2);
+    REQUIRE(registry.get<Position>(entity).x == 2);
 }
 
 TEST_CASE("registry snapshots exclude system-tagged job bookkeeping entities") {
@@ -2180,16 +2224,16 @@ TEST_CASE("registry snapshots exclude system-tagged job bookkeeping entities") {
 
     auto snapshot = registry.snapshot();
 
-    REQUIRE(registry.write<Position>(entity) != nullptr);
-    registry.write<Position>(entity)->x = 7;
-    registry.write<Position>(job)->x = 100;
+    (void)registry.write<Position>(entity);
+    registry.write<Position>(entity).x = 7;
+    registry.write<Position>(job).x = 100;
 
     registry.restore(snapshot);
 
     REQUIRE(registry.alive(job));
     REQUIRE(registry.has(job, registry.system_tag()));
-    REQUIRE(registry.get<Position>(entity)->x == 1);
-    REQUIRE(registry.get<Position>(job) == nullptr);
+    REQUIRE(registry.get<Position>(entity).x == 1);
+    REQUIRE_FALSE(registry.contains<Position>(job));
 
     const ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
     REQUIRE(schedule.stages.size() == 1);
@@ -2227,7 +2271,7 @@ TEST_CASE("delta snapshots restore dirty values additions removals and destroyed
     replay.declare_owned_group<Position, Velocity>();
     replay.restore(baseline);
 
-    source.write<Position>(updated)->x = 10;
+    source.write<Position>(updated).x = 10;
     const ecs::Entity added = source.create();
     REQUIRE(source.add<Position>(added, Position{4, 4}) != nullptr);
     REQUIRE(source.add<Velocity>(added, Velocity{4.0f, 4.0f}) != nullptr);
@@ -2238,18 +2282,18 @@ TEST_CASE("delta snapshots restore dirty values additions removals and destroyed
     replay.restore(delta);
 
     REQUIRE(replay.alive(updated));
-    REQUIRE(replay.get<Position>(updated)->x == 10);
-    REQUIRE(replay.get<Position>(updated)->y == 1);
-    REQUIRE(replay.get<Velocity>(updated)->dx == 1.0f);
+    REQUIRE(replay.get<Position>(updated).x == 10);
+    REQUIRE(replay.get<Position>(updated).y == 1);
+    REQUIRE(replay.get<Velocity>(updated).dx == 1.0f);
     REQUIRE(replay.alive(added));
-    REQUIRE(replay.get<Position>(added)->x == 4);
-    REQUIRE(replay.get<Velocity>(added)->dx == 4.0f);
+    REQUIRE(replay.get<Position>(added).x == 4);
+    REQUIRE(replay.get<Velocity>(added).dx == 4.0f);
     REQUIRE(replay.alive(removed_component));
-    REQUIRE(replay.get<Position>(removed_component)->x == 2);
-    REQUIRE(replay.get<Velocity>(removed_component) == nullptr);
+    REQUIRE(replay.get<Position>(removed_component).x == 2);
+    REQUIRE_FALSE(replay.contains<Velocity>(removed_component));
     REQUIRE_FALSE(replay.alive(destroyed));
-    REQUIRE(replay.get<Position>(destroyed) == nullptr);
-    REQUIRE(replay.get<Health>(destroyed) == nullptr);
+    REQUIRE_FALSE(replay.contains<Position>(destroyed));
+    REQUIRE_FALSE(replay.contains<Health>(destroyed));
     REQUIRE(replay.is_dirty<Position>(updated));
     REQUIRE(replay.is_dirty<Position>(added));
     REQUIRE(replay.is_dirty<Velocity>(removed_component));
@@ -2310,11 +2354,11 @@ TEST_CASE("delta snapshots restore singleton dirty values") {
     replay.register_component<GameTime>("GameTime");
     replay.restore(baseline);
 
-    source.write<GameTime>()->tick = 55;
+    source.write<GameTime>().tick = 55;
     auto delta = source.delta_snapshot(baseline);
     replay.restore(delta);
 
-    REQUIRE(replay.get<GameTime>()->tick == 55);
+    REQUIRE(replay.get<GameTime>().tick == 55);
     REQUIRE(replay.is_dirty<GameTime>());
 }
 
@@ -2334,15 +2378,15 @@ TEST_CASE("delta snapshots exclude system-tagged job bookkeeping entities") {
     replay.register_component<Position>("Position");
     replay.restore(baseline);
 
-    source.write<Position>(entity)->x = 5;
-    source.write<Position>(job)->x = 100;
+    source.write<Position>(entity).x = 5;
+    source.write<Position>(job).x = 100;
 
     auto delta = source.delta_snapshot(baseline);
     replay.restore(delta);
 
-    REQUIRE(replay.get<Position>(entity)->x == 5);
+    REQUIRE(replay.get<Position>(entity).x == 5);
     REQUIRE_FALSE(replay.alive(job));
-    REQUIRE(replay.get<Position>(job) == nullptr);
+    REQUIRE_FALSE(replay.contains<Position>(job));
 }
 
 TEST_CASE("delta restore validates baseline token component metadata and removal state") {
@@ -2356,7 +2400,7 @@ TEST_CASE("delta restore validates baseline token component metadata and removal
     source.clear_all_dirty<Velocity>();
 
     auto baseline = source.snapshot();
-    source.write<Position>(entity)->x = 2;
+    source.write<Position>(entity).x = 2;
     REQUIRE(source.remove<Velocity>(entity));
     auto delta = source.delta_snapshot(baseline);
 
@@ -2498,8 +2542,8 @@ TEST_CASE("invalid and stale entity operations fail without throwing once compon
     const ecs::Entity invalid{};
     REQUIRE_FALSE(registry.alive(invalid));
     REQUIRE(registry.add<Position>(invalid, Position{1, 1}) == nullptr);
-    REQUIRE(registry.get<Position>(invalid) == nullptr);
-    REQUIRE(registry.write<Position>(invalid) == nullptr);
+    REQUIRE_FALSE(registry.contains<Position>(invalid));
+    REQUIRE_FALSE(registry.contains<Position>(invalid));
     REQUIRE_FALSE(registry.clear_dirty<Position>(invalid));
     REQUIRE_FALSE(registry.remove<Position>(invalid));
     REQUIRE_FALSE(registry.destroy(invalid));
@@ -2507,8 +2551,8 @@ TEST_CASE("invalid and stale entity operations fail without throwing once compon
     const ecs::Entity entity = registry.create();
     REQUIRE(registry.destroy(entity));
     REQUIRE(registry.add<Position>(entity, Position{1, 1}) == nullptr);
-    REQUIRE(registry.get<Position>(entity) == nullptr);
-    REQUIRE(registry.write<Position>(entity) == nullptr);
+    REQUIRE_FALSE(registry.contains<Position>(entity));
+    REQUIRE_FALSE(registry.contains<Position>(entity));
     REQUIRE_FALSE(registry.clear_dirty<Position>(entity));
     REQUIRE_FALSE(registry.remove<Position>(entity));
     REQUIRE_FALSE(registry.destroy(entity));

@@ -322,7 +322,7 @@ void BM_IterateSingleComponent(benchmark::State& state) {
     for (auto _ : state) {
         std::int64_t total = 0;
         for (ecs::Entity entity : entities) {
-            total += registry.get<C0>(entity)->value;
+            total += registry.get<C0>(entity).value;
         }
         benchmark::DoNotOptimize(total);
     }
@@ -341,25 +341,25 @@ void BM_IterateComponents(benchmark::State& state) {
     for (auto _ : state) {
         std::int64_t total = 0;
         for (ecs::Entity entity : entities) {
-            total += registry.get<C0>(entity)->value;
-            total += registry.get<C1>(entity)->value;
+            total += registry.get<C0>(entity).value;
+            total += registry.get<C1>(entity).value;
             if constexpr (ComponentCount >= 8) {
-                total += registry.get<C2>(entity)->value;
-                total += registry.get<C3>(entity)->value;
-                total += registry.get<C4>(entity)->value;
-                total += registry.get<C5>(entity)->value;
-                total += registry.get<C6>(entity)->value;
-                total += registry.get<C7>(entity)->value;
+                total += registry.get<C2>(entity).value;
+                total += registry.get<C3>(entity).value;
+                total += registry.get<C4>(entity).value;
+                total += registry.get<C5>(entity).value;
+                total += registry.get<C6>(entity).value;
+                total += registry.get<C7>(entity).value;
             }
             if constexpr (ComponentCount >= 16) {
-                total += registry.get<C8>(entity)->value;
-                total += registry.get<C9>(entity)->value;
-                total += registry.get<C10>(entity)->value;
-                total += registry.get<C11>(entity)->value;
-                total += registry.get<C12>(entity)->value;
-                total += registry.get<C13>(entity)->value;
-                total += registry.get<C14>(entity)->value;
-                total += registry.get<C15>(entity)->value;
+                total += registry.get<C8>(entity).value;
+                total += registry.get<C9>(entity).value;
+                total += registry.get<C10>(entity).value;
+                total += registry.get<C11>(entity).value;
+                total += registry.get<C12>(entity).value;
+                total += registry.get<C13>(entity).value;
+                total += registry.get<C14>(entity).value;
+                total += registry.get<C15>(entity).value;
             }
         }
         benchmark::DoNotOptimize(total);
@@ -482,8 +482,8 @@ void BM_IterateWriteSameComponent(benchmark::State& state) {
 
     for (auto _ : state) {
         for (ecs::Entity entity : entities) {
-            C0* component = registry.write<C0>(entity);
-            component->value += 1;
+            C0& component = registry.write<C0>(entity);
+            component.value += 1;
             benchmark::DoNotOptimize(component);
         }
         benchmark::ClobberMemory();
@@ -501,14 +501,14 @@ void BM_IterateWriteEightComponents(benchmark::State& state) {
 
     for (auto _ : state) {
         for (ecs::Entity entity : entities) {
-            registry.write<C0>(entity)->value += 1;
-            registry.write<C1>(entity)->value += 1;
-            registry.write<C2>(entity)->value += 1;
-            registry.write<C3>(entity)->value += 1;
-            registry.write<C4>(entity)->value += 1;
-            registry.write<C5>(entity)->value += 1;
-            registry.write<C6>(entity)->value += 1;
-            registry.write<C7>(entity)->value += 1;
+            registry.write<C0>(entity).value += 1;
+            registry.write<C1>(entity).value += 1;
+            registry.write<C2>(entity).value += 1;
+            registry.write<C3>(entity).value += 1;
+            registry.write<C4>(entity).value += 1;
+            registry.write<C5>(entity).value += 1;
+            registry.write<C6>(entity).value += 1;
+            registry.write<C7>(entity).value += 1;
         }
         benchmark::ClobberMemory();
     }
@@ -559,7 +559,7 @@ void BM_AccessViewReadWrite(benchmark::State& state) {
 
     for (auto _ : state) {
         registry.view<const C0>().access<C1>().each([&](auto& view, ecs::Entity entity, const C0& c0) {
-            view.template write<C1>(entity)->value += c0.value;
+            view.template write<C1>(entity).value += c0.value;
         });
         benchmark::ClobberMemory();
     }
@@ -709,8 +709,8 @@ void BM_DeltaSnapshotDirtyValues(benchmark::State& state) {
     auto baseline = registry.snapshot();
 
     for (std::size_t i = 0; i < entities.size(); i += 16) {
-        registry.write<C0>(entities[i])->value += 1;
-        registry.write<C1>(entities[i])->value += 1;
+        registry.write<C0>(entities[i]).value += 1;
+        registry.write<C1>(entities[i]).value += 1;
     }
 
     for (auto _ : state) {
@@ -780,8 +780,8 @@ void BM_DeltaSnapshotRestoreDirtyValues(benchmark::State& state) {
     auto baseline = source.snapshot();
 
     for (std::size_t i = 0; i < entities.size(); i += 16) {
-        source.write<C0>(entities[i])->value += 1;
-        source.write<C1>(entities[i])->value += 1;
+        source.write<C0>(entities[i]).value += 1;
+        source.write<C1>(entities[i]).value += 1;
     }
     auto delta = source.delta_snapshot(baseline);
 

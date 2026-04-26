@@ -15,7 +15,7 @@ Components are also entities. Registering a component creates a normal entity an
 
 ## Typed Components
 
-Compile-time component APIs require explicit registration. Using `add<T>`, `get<T>`, `write<T>`, `remove<T>`, or dirty helpers before `register_component<T>()` throws `std::logic_error`.
+Compile-time component APIs require explicit registration. Using `add<T>`, `contains<T>`, `try_get<T>`, `get<T>`, `write<T>`, `remove<T>`, or dirty helpers before `register_component<T>()` throws `std::logic_error`.
 
 ```cpp
 #include "ecs/ecs.hpp"
@@ -33,8 +33,8 @@ int main() {
 
     registry.add<Position>(entity, Position{1, 2});
 
-    if (Position* position = registry.write<Position>(entity)) {
-        position->x += 3;
+    if (registry.contains<Position>(entity)) {
+        registry.write<Position>(entity).x += 3;
     }
 
     registry.clear_dirty<Position>(entity);
@@ -93,7 +93,7 @@ struct is_singleton_component<GameTime> : std::true_type {};
 }
 
 registry.register_component<GameTime>("GameTime");
-registry.write<GameTime>()->tick += 1;
+registry.write<GameTime>().tick += 1;
 ```
 
 No-entity `get<T>()`, `write<T>()`, `clear_dirty<T>()`, and `is_dirty<T>()` overloads are available only for singleton component types.
@@ -109,11 +109,11 @@ view.each([](ecs::Entity entity, const Position& position, Velocity& velocity) {
     velocity.dx += static_cast<float>(position.x);
 });
 
-const Position* position = view.get<Position>(entity);
-Velocity* velocity = view.write<Velocity>(entity);
+const Position& position = view.get<Position>(entity);
+Velocity& velocity = view.write<Velocity>(entity);
 ```
 
-`view.get<T>()` and `view.write<T>()` are only available for components listed in the view. `view.write<T>()` is additionally available only when `T` was listed without `const`.
+`view.get<T>()` and `view.write<T>()` are required-access APIs and are only available for components listed in the view. Use `contains<T>(entity)` before optional access. `view.write<T>()` is additionally available only when `T` was listed without `const`.
 
 Singleton components listed in a view are passed to callbacks but do not filter iteration. A singleton-only view calls its callback once with an invalid `ecs::Entity`.
 
@@ -124,8 +124,8 @@ auto view = registry.view<const Velocity>().access<Velocity>();
 
 view.each([](auto& active_view, ecs::Entity entity, const Velocity& velocity) {
     if (velocity.dx != 0.0f) {
-        if (Velocity* writable = active_view.template write<Velocity>(entity)) {
-            writable->dy += velocity.dx;
+        if (active_view.template contains<Velocity>(entity)) {
+            active_view.template write<Velocity>(entity).dy += velocity.dx;
         }
     }
 });
@@ -137,10 +137,10 @@ Views can also carry access-only components. Access-only components do not filte
 auto view = registry.view<Position>().access<const Target, Health>();
 
 view.each([&](auto& active_view, ecs::Entity entity, Position& position) {
-    const Target* target = active_view.template get<Target>(entity);
+    const Target* target = active_view.template try_get<Target>(entity);
     if (target != nullptr) {
-        if (Health* health = active_view.template write<Health>(target->entity)) {
-            health->value += position.x;
+        if (active_view.template contains<Health>(target->entity)) {
+            active_view.template write<Health>(target->entity).value += position.x;
         }
     }
 });
@@ -166,8 +166,8 @@ Job views support the same access pattern as ordinary views:
 registry.job<const Position>(20)
     .access<Velocity>()
     .each([](auto& active_view, ecs::Entity entity, const Position& position) {
-        if (Velocity* velocity = active_view.template write<Velocity>(entity)) {
-            velocity->dx += position.x;
+        if (active_view.template contains<Velocity>(entity)) {
+            active_view.template write<Velocity>(entity).dx += position.x;
         }
     });
 ```
@@ -293,11 +293,13 @@ std::string text = registry.debug_print(entity, position_type);
 - `bool Registry::remove_tag(Entity entity, Entity tag)`
 - `bool Registry::has<T>(Entity entity) const` (tag components only)
 - `bool Registry::has(Entity entity, Entity tag) const`
-- `const T* Registry::get<T>(Entity entity) const`
-- `const T* Registry::get<T>() const` (singleton components only)
+- `bool Registry::contains<T>(Entity entity) const` (non-singleton components only)
+- `const T* Registry::try_get<T>(Entity entity) const` (non-singleton components only)
+- `const T& Registry::get<T>(Entity entity) const`
+- `const T& Registry::get<T>() const` (singleton components only)
 - `const void* Registry::get(Entity entity, Entity component) const`
-- `T* Registry::write<T>(Entity entity)`
-- `T* Registry::write<T>()` (singleton components only)
+- `T& Registry::write<T>(Entity entity)`
+- `T& Registry::write<T>()` (singleton components only)
 - `void* Registry::write(Entity entity, Entity component)`
 - `bool Registry::clear_dirty<T>(Entity entity)`
 - `bool Registry::clear_dirty<T>()` (singleton components only)
@@ -342,13 +344,15 @@ std::string text = registry.debug_print(entity, position_type);
 - `bool filtered_view.has_tag(Entity entity, Entity tag) const`
 - `bool filtered_view.add_tag(Entity entity, Entity tag)` (mutable runtime tag filters only)
 - `bool filtered_view.remove_tag(Entity entity, Entity tag)` (mutable runtime tag filters only)
-- `const T* View<Components...>::get<T>(Entity entity) const`
-- `const T* View<Components...>::get<T>() const` (singleton components only)
-- `T* View<Components...>::write<T>(Entity entity)`
-- `T* View<Components...>::write<T>()` (singleton components only)
+- `bool View<Components...>::contains<T>(Entity entity) const` (non-singleton components only)
+- `const T* View<Components...>::try_get<T>(Entity entity) const` (non-singleton components only)
+- `const T& View<Components...>::get<T>(Entity entity) const`
+- `const T& View<Components...>::get<T>() const` (singleton components only)
+- `T& View<Components...>::write<T>(Entity entity)`
+- `T& View<Components...>::write<T>()` (singleton components only)
 - `std::string Registry::debug_print(Entity entity, Entity component) const`
 
-Invalid, dead, stale, or missing entity values are reported with `nullptr` or `false`. Unregistered component types or invalid component entities throw `std::logic_error`.
+Optional access uses `contains<T>(entity)`, `try_get<T>(entity)`, or runtime pointer APIs. Typed `get<T>()` and `write<T>()` are required-access APIs; using them for missing components or invalid entities is programmer error. Unregistered component types or invalid component entities throw `std::logic_error`.
 
 ## Component Storage
 
@@ -363,7 +367,7 @@ Trivially copyable components are relocated with `memcpy`. Non-trivially copyabl
 
 Component pointers remain valid until that component storage is removed or mutated in a way that reallocates or moves dense storage.
 
-`add<T>()`, runtime `add()`, `ensure()`, and `write()` mark the component dirty because they return writable storage. Tag add/remove marks tag membership dirty. `get()` and `has()` are read-only and do not modify dirty state.
+`add<T>()`, runtime `add()`, `ensure()`, and `write()` mark the component dirty because they return writable storage. Tag add/remove marks tag membership dirty. `get()`, `try_get()`, `contains()`, and `has()` are read-only and do not modify dirty state.
 
 Snapshots capture entity/component world state for later restoration. Delta snapshots validate against a baseline snapshot token, copy current entity slot state, and save only dirty component values plus dirty component-removal tombstones. Trivially copyable component storage is byte-copied, copy-constructible typed components are cloned through their lifecycle hook, and move-only non-trivial component storage rejects snapshot creation when captured. Registered job callbacks are not part of snapshots. Internal bookkeeping entities are tagged with `Registry::system_tag()` and excluded from snapshot payloads.
 

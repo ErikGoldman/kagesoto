@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -515,19 +516,50 @@ public:
         return false;
     }
 
-    template <typename T, typename std::enable_if<!detail::is_tag_query<T>::value, int>::type = 0>
-    const T* get(Entity entity) const {
-        const Entity component = registered_component<T>();
-        if constexpr (is_singleton_component<T>::value) {
-            return static_cast<const T*>(get(singleton_entity_, component));
+    template <
+        typename T,
+        typename std::enable_if<!detail::is_tag_query<T>::value && !is_singleton_component<T>::value, int>::type = 0>
+    bool contains(Entity entity) const {
+        registered_component<T>();
+        if (!alive(entity)) {
+            return false;
         }
-        return static_cast<const T*>(get(entity, component));
+
+        const TypeErasedStorage* storage = typed_storage<T>();
+        return storage != nullptr && storage->contains_index(entity_index(entity));
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<!detail::is_tag_query<T>::value && !is_singleton_component<T>::value, int>::type = 0>
+    const T* try_get(Entity entity) const {
+        registered_component<T>();
+        if (!alive(entity)) {
+            return nullptr;
+        }
+
+        const TypeErasedStorage* storage = typed_storage<T>();
+        return storage != nullptr ? static_cast<const T*>(storage->get(entity_index(entity))) : nullptr;
+    }
+
+    template <typename T, typename std::enable_if<!detail::is_tag_query<T>::value, int>::type = 0>
+    const T& get(Entity entity) const {
+        registered_component<T>();
+        std::uint32_t index = entity_index(entity);
+        if constexpr (is_singleton_component<T>::value) {
+            index = entity_index(singleton_entity_);
+        }
+        const TypeErasedStorage* storage = typed_storage<T>();
+        assert(storage != nullptr);
+        return *static_cast<const T*>(storage->get_unchecked(index));
     }
 
     template <typename T, typename std::enable_if<is_singleton_component<T>::value, int>::type = 0>
-    const T* get() const {
-        const Entity component = registered_component<T>();
-        return static_cast<const T*>(get(singleton_entity_, component));
+    const T& get() const {
+        registered_component<T>();
+        const TypeErasedStorage* storage = typed_storage<T>();
+        assert(storage != nullptr);
+        return *static_cast<const T*>(storage->get_unchecked(entity_index(singleton_entity_)));
     }
 
     const void* get(Entity entity, Entity component) const {
@@ -547,18 +579,23 @@ public:
     }
 
     template <typename T, typename std::enable_if<!detail::is_tag_query<T>::value, int>::type = 0>
-    T* write(Entity entity) {
-        const Entity component = registered_component<T>();
+    T& write(Entity entity) {
+        registered_component<T>();
+        std::uint32_t index = entity_index(entity);
         if constexpr (is_singleton_component<T>::value) {
-            return static_cast<T*>(write(singleton_entity_, component));
+            index = entity_index(singleton_entity_);
         }
-        return static_cast<T*>(write(entity, component));
+        TypeErasedStorage* storage = typed_storage<T>();
+        assert(storage != nullptr);
+        return *static_cast<T*>(storage->write_unchecked(index));
     }
 
     template <typename T, typename std::enable_if<is_singleton_component<T>::value, int>::type = 0>
-    T* write() {
-        const Entity component = registered_component<T>();
-        return static_cast<T*>(write(singleton_entity_, component));
+    T& write() {
+        registered_component<T>();
+        TypeErasedStorage* storage = typed_storage<T>();
+        assert(storage != nullptr);
+        return *static_cast<T*>(storage->write_unchecked(entity_index(singleton_entity_)));
     }
 
     void* write(Entity entity, Entity component) {
@@ -999,6 +1036,20 @@ private:
             if (info_.tag) {
                 return nullptr;
             }
+            return data_ + dense * info_.size;
+        }
+
+        const void* get_unchecked(std::uint32_t index) const {
+            assert(!info_.tag);
+            assert(contains(index));
+            return data_ + sparse_[index] * info_.size;
+        }
+
+        void* write_unchecked(std::uint32_t index) {
+            assert(!info_.tag);
+            assert(contains(index));
+            const std::uint32_t dense = sparse_[index];
+            dirty_[dense] = 1;
             return data_ + dense * info_.size;
         }
 
@@ -1765,6 +1816,7 @@ private:
     void ensure_typed_capacity(std::size_t id) {
         if (id >= typed_components_.size()) {
             typed_components_.resize(id + 1);
+            typed_storages_.resize(id + 1);
         }
     }
 
@@ -1815,6 +1867,7 @@ private:
                 if (typed_id != npos_type_id) {
                     ensure_typed_capacity(typed_id);
                     typed_components_[typed_id] = existing;
+                    typed_storages_[typed_id] = find_storage(existing);
                     record.type_id = typed_id;
                     record.lifecycle = lifecycle;
                 }
@@ -1895,7 +1948,35 @@ private:
             found = inserted.first;
         }
 
+        if (record.type_id != npos_type_id) {
+            ensure_typed_capacity(record.type_id);
+            typed_storages_[record.type_id] = found->second.get();
+        }
+
         return *found->second;
+    }
+
+    template <typename T>
+    TypeErasedStorage* typed_storage() {
+        const std::size_t id = type_id<T>();
+        return id < typed_storages_.size() ? typed_storages_[id] : nullptr;
+    }
+
+    template <typename T>
+    const TypeErasedStorage* typed_storage() const {
+        const std::size_t id = type_id<T>();
+        return id < typed_storages_.size() ? typed_storages_[id] : nullptr;
+    }
+
+    void rebuild_typed_storages() {
+        typed_storages_.assign(typed_components_.size(), nullptr);
+        for (const auto& component : components_) {
+            const ComponentRecord& record = component.second;
+            if (record.type_id != npos_type_id && record.type_id < typed_storages_.size()) {
+                const auto found = storages_.find(component.first);
+                typed_storages_[record.type_id] = found != storages_.end() ? found->second.get() : nullptr;
+            }
+        }
     }
 
     TypeErasedStorage* find_storage(Entity component) {
@@ -1935,11 +2016,13 @@ private:
 
         if (record->type_id != npos_type_id && record->type_id < typed_components_.size()) {
             typed_components_[record->type_id] = Entity{};
+            typed_storages_[record->type_id] = nullptr;
         }
 
-        for (Entity& cached : typed_components_) {
-            if (cached == component) {
-                cached = Entity{};
+        for (std::size_t index = 0; index < typed_components_.size(); ++index) {
+            if (typed_components_[index] == component) {
+                typed_components_[index] = Entity{};
+                typed_storages_[index] = nullptr;
             }
         }
 
@@ -2158,6 +2241,7 @@ private:
     std::unordered_map<std::string, std::uint32_t> component_names_;
     std::unordered_map<std::uint32_t, std::unique_ptr<TypeErasedStorage>> storages_;
     std::vector<Entity> typed_components_;
+    std::vector<TypeErasedStorage*> typed_storages_;
     std::vector<std::unique_ptr<GroupRecord>> groups_;
     std::vector<JobRecord> jobs_;
     JobThreadExecutor job_thread_executor_;
@@ -2325,6 +2409,7 @@ inline void Registry::restore(const Snapshot& snapshot) {
     component_names_ = snapshot.component_names_;
     storages_ = std::move(storages);
     typed_components_ = snapshot.typed_components_;
+    rebuild_typed_storages();
     groups_ = std::move(groups);
     singleton_entity_ = snapshot.singleton_entity_;
     system_tag_ = snapshot.system_tag_;
@@ -2539,23 +2624,45 @@ public:
         return view;
     }
 
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::contains_component<T, Components...>::value && !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    bool contains(Entity entity) const {
+        if (!registry_->alive(entity)) {
+            return false;
+        }
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        return storage != nullptr && storage->contains_index(entity_index(entity));
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::contains_component<T, Components...>::value && !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    const detail::component_query_t<T>* try_get(Entity entity) const {
+        if (!registry_->alive(entity)) {
+            return nullptr;
+        }
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        return storage != nullptr
+            ? static_cast<const detail::component_query_t<T>*>(storage->get(entity_index(entity)))
+            : nullptr;
+    }
+
     template <typename T, typename std::enable_if<detail::contains_component<T, Components...>::value, int>::type = 0>
-    const detail::component_query_t<T>* get(Entity entity) const {
+    const detail::component_query_t<T>& get(Entity entity) const {
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
             index = entity_index(registry_->singleton_entity_);
-        } else {
-            if (!registry_->alive(entity)) {
-                return nullptr;
-            }
         }
 
         const TypeErasedStorage* storage = storage_for_type<T>();
-        if (storage == nullptr) {
-            return nullptr;
-        }
+        assert(storage != nullptr);
 
-        return static_cast<const detail::component_query_t<T>*>(storage->get(index));
+        return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(index));
     }
 
     template <
@@ -2563,35 +2670,28 @@ public:
         typename std::enable_if<
             detail::is_singleton_query<T>::value && detail::contains_component<T, Components...>::value,
             int>::type = 0>
-    const detail::component_query_t<T>* get() const {
+    const detail::component_query_t<T>& get() const {
         const TypeErasedStorage* storage = storage_for_type<T>();
-        if (storage == nullptr) {
-            return nullptr;
-        }
+        assert(storage != nullptr);
 
-        return static_cast<const detail::component_query_t<T>*>(storage->get(entity_index(registry_->singleton_entity_)));
+        return *static_cast<const detail::component_query_t<T>*>(
+            storage->get_unchecked(entity_index(registry_->singleton_entity_)));
     }
 
     template <typename T, typename std::enable_if<
                               !std::is_const<typename std::remove_reference<T>::type>::value &&
                                   detail::contains_mutable_component<T, Components...>::value,
                               int>::type = 0>
-    detail::component_query_t<T>* write(Entity entity) {
+    detail::component_query_t<T>& write(Entity entity) {
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
             index = entity_index(registry_->singleton_entity_);
-        } else {
-            if (!registry_->alive(entity)) {
-                return nullptr;
-            }
         }
 
         TypeErasedStorage* storage = storage_for_type<T>();
-        if (storage == nullptr) {
-            return nullptr;
-        }
+        assert(storage != nullptr);
 
-        return static_cast<detail::component_query_t<T>*>(storage->write(index));
+        return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(index));
     }
 
     template <
@@ -2601,13 +2701,12 @@ public:
                 !std::is_const<typename std::remove_reference<T>::type>::value &&
                 detail::contains_mutable_component<T, Components...>::value,
             int>::type = 0>
-    detail::component_query_t<T>* write() {
+    detail::component_query_t<T>& write() {
         TypeErasedStorage* storage = storage_for_type<T>();
-        if (storage == nullptr) {
-            return nullptr;
-        }
+        assert(storage != nullptr);
 
-        return static_cast<detail::component_query_t<T>*>(storage->write(entity_index(registry_->singleton_entity_)));
+        return *static_cast<detail::component_query_t<T>*>(
+            storage->write_unchecked(entity_index(registry_->singleton_entity_)));
     }
 
 private:
@@ -2705,9 +2804,9 @@ private:
             index = entity_index(registry_->singleton_entity_);
         }
         if constexpr (std::is_const<typename std::remove_reference<T>::type>::value) {
-            return *static_cast<const detail::component_query_t<T>*>(storage->get(index));
+            return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(index));
         } else {
-            return *static_cast<detail::component_query_t<T>*>(storage->write(index));
+            return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(index));
         }
     }
 
@@ -2883,24 +2982,48 @@ public:
 
     template <
         typename T,
+        typename std::enable_if<
+            detail::contains_component<T, IterComponents..., AccessComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    bool contains(Entity entity) const {
+        if (!registry_->alive(entity)) {
+            return false;
+        }
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        return storage != nullptr && storage->contains_index(entity_index(entity));
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::contains_component<T, IterComponents..., AccessComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    const detail::component_query_t<T>* try_get(Entity entity) const {
+        if (!registry_->alive(entity)) {
+            return nullptr;
+        }
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        return storage != nullptr
+            ? static_cast<const detail::component_query_t<T>*>(storage->get(entity_index(entity)))
+            : nullptr;
+    }
+
+    template <
+        typename T,
         typename std::enable_if<detail::contains_component<T, IterComponents..., AccessComponents...>::value, int>::
             type = 0>
-    const detail::component_query_t<T>* get(Entity entity) const {
+    const detail::component_query_t<T>& get(Entity entity) const {
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
             index = entity_index(registry_->singleton_entity_);
-        } else {
-            if (!registry_->alive(entity)) {
-                return nullptr;
-            }
         }
 
         const TypeErasedStorage* storage = storage_for_type<T>();
-        if (storage == nullptr) {
-            return nullptr;
-        }
+        assert(storage != nullptr);
 
-        return static_cast<const detail::component_query_t<T>*>(storage->get(index));
+        return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(index));
     }
 
     template <
@@ -2909,13 +3032,12 @@ public:
             detail::is_singleton_query<T>::value &&
                 detail::contains_component<T, IterComponents..., AccessComponents...>::value,
             int>::type = 0>
-    const detail::component_query_t<T>* get() const {
+    const detail::component_query_t<T>& get() const {
         const TypeErasedStorage* storage = storage_for_type<T>();
-        if (storage == nullptr) {
-            return nullptr;
-        }
+        assert(storage != nullptr);
 
-        return static_cast<const detail::component_query_t<T>*>(storage->get(entity_index(registry_->singleton_entity_)));
+        return *static_cast<const detail::component_query_t<T>*>(
+            storage->get_unchecked(entity_index(registry_->singleton_entity_)));
     }
 
     template <
@@ -2924,22 +3046,16 @@ public:
             !std::is_const<typename std::remove_reference<T>::type>::value &&
                 detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
             int>::type = 0>
-    detail::component_query_t<T>* write(Entity entity) {
+    detail::component_query_t<T>& write(Entity entity) {
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
             index = entity_index(registry_->singleton_entity_);
-        } else {
-            if (!registry_->alive(entity)) {
-                return nullptr;
-            }
         }
 
         TypeErasedStorage* storage = storage_for_type<T>();
-        if (storage == nullptr) {
-            return nullptr;
-        }
+        assert(storage != nullptr);
 
-        return static_cast<detail::component_query_t<T>*>(storage->write(index));
+        return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(index));
     }
 
     template <
@@ -2949,13 +3065,12 @@ public:
                 !std::is_const<typename std::remove_reference<T>::type>::value &&
                 detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
             int>::type = 0>
-    detail::component_query_t<T>* write() {
+    detail::component_query_t<T>& write() {
         TypeErasedStorage* storage = storage_for_type<T>();
-        if (storage == nullptr) {
-            return nullptr;
-        }
+        assert(storage != nullptr);
 
-        return static_cast<detail::component_query_t<T>*>(storage->write(entity_index(registry_->singleton_entity_)));
+        return *static_cast<detail::component_query_t<T>*>(
+            storage->write_unchecked(entity_index(registry_->singleton_entity_)));
     }
 
 private:
@@ -3060,9 +3175,9 @@ private:
             index = entity_index(registry_->singleton_entity_);
         }
         if constexpr (std::is_const<typename std::remove_reference<T>::type>::value) {
-            return *static_cast<const detail::component_query_t<T>*>(storage->get(index));
+            return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(index));
         } else {
-            return *static_cast<detail::component_query_t<T>*>(storage->write(index));
+            return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(index));
         }
     }
 
@@ -3210,24 +3325,48 @@ public:
 
     template <
         typename T,
+        typename std::enable_if<
+            detail::contains_component<T, IterComponents..., AccessComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    bool contains(Entity entity) const {
+        if (!registry_->alive(entity)) {
+            return false;
+        }
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        return storage != nullptr && storage->contains_index(entity_index(entity));
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::contains_component<T, IterComponents..., AccessComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    const detail::component_query_t<T>* try_get(Entity entity) const {
+        if (!registry_->alive(entity)) {
+            return nullptr;
+        }
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        return storage != nullptr
+            ? static_cast<const detail::component_query_t<T>*>(storage->get(entity_index(entity)))
+            : nullptr;
+    }
+
+    template <
+        typename T,
         typename std::enable_if<detail::contains_component<T, IterComponents..., AccessComponents...>::value, int>::
             type = 0>
-    const detail::component_query_t<T>* get(Entity entity) const {
+    const detail::component_query_t<T>& get(Entity entity) const {
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
             index = entity_index(registry_->singleton_entity_);
-        } else {
-            if (!registry_->alive(entity)) {
-                return nullptr;
-            }
         }
 
         const TypeErasedStorage* storage = storage_for_type<T>();
-        if (storage == nullptr) {
-            return nullptr;
-        }
+        assert(storage != nullptr);
 
-        return static_cast<const detail::component_query_t<T>*>(storage->get(index));
+        return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(index));
     }
 
     template <
@@ -3236,13 +3375,12 @@ public:
             detail::is_singleton_query<T>::value &&
                 detail::contains_component<T, IterComponents..., AccessComponents...>::value,
             int>::type = 0>
-    const detail::component_query_t<T>* get() const {
+    const detail::component_query_t<T>& get() const {
         const TypeErasedStorage* storage = storage_for_type<T>();
-        if (storage == nullptr) {
-            return nullptr;
-        }
+        assert(storage != nullptr);
 
-        return static_cast<const detail::component_query_t<T>*>(storage->get(entity_index(registry_->singleton_entity_)));
+        return *static_cast<const detail::component_query_t<T>*>(
+            storage->get_unchecked(entity_index(registry_->singleton_entity_)));
     }
 
     template <
@@ -3251,22 +3389,16 @@ public:
             !std::is_const<typename std::remove_reference<T>::type>::value &&
                 detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
             int>::type = 0>
-    detail::component_query_t<T>* write(Entity entity) {
+    detail::component_query_t<T>& write(Entity entity) {
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
             index = entity_index(registry_->singleton_entity_);
-        } else {
-            if (!registry_->alive(entity)) {
-                return nullptr;
-            }
         }
 
         TypeErasedStorage* storage = storage_for_type<T>();
-        if (storage == nullptr) {
-            return nullptr;
-        }
+        assert(storage != nullptr);
 
-        return static_cast<detail::component_query_t<T>*>(storage->write(index));
+        return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(index));
     }
 
     template <
@@ -3276,13 +3408,12 @@ public:
                 !std::is_const<typename std::remove_reference<T>::type>::value &&
                 detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
             int>::type = 0>
-    detail::component_query_t<T>* write() {
+    detail::component_query_t<T>& write() {
         TypeErasedStorage* storage = storage_for_type<T>();
-        if (storage == nullptr) {
-            return nullptr;
-        }
+        assert(storage != nullptr);
 
-        return static_cast<detail::component_query_t<T>*>(storage->write(entity_index(registry_->singleton_entity_)));
+        return *static_cast<detail::component_query_t<T>*>(
+            storage->write_unchecked(entity_index(registry_->singleton_entity_)));
     }
 
     template <
@@ -3491,9 +3622,9 @@ private:
             index = entity_index(registry_->singleton_entity_);
         }
         if constexpr (std::is_const<typename std::remove_reference<T>::type>::value) {
-            return *static_cast<const detail::component_query_t<T>*>(storage->get(index));
+            return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(index));
         } else {
-            return *static_cast<detail::component_query_t<T>*>(storage->write(index));
+            return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(index));
         }
     }
 
@@ -3522,26 +3653,26 @@ public:
         : registry_(&registry), view_(&view) {}
 
     template <typename T>
-    const detail::component_query_t<T>* get(Entity entity) const {
+    const detail::component_query_t<T>& get(Entity entity) const {
         return view_->template get<T>(entity);
     }
 
     template <
         typename T,
         typename std::enable_if<detail::is_singleton_query<T>::value, int>::type = 0>
-    const detail::component_query_t<T>* get() const {
+    const detail::component_query_t<T>& get() const {
         return view_->template get<T>();
     }
 
     template <typename T>
-    detail::component_query_t<T>* write(Entity entity) {
+    detail::component_query_t<T>& write(Entity entity) {
         return view_->template write<T>(entity);
     }
 
     template <
         typename T,
         typename std::enable_if<detail::is_singleton_query<T>::value, int>::type = 0>
-    detail::component_query_t<T>* write() {
+    detail::component_query_t<T>& write() {
         return view_->template write<T>();
     }
 
@@ -3642,7 +3773,7 @@ public:
     }
 
     template <typename T, typename std::enable_if<detail::contains_component<T, Components...>::value, int>::type = 0>
-    const detail::component_query_t<T>* get(Entity entity) const {
+    const detail::component_query_t<T>& get(Entity entity) const {
         return view_.template get<T>(entity);
     }
 
@@ -3651,7 +3782,7 @@ public:
         typename std::enable_if<
             detail::is_singleton_query<T>::value && detail::contains_component<T, Components...>::value,
             int>::type = 0>
-    const detail::component_query_t<T>* get() const {
+    const detail::component_query_t<T>& get() const {
         return view_.template get<T>();
     }
 
@@ -3659,7 +3790,7 @@ public:
                               !std::is_const<typename std::remove_reference<T>::type>::value &&
                                   detail::contains_mutable_component<T, Components...>::value,
                               int>::type = 0>
-    detail::component_query_t<T>* write(Entity entity) {
+    detail::component_query_t<T>& write(Entity entity) {
         return view_.template write<T>(entity);
     }
 
@@ -3670,7 +3801,7 @@ public:
                 !std::is_const<typename std::remove_reference<T>::type>::value &&
                 detail::contains_mutable_component<T, Components...>::value,
             int>::type = 0>
-    detail::component_query_t<T>* write() {
+    detail::component_query_t<T>& write() {
         return view_.template write<T>();
     }
 
@@ -3751,7 +3882,7 @@ public:
         typename T,
         typename std::enable_if<detail::contains_component<T, IterComponents..., AccessComponents...>::value, int>::
             type = 0>
-    const detail::component_query_t<T>* get(Entity entity) const {
+    const detail::component_query_t<T>& get(Entity entity) const {
         return view_.template get<T>(entity);
     }
 
@@ -3761,7 +3892,7 @@ public:
             detail::is_singleton_query<T>::value &&
                 detail::contains_component<T, IterComponents..., AccessComponents...>::value,
             int>::type = 0>
-    const detail::component_query_t<T>* get() const {
+    const detail::component_query_t<T>& get() const {
         return view_.template get<T>();
     }
 
@@ -3771,7 +3902,7 @@ public:
             !std::is_const<typename std::remove_reference<T>::type>::value &&
                 detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
             int>::type = 0>
-    detail::component_query_t<T>* write(Entity entity) {
+    detail::component_query_t<T>& write(Entity entity) {
         return view_.template write<T>(entity);
     }
 
@@ -3782,7 +3913,7 @@ public:
                 !std::is_const<typename std::remove_reference<T>::type>::value &&
                 detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
             int>::type = 0>
-    detail::component_query_t<T>* write() {
+    detail::component_query_t<T>& write() {
         return view_.template write<T>();
     }
 

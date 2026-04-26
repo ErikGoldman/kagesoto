@@ -15,15 +15,13 @@ int main() {
 
     registry.add<Position>(entity, Position{1.0f, 2.0f});
 
-    if (Position* position = registry.write<Position>(entity)) {
-        position->x += 3.0f;
-    }
+    registry.write<Position>(entity).x += 3.0f;
 
-    const Position* position = registry.get<Position>(entity);
-    if (position == nullptr) {
+    if (!registry.contains<Position>(entity)) {
         return 1;
     }
 
-    std::cout << position->x << ", " << position->y << '\n';
+    const Position& position = registry.get<Position>(entity);
+    std::cout << position.x << ", " << position.y << '\n';
     return 0;
 }
