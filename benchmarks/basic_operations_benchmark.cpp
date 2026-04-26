@@ -801,6 +801,42 @@ void BM_DeltaSnapshotRestoreDirtyValues(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(entity_count / 16) * 2);
 }
 
+void BM_DeltaSnapshotRestoreStructuralChanges(benchmark::State& state) {
+    const int entity_count = static_cast<int>(state.range(0));
+    ecs::Registry source;
+    register_first_n_components(source, 2);
+    const std::vector<ecs::Entity> entities = create_entities(source, entity_count);
+    add_first_n_components(source, entities, 2);
+    source.declare_owned_group<C0, C1>();
+    source.clear_all_dirty<C0>();
+    source.clear_all_dirty<C1>();
+    auto baseline = source.snapshot();
+
+    for (std::size_t i = 0; i < entities.size(); i += 32) {
+        source.remove<C1>(entities[i]);
+    }
+    for (std::size_t i = 16; i < entities.size(); i += 32) {
+        source.destroy(entities[i]);
+    }
+    auto delta = source.delta_snapshot(baseline);
+
+    ecs::Registry replay;
+    register_first_n_components(replay, 2);
+    replay.declare_owned_group<C0, C1>();
+    replay.restore(baseline);
+
+    for (auto _ : state) {
+        replay.restore(delta);
+        benchmark::DoNotOptimize(&replay);
+
+        state.PauseTiming();
+        replay.restore(baseline);
+        state.ResumeTiming();
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(entity_count / 16));
+}
+
 void BM_RuntimeAddRemoveComponents(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
     ecs::Registry registry;
@@ -967,6 +1003,7 @@ BENCHMARK(BM_DeltaSnapshotDirtyValues)->Apply(BasicOperationArgs);
 BENCHMARK(BM_DeltaSnapshotStructuralChanges)->Apply(BasicOperationArgs);
 BENCHMARK(BM_SnapshotRestore)->Apply(BasicOperationArgs);
 BENCHMARK(BM_DeltaSnapshotRestoreDirtyValues)->Apply(BasicOperationArgs);
+BENCHMARK(BM_DeltaSnapshotRestoreStructuralChanges)->Apply(BasicOperationArgs);
 BENCHMARK(BM_RuntimeAddRemoveComponents)->Apply(BasicOperationArgs);
 BENCHMARK(BM_RuntimeEnsureExistingWriteRead)->Apply(BasicOperationArgs);
 BENCHMARK(BM_NonTrivialComponentChurn)->Apply(BasicOperationArgs);

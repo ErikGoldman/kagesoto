@@ -1,5 +1,5 @@
 build/
-build-bench/
+build-bench*/
 artifacts/
 .vs/
 gmon.out

@@ -807,7 +807,10 @@ private:
             : dense_indices_(other.dense_indices_),
               sparse_(other.sparse_),
               dirty_(other.dirty_),
-              tombstones_(other.tombstones_),
+              tombstones_(other.tombstone_count_ == 0 ? std::vector<unsigned char>{} : other.tombstones_),
+              tombstone_indices_(other.tombstone_count_ == 0 ? std::vector<std::uint32_t>{} : other.tombstone_indices_),
+              dirty_count_(other.dirty_count_),
+              tombstone_count_(other.tombstone_count_),
               info_(other.info_),
               lifecycle_(other.lifecycle_) {
             copy_from(other);
@@ -827,14 +830,19 @@ private:
               sparse_(std::move(other.sparse_)),
               dirty_(std::move(other.dirty_)),
               tombstones_(std::move(other.tombstones_)),
+              tombstone_indices_(std::move(other.tombstone_indices_)),
               data_(other.data_),
               size_(other.size_),
               capacity_(other.capacity_),
+              dirty_count_(other.dirty_count_),
+              tombstone_count_(other.tombstone_count_),
               info_(other.info_),
               lifecycle_(other.lifecycle_) {
             other.data_ = nullptr;
             other.size_ = 0;
             other.capacity_ = 0;
+            other.dirty_count_ = 0;
+            other.tombstone_count_ = 0;
         }
 
         TypeErasedStorage& operator=(TypeErasedStorage&& other) noexcept {
@@ -845,14 +853,19 @@ private:
                 sparse_ = std::move(other.sparse_);
                 dirty_ = std::move(other.dirty_);
                 tombstones_ = std::move(other.tombstones_);
+                tombstone_indices_ = std::move(other.tombstone_indices_);
                 data_ = other.data_;
                 size_ = other.size_;
                 capacity_ = other.capacity_;
+                dirty_count_ = other.dirty_count_;
+                tombstone_count_ = other.tombstone_count_;
                 info_ = other.info_;
                 lifecycle_ = other.lifecycle_;
                 other.data_ = nullptr;
                 other.size_ = 0;
                 other.capacity_ = 0;
+                other.dirty_count_ = 0;
+                other.tombstone_count_ = 0;
             }
 
             return *this;
@@ -871,7 +884,7 @@ private:
             validate_type<T>();
 
             if (void* existing = get(index)) {
-                dirty_[sparse_[index]] = 1;
+                mark_dirty_dense(sparse_[index]);
 
                 if constexpr (std::is_trivially_copyable<T>::value) {
                     T replacement(std::forward<Args>(args)...);
@@ -886,12 +899,13 @@ private:
             }
 
             ensure_sparse(index);
-            tombstones_[index] = no_tombstone;
+            clear_tombstone(index);
             ensure_capacity(size_ + 1);
 
             const std::uint32_t dense = static_cast<std::uint32_t>(size_);
             dense_indices_.push_back(index);
             dirty_.push_back(1);
+            ++dirty_count_;
             sparse_[index] = dense;
             void* target = data_ + size_ * info_.size;
             new (target) T(std::forward<Args>(args)...);
@@ -906,16 +920,17 @@ private:
             }
 
             if (contains(index)) {
-                dirty_[sparse_[index]] = 1;
+                mark_dirty_dense(sparse_[index]);
                 return;
             }
 
             ensure_sparse(index);
-            tombstones_[index] = no_tombstone;
+            clear_tombstone(index);
 
             const std::uint32_t dense = static_cast<std::uint32_t>(size_);
             dense_indices_.push_back(index);
             dirty_.push_back(1);
+            ++dirty_count_;
             sparse_[index] = dense;
             ++size_;
         }
@@ -929,18 +944,19 @@ private:
             }
 
             if (void* existing = get(index)) {
-                dirty_[sparse_[index]] = 1;
+                mark_dirty_dense(sparse_[index]);
                 assign_bytes(existing, value);
                 return existing;
             }
 
             ensure_sparse(index);
-            tombstones_[index] = no_tombstone;
+            clear_tombstone(index);
             ensure_capacity(size_ + 1);
 
             const std::uint32_t dense = static_cast<std::uint32_t>(size_);
             dense_indices_.push_back(index);
             dirty_.push_back(1);
+            ++dirty_count_;
             sparse_[index] = dense;
             void* target = data_ + size_ * info_.size;
             assign_bytes(target, value);
@@ -954,18 +970,19 @@ private:
                 return;
             }
             if (void* existing = get(index)) {
-                dirty_[sparse_[index]] = 1;
+                mark_dirty_dense(sparse_[index]);
                 replace_copy(existing, value);
                 return;
             }
 
             ensure_sparse(index);
-            tombstones_[index] = no_tombstone;
+            clear_tombstone(index);
             ensure_capacity(size_ + 1);
 
             const std::uint32_t dense = static_cast<std::uint32_t>(size_);
             dense_indices_.push_back(index);
             dirty_.push_back(1);
+            ++dirty_count_;
             sparse_[index] = dense;
             construct_copy(data_ + size_ * info_.size, value);
             ++size_;
@@ -1033,7 +1050,7 @@ private:
             }
 
             const std::uint32_t dense = sparse_[index];
-            dirty_[dense] = 1;
+            mark_dirty_dense(dense);
             if (info_.tag) {
                 return nullptr;
             }
@@ -1050,20 +1067,20 @@ private:
             assert(!info_.tag);
             assert(contains(index));
             const std::uint32_t dense = sparse_[index];
-            dirty_[dense] = 1;
+            mark_dirty_dense(dense);
             return data_ + dense * info_.size;
         }
 
         bool clear_dirty(std::uint32_t index) {
             if (!contains(index)) {
                 if (has_tombstone(index)) {
-                    tombstones_[index] = no_tombstone;
+                    clear_tombstone(index);
                     return true;
                 }
                 return false;
             }
 
-            dirty_[sparse_[index]] = 0;
+            clear_dirty_dense(sparse_[index]);
             return true;
         }
 
@@ -1078,6 +1095,9 @@ private:
         void clear_all_dirty() {
             std::fill(dirty_.begin(), dirty_.end(), 0);
             std::fill(tombstones_.begin(), tombstones_.end(), no_tombstone);
+            tombstone_indices_.clear();
+            dirty_count_ = 0;
+            tombstone_count_ = 0;
         }
 
         std::size_t dense_size() const noexcept {
@@ -1097,17 +1117,7 @@ private:
         }
 
         bool has_dirty_entries() const {
-            for (unsigned char dirty : dirty_) {
-                if (dirty != 0) {
-                    return true;
-                }
-            }
-            for (unsigned char tombstone : tombstones_) {
-                if (tombstone != no_tombstone) {
-                    return true;
-                }
-            }
-            return false;
+            return dirty_count_ != 0 || tombstone_count_ != 0;
         }
 
         bool has_destroy_tombstone(std::uint32_t index) const {
@@ -1115,7 +1125,15 @@ private:
         }
 
         std::size_t tombstone_size() const noexcept {
-            return tombstones_.size();
+            return tombstone_count_ == 0 ? 0 : tombstones_.size();
+        }
+
+        std::size_t tombstone_entry_count() const noexcept {
+            return tombstone_indices_.size();
+        }
+
+        std::uint32_t tombstone_index_at(std::size_t position) const {
+            return tombstone_indices_[position];
         }
 
         bool has_dirty_tombstone_at(std::uint32_t index) const {
@@ -1192,13 +1210,13 @@ private:
 
         std::unique_ptr<TypeErasedStorage> clone_excluding(const std::vector<bool>& excluded) const {
             auto copy = clone_filtered(excluded, false);
-            copy->copy_tombstones_excluding(tombstones_, excluded);
+            copy->copy_tombstones_excluding(tombstones_, tombstone_indices_, tombstone_count_, excluded);
             return copy;
         }
 
         std::unique_ptr<TypeErasedStorage> clone_dirty_excluding(const std::vector<bool>& excluded) const {
             auto copy = clone_filtered(excluded, true);
-            copy->copy_tombstones_excluding(tombstones_, excluded);
+            copy->copy_tombstones_excluding(tombstones_, tombstone_indices_, tombstone_count_, excluded);
             return copy;
         }
 
@@ -1286,6 +1304,8 @@ private:
         void ensure_sparse(std::uint32_t index) {
             if (index >= sparse_.size()) {
                 sparse_.resize(static_cast<std::size_t>(index) + 1, npos);
+            }
+            if (index >= tombstones_.size()) {
                 tombstones_.resize(static_cast<std::size_t>(index) + 1, no_tombstone);
             }
         }
@@ -1344,6 +1364,7 @@ private:
         void erase_at(std::uint32_t dense) {
             const std::uint32_t removed_index = dense_indices_[dense];
             const std::uint32_t last_dense = static_cast<std::uint32_t>(size_ - 1);
+            clear_dirty_dense(dense);
 
             if (dense != last_dense) {
                 const std::uint32_t moved_index = dense_indices_[last_dense];
@@ -1386,15 +1407,54 @@ private:
             dirty_.clear();
             std::fill(sparse_.begin(), sparse_.end(), npos);
             std::fill(tombstones_.begin(), tombstones_.end(), no_tombstone);
+            tombstone_indices_.clear();
+            dirty_count_ = 0;
+            tombstone_count_ = 0;
         }
 
         void mark_tombstone(std::uint32_t index, unsigned char flags) {
             ensure_sparse(index);
+            if (tombstones_[index] == no_tombstone && flags != no_tombstone) {
+                ++tombstone_count_;
+                tombstone_indices_.push_back(index);
+            } else if (tombstones_[index] != no_tombstone && flags == no_tombstone) {
+                --tombstone_count_;
+                erase_tombstone_index(index);
+            }
             tombstones_[index] = flags;
+        }
+
+        void clear_tombstone(std::uint32_t index) {
+            if (index < tombstones_.size() && tombstones_[index] != no_tombstone) {
+                tombstones_[index] = no_tombstone;
+                erase_tombstone_index(index);
+                --tombstone_count_;
+            }
         }
 
         bool has_tombstone(std::uint32_t index) const {
             return index < tombstones_.size() && tombstones_[index] != no_tombstone;
+        }
+
+        void mark_dirty_dense(std::uint32_t dense) {
+            if (dirty_[dense] == 0) {
+                ++dirty_count_;
+                dirty_[dense] = 1;
+            }
+        }
+
+        void clear_dirty_dense(std::uint32_t dense) {
+            if (dirty_[dense] != 0) {
+                dirty_[dense] = 0;
+                --dirty_count_;
+            }
+        }
+
+        void erase_tombstone_index(std::uint32_t index) {
+            const auto found = std::find(tombstone_indices_.begin(), tombstone_indices_.end(), index);
+            if (found != tombstone_indices_.end()) {
+                tombstone_indices_.erase(found);
+            }
         }
 
         std::unique_ptr<TypeErasedStorage> clone_filtered(
@@ -1415,7 +1475,9 @@ private:
                 }
 
                 copy->emplace_or_replace_copy(index, get(index));
-                copy->dirty_[copy->sparse_[index]] = dirty_[dense];
+                if (dirty_[dense] == 0) {
+                    copy->clear_dirty_dense(copy->sparse_[index]);
+                }
             }
             return copy;
         }
@@ -1448,6 +1510,9 @@ private:
                 const std::uint32_t next_dense = static_cast<std::uint32_t>(copy->dense_indices_.size());
                 copy->dense_indices_.push_back(index);
                 copy->dirty_.push_back(dirty_[dense]);
+                if (dirty_[dense] != 0) {
+                    ++copy->dirty_count_;
+                }
                 copy->sparse_[index] = next_dense;
             }
 
@@ -1470,12 +1535,36 @@ private:
 
         void copy_tombstones_excluding(
             const std::vector<unsigned char>& tombstones,
+            const std::vector<std::uint32_t>& tombstone_indices,
+            std::size_t tombstone_count,
             const std::vector<bool>& excluded) {
+            if (tombstone_count == 0) {
+                tombstones_.clear();
+                tombstone_indices_.clear();
+                tombstone_count_ = 0;
+                return;
+            }
+
             tombstones_ = tombstones;
-            for (std::size_t index = 0; index < tombstones_.size() && index < excluded.size(); ++index) {
-                if (excluded[index]) {
-                    tombstones_[index] = no_tombstone;
+            tombstone_indices_.clear();
+            if (excluded.empty()) {
+                tombstone_indices_ = tombstone_indices;
+                tombstone_count_ = tombstone_count;
+                return;
+            }
+
+            tombstone_indices_.reserve(tombstone_indices.size());
+            tombstone_count_ = 0;
+            for (std::uint32_t index : tombstone_indices) {
+                if (index >= tombstones_.size() || tombstones_[index] == no_tombstone) {
+                    continue;
                 }
+                if (index < excluded.size() && excluded[index]) {
+                    tombstones_[index] = no_tombstone;
+                    continue;
+                }
+                tombstone_indices_.push_back(index);
+                ++tombstone_count_;
             }
         }
 
@@ -1525,9 +1614,12 @@ private:
         std::vector<std::uint32_t> sparse_;
         std::vector<unsigned char> dirty_;
         std::vector<unsigned char> tombstones_;
+        std::vector<std::uint32_t> tombstone_indices_;
         unsigned char* data_ = nullptr;
         std::size_t size_ = 0;
         std::size_t capacity_ = 0;
+        std::size_t dirty_count_ = 0;
+        std::size_t tombstone_count_ = 0;
         ComponentInfo info_;
         ComponentLifecycle lifecycle_;
 
@@ -2181,15 +2273,30 @@ private:
     }
 
     std::vector<bool> make_snapshot_exclusion_mask() const {
-        std::vector<bool> excluded(entities_.size(), false);
-        for (std::uint32_t index = 0; index < excluded.size(); ++index) {
-            excluded[index] = is_snapshot_excluded_index(index);
+        std::vector<bool> excluded;
+        const TypeErasedStorage* system_storage = system_tag_ ? find_storage(system_tag_) : nullptr;
+        if (system_storage == nullptr) {
+            return excluded;
+        }
+
+        for (std::size_t dense = 0; dense < system_storage->dense_size(); ++dense) {
+            const std::uint32_t index = system_storage->dense_index_at(dense);
+            if (index >= entities_.size() || components_.find(index) != components_.end()) {
+                continue;
+            }
+            if (excluded.empty()) {
+                excluded.resize(entities_.size(), false);
+            }
+            excluded[index] = true;
         }
         return excluded;
     }
 
     std::vector<std::uint64_t> make_snapshot_entities(const std::vector<bool>& excluded) const {
         std::vector<std::uint64_t> entities = entities_;
+        if (excluded.empty()) {
+            return entities;
+        }
         for (std::size_t index = 0; index < entities.size() && index < excluded.size(); ++index) {
             if (excluded[index]) {
                 entities[index] = 0;
@@ -2380,6 +2487,7 @@ private:
     std::uint32_t free_head_ = invalid_index;
     std::unordered_map<std::uint32_t, ComponentRecord> components_;
     std::unordered_map<std::uint32_t, std::unique_ptr<TypeErasedStorage>> storages_;
+    bool has_entities_ = true;
     std::uint64_t baseline_token_ = 0;
     std::uint64_t state_token_ = 0;
 };
@@ -2416,8 +2524,14 @@ inline Registry::Snapshot Registry::snapshot() const {
 inline Registry::DeltaSnapshot Registry::delta_snapshot(const Snapshot& baseline) const {
     DeltaSnapshot result;
     const std::vector<bool> excluded = make_snapshot_exclusion_mask();
-    result.entities_ = make_snapshot_entities(excluded);
-    result.free_head_ = rebuild_free_list(result.entities_);
+    if ((excluded.empty() && entities_ == baseline.entities_) ||
+        (!excluded.empty() && make_snapshot_entities(excluded) == baseline.entities_)) {
+        result.has_entities_ = false;
+        result.free_head_ = baseline.free_head_;
+    } else {
+        result.entities_ = make_snapshot_entities(excluded);
+        result.free_head_ = rebuild_free_list(result.entities_);
+    }
     result.baseline_token_ = baseline.state_token_;
     result.state_token_ = next_state_token();
 
@@ -2446,8 +2560,15 @@ inline Registry::DeltaSnapshot Registry::delta_snapshot(const Snapshot& baseline
 inline Registry::DeltaSnapshot Registry::delta_snapshot(const DeltaSnapshot& baseline) const {
     DeltaSnapshot result;
     const std::vector<bool> excluded = make_snapshot_exclusion_mask();
-    result.entities_ = make_snapshot_entities(excluded);
-    result.free_head_ = rebuild_free_list(result.entities_);
+    if (baseline.has_entities_ &&
+        ((excluded.empty() && entities_ == baseline.entities_) ||
+         (!excluded.empty() && make_snapshot_entities(excluded) == baseline.entities_))) {
+        result.has_entities_ = false;
+        result.free_head_ = baseline.free_head_;
+    } else {
+        result.entities_ = make_snapshot_entities(excluded);
+        result.free_head_ = rebuild_free_list(result.entities_);
+    }
     result.baseline_token_ = baseline.state_token_;
     result.state_token_ = next_state_token();
 
@@ -2529,16 +2650,18 @@ inline void Registry::restore(const DeltaSnapshot& snapshot) {
         }
     }
 
-    std::vector<std::uint64_t> entities = snapshot.entities_;
-    merge_current_system_entities(entities);
-    entities_ = std::move(entities);
-    free_head_ = rebuild_free_list(entities_);
+    if (snapshot.has_entities_) {
+        std::vector<std::uint64_t> entities = snapshot.entities_;
+        merge_current_system_entities(entities);
+        entities_ = std::move(entities);
+        free_head_ = rebuild_free_list(entities_);
+    }
 
     std::vector<std::uint32_t> destroyed_indices;
     for (const auto& storage : snapshot.storages_) {
         const TypeErasedStorage& delta_storage = *storage.second;
-        for (std::size_t index = 0; index < delta_storage.tombstone_size(); ++index) {
-            const std::uint32_t entity_index = static_cast<std::uint32_t>(index);
+        for (std::size_t tombstone = 0; tombstone < delta_storage.tombstone_entry_count(); ++tombstone) {
+            const std::uint32_t entity_index = delta_storage.tombstone_index_at(tombstone);
             if (delta_storage.has_destroy_tombstone(entity_index) &&
                 std::find(destroyed_indices.begin(), destroyed_indices.end(), entity_index) == destroyed_indices.end()) {
                 destroyed_indices.push_back(entity_index);
@@ -2557,12 +2680,16 @@ inline void Registry::restore(const DeltaSnapshot& snapshot) {
 
     for (const auto& storage : snapshot.storages_) {
         const std::uint32_t component_index = storage.first;
-        const Entity component{entities_.at(component_index)};
+        const auto found_component = components_.find(component_index);
+        if (found_component == components_.end()) {
+            throw std::logic_error("ecs delta snapshot component is not registered");
+        }
+        const Entity component = found_component->second.entity;
         const TypeErasedStorage& delta_storage = *storage.second;
         TypeErasedStorage* target_storage = find_storage(component);
 
-        for (std::size_t index = 0; index < delta_storage.tombstone_size(); ++index) {
-            const std::uint32_t entity_index = static_cast<std::uint32_t>(index);
+        for (std::size_t tombstone = 0; tombstone < delta_storage.tombstone_entry_count(); ++tombstone) {
+            const std::uint32_t entity_index = delta_storage.tombstone_index_at(tombstone);
             if (!delta_storage.has_dirty_tombstone_at(entity_index) ||
                 delta_storage.has_destroy_tombstone(entity_index)) {
                 continue;
