@@ -28,6 +28,10 @@ struct Health {
     int value = 0;
 };
 
+struct Active {};
+
+struct Disabled {};
+
 struct GameTime {
     int tick = 0;
 };
@@ -112,6 +116,26 @@ struct HasViewWrite<
     View,
     T,
     std::void_t<decltype(std::declval<View&>().template write<T>(std::declval<ecs::Entity>()))>>
+    : std::true_type {};
+
+template <typename View, typename T, typename = void>
+struct HasViewTagAdd : std::false_type {};
+
+template <typename View, typename T>
+struct HasViewTagAdd<
+    View,
+    T,
+    std::void_t<decltype(std::declval<View&>().template add_tag<T>(std::declval<ecs::Entity>()))>>
+    : std::true_type {};
+
+template <typename View, typename T, typename = void>
+struct HasViewTagRemove : std::false_type {};
+
+template <typename View, typename T>
+struct HasViewTagRemove<
+    View,
+    T,
+    std::void_t<decltype(std::declval<View&>().template remove_tag<T>(std::declval<ecs::Entity>()))>>
     : std::true_type {};
 
 template <typename Registry, typename T, typename = void>
@@ -264,6 +288,57 @@ TEST_CASE("component registration validates descriptors and duplicate names") {
 
     REQUIRE_THROWS_AS(registry.register_component<Tracker>("Position"), std::logic_error);
     REQUIRE_THROWS_AS(registry.register_component<GameTime>("Position"), std::logic_error);
+}
+
+TEST_CASE("empty typed components are presence-only tags") {
+    ecs::Registry registry;
+    const ecs::Entity active_tag = registry.register_component<Active>("Active");
+
+    REQUIRE(registry.component<Active>() == active_tag);
+    REQUIRE(registry.component_info(active_tag)->size == 0);
+    REQUIRE(registry.component_info(active_tag)->alignment == alignof(Active));
+    REQUIRE(registry.component_info(active_tag)->tag);
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Active>(entity));
+    REQUIRE(registry.has<Active>(entity));
+    REQUIRE(registry.has(entity, active_tag));
+    REQUIRE(registry.is_dirty<Active>(entity));
+    REQUIRE(registry.debug_print(entity, active_tag) == "Active{}");
+
+    REQUIRE(registry.clear_dirty<Active>(entity));
+    REQUIRE_FALSE(registry.is_dirty<Active>(entity));
+    REQUIRE(registry.remove<Active>(entity));
+    REQUIRE_FALSE(registry.has<Active>(entity));
+    REQUIRE(registry.is_dirty<Active>(entity));
+    REQUIRE(registry.debug_print(entity, active_tag) == "<missing>");
+
+    REQUIRE_THROWS_AS(registry.get(entity, active_tag), std::logic_error);
+    REQUIRE_THROWS_AS(registry.write(entity, active_tag), std::logic_error);
+    REQUIRE_THROWS_AS(registry.ensure(entity, active_tag), std::logic_error);
+}
+
+TEST_CASE("runtime tags can be registered added checked and removed") {
+    ecs::Registry registry;
+    const ecs::Entity visible = registry.register_tag("Visible");
+    const ecs::Entity entity = registry.create();
+
+    REQUIRE(registry.component_info(visible)->size == 0);
+    REQUIRE(registry.component_info(visible)->alignment == 1);
+    REQUIRE(registry.component_info(visible)->tag);
+    REQUIRE(registry.register_tag("Visible") == visible);
+
+    REQUIRE(registry.add_tag(entity, visible));
+    REQUIRE(registry.has(entity, visible));
+    REQUIRE(registry.remove_tag(entity, visible));
+    REQUIRE_FALSE(registry.has(entity, visible));
+
+    ecs::ComponentDesc desc;
+    desc.name = "Visible";
+    desc.size = sizeof(Position);
+    desc.alignment = alignof(Position);
+    REQUIRE_THROWS_AS(registry.register_component(std::move(desc)), std::logic_error);
+    REQUIRE_THROWS_AS(registry.add(entity, visible), std::logic_error);
 }
 
 TEST_CASE("trivial components can be added, read, written, replaced, and removed") {
@@ -488,6 +563,129 @@ TEST_CASE("views iterate entities that contain every requested component") {
     REQUIRE(visited[1] == both_b);
     REQUIRE(registry.get<Velocity>(both_a)->dy == 5.0f);
     REQUIRE(registry.get<Velocity>(both_b)->dy == 9.0f);
+}
+
+TEST_CASE("views filter on included and excluded typed tags") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Active>("Active");
+    registry.register_component<Disabled>("Disabled");
+
+    const ecs::Entity active = registry.create();
+    const ecs::Entity inactive = registry.create();
+    const ecs::Entity disabled = registry.create();
+
+    REQUIRE(registry.add<Position>(active, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Position>(inactive, Position{2, 0}) != nullptr);
+    REQUIRE(registry.add<Position>(disabled, Position{3, 0}) != nullptr);
+    REQUIRE(registry.add<Active>(active));
+    REQUIRE(registry.add<Active>(disabled));
+    REQUIRE(registry.add<Disabled>(disabled));
+
+    std::vector<ecs::Entity> visited;
+    registry.view<const Position>()
+        .with_tags<const Active>()
+        .without_tags<const Disabled>()
+        .each([&](ecs::Entity entity, const Position& position) {
+            visited.push_back(entity);
+            REQUIRE(position.x == 1);
+        });
+
+    REQUIRE(visited == std::vector<ecs::Entity>{active});
+}
+
+TEST_CASE("tag filter constness controls view-level tag mutation") {
+    using MutableView = decltype(std::declval<ecs::Registry::View<Position>&>().template with_tags<Active>());
+    using ConstView = decltype(std::declval<ecs::Registry::View<Position>&>().template with_tags<const Active>());
+    using MutableWithoutView =
+        decltype(std::declval<ecs::Registry::View<Position>&>().template without_tags<Disabled>());
+
+    static_assert(HasViewTagAdd<MutableView, Active>::value, "non-const with tag can be added");
+    static_assert(HasViewTagRemove<MutableView, Active>::value, "non-const with tag can be removed");
+    static_assert(!HasViewTagAdd<ConstView, Active>::value, "const with tag cannot be added");
+    static_assert(!HasViewTagRemove<ConstView, Active>::value, "const with tag cannot be removed");
+    static_assert(HasViewTagAdd<MutableWithoutView, Disabled>::value, "non-const without tag can be added");
+
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Active>("Active");
+    registry.register_component<Disabled>("Disabled");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Active>(entity));
+
+    int calls = 0;
+    registry.view<Position>().with_tags<Active>().each([&](auto& view, ecs::Entity current, Position&) {
+        REQUIRE(current == entity);
+        REQUIRE(view.template has_tag<Active>(current));
+        REQUIRE(view.template remove_tag<Active>(current));
+        ++calls;
+    });
+
+    REQUIRE(calls == 1);
+    REQUIRE_FALSE(registry.has<Active>(entity));
+}
+
+TEST_CASE("runtime tag filters support mutable and readonly view access") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    const ecs::Entity selected_tag = registry.register_tag("Selected");
+    const ecs::Entity hidden_tag = registry.register_tag("Hidden");
+
+    const ecs::Entity selected = registry.create();
+    const ecs::Entity hidden = registry.create();
+    REQUIRE(registry.add<Position>(selected, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Position>(hidden, Position{2, 0}) != nullptr);
+    REQUIRE(registry.add_tag(selected, selected_tag));
+    REQUIRE(registry.add_tag(hidden, selected_tag));
+    REQUIRE(registry.add_tag(hidden, hidden_tag));
+
+    std::vector<ecs::Entity> readonly;
+    auto readonly_view = registry.view<const Position>().with_tags({selected_tag}).without_tags({hidden_tag});
+    readonly_view.each([&](auto& view, ecs::Entity entity, const Position&) {
+        REQUIRE(view.has_tag(entity, selected_tag));
+        readonly.push_back(entity);
+    });
+    REQUIRE(readonly == std::vector<ecs::Entity>{selected});
+    REQUIRE_THROWS_AS(readonly_view.remove_tag(selected, selected_tag), std::logic_error);
+
+    auto mutable_view = registry.view<Position>().with_mutable_tags({selected_tag});
+    int calls = 0;
+    mutable_view.each([&](auto& view, ecs::Entity entity, Position&) {
+        REQUIRE(view.remove_tag(entity, selected_tag));
+        ++calls;
+    });
+
+    REQUIRE(calls == 2);
+    REQUIRE_FALSE(registry.has(selected, selected_tag));
+    REQUIRE_FALSE(registry.has(hidden, selected_tag));
+}
+
+TEST_CASE("access views preserve access components while filtering tags") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+    registry.register_component<Active>("Active");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(entity, Velocity{2.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Active>(entity));
+
+    int calls = 0;
+    registry.view<const Position>()
+        .access<Velocity>()
+        .with_tags<const Active>()
+        .each([&](auto& view, ecs::Entity current, const Position& position) {
+            Velocity* velocity = view.template write<Velocity>(current);
+            REQUIRE(velocity != nullptr);
+            velocity->dx += static_cast<float>(position.x);
+            ++calls;
+        });
+
+    REQUIRE(calls == 1);
+    REQUIRE(registry.get<Velocity>(entity)->dx == 3.0f);
 }
 
 TEST_CASE("views expose gated get and write access for listed components") {
@@ -1647,6 +1845,25 @@ TEST_CASE("registry snapshots restore entities components metadata groups single
     REQUIRE(reused_after_restore == reused_after_snapshot);
 }
 
+TEST_CASE("registry snapshots restore tag presence and dirty bits") {
+    ecs::Registry registry;
+    const ecs::Entity active_tag = registry.register_component<Active>("Active");
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Active>(entity));
+    REQUIRE(registry.clear_dirty<Active>(entity));
+
+    auto snapshot = registry.snapshot();
+
+    REQUIRE(registry.remove<Active>(entity));
+    REQUIRE_FALSE(registry.has<Active>(entity));
+
+    registry.restore(snapshot);
+
+    REQUIRE(registry.component<Active>() == active_tag);
+    REQUIRE(registry.has<Active>(entity));
+    REQUIRE_FALSE(registry.is_dirty<Active>(entity));
+}
+
 TEST_CASE("registry snapshots deep copy copyable non-trivial component storage") {
     ecs::Registry registry;
     registry.register_component<CopyableName>("CopyableName");
@@ -1760,6 +1977,43 @@ TEST_CASE("delta snapshots restore dirty values additions removals and destroyed
     REQUIRE(std::find(grouped.begin(), grouped.end(), updated) != grouped.end());
     REQUIRE(std::find(grouped.begin(), grouped.end(), added) != grouped.end());
     REQUIRE(std::find(grouped.begin(), grouped.end(), removed_component) == grouped.end());
+}
+
+TEST_CASE("delta snapshots restore tag additions and removals") {
+    ecs::Registry source;
+    source.register_component<Position>("Position");
+    source.register_component<Active>("Active");
+
+    const ecs::Entity kept = source.create();
+    const ecs::Entity removed = source.create();
+    REQUIRE(source.add<Position>(kept, Position{1, 0}) != nullptr);
+    REQUIRE(source.add<Position>(removed, Position{2, 0}) != nullptr);
+    REQUIRE(source.add<Active>(removed));
+    source.clear_all_dirty<Active>();
+    source.clear_all_dirty<Position>();
+
+    auto baseline = source.snapshot();
+    ecs::Registry replay;
+    replay.register_component<Position>("Position");
+    replay.register_component<Active>("Active");
+    replay.restore(baseline);
+
+    REQUIRE(source.add<Active>(kept));
+    REQUIRE(source.remove<Active>(removed));
+
+    auto delta = source.delta_snapshot(baseline);
+    replay.restore(delta);
+
+    REQUIRE(replay.has<Active>(kept));
+    REQUIRE_FALSE(replay.has<Active>(removed));
+    REQUIRE(replay.is_dirty<Active>(kept));
+    REQUIRE(replay.is_dirty<Active>(removed));
+
+    std::vector<ecs::Entity> active_entities;
+    replay.view<const Position>().with_tags<const Active>().each([&](ecs::Entity entity, const Position&) {
+        active_entities.push_back(entity);
+    });
+    REQUIRE(active_entities == std::vector<ecs::Entity>{kept});
 }
 
 TEST_CASE("delta snapshots restore singleton dirty values") {

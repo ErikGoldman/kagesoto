@@ -32,11 +32,25 @@ namespace detail {
 template <typename... Components>
 struct type_list {};
 
+template <typename Left, typename Right>
+struct type_list_concat;
+
+template <typename... Left, typename... Right>
+struct type_list_concat<type_list<Left...>, type_list<Right...>> {
+    using type = type_list<Left..., Right...>;
+};
+
 template <typename T>
 using component_query_t = typename std::remove_cv<typename std::remove_reference<T>::type>::type;
 
 template <typename T>
 struct is_singleton_query : is_singleton_component<component_query_t<T>> {};
+
+template <typename T>
+struct is_tag_query
+    : std::integral_constant<
+          bool,
+          std::is_empty<component_query_t<T>>::value && !is_singleton_query<T>::value> {};
 
 template <typename... Components>
 struct contains_non_singleton_component;
@@ -144,6 +158,7 @@ struct ComponentInfo {
     std::size_t size = 0;
     std::size_t alignment = 1;
     bool trivially_copyable = true;
+    bool tag = false;
 };
 
 struct ComponentField {
@@ -179,6 +194,9 @@ public:
 
     template <typename IterList, typename... AccessComponents>
     class AccessView;
+
+    template <typename IterList, typename AccessList, typename WithList, typename WithoutList>
+    class TagFilteredView;
 
     template <typename... Components>
     class JobView;
@@ -273,7 +291,7 @@ public:
 
         ComponentDesc desc;
         desc.name = std::move(name);
-        desc.size = sizeof(T);
+        desc.size = detail::is_tag_query<T>::value ? 0 : sizeof(T);
         desc.alignment = alignof(T);
 
         ComponentLifecycle lifecycle;
@@ -289,6 +307,7 @@ public:
             lifecycle,
             std::is_trivially_copyable<T>::value,
             is_singleton_component<T>::value,
+            detail::is_tag_query<T>::value,
             id);
 
         ensure_typed_capacity(id);
@@ -302,7 +321,18 @@ public:
     Entity register_component(ComponentDesc desc) {
         ComponentLifecycle lifecycle;
         lifecycle.trivially_copyable = true;
-        return register_component_impl(std::move(desc), lifecycle, true, false, npos_type_id);
+        return register_component_impl(std::move(desc), lifecycle, true, false, false, npos_type_id);
+    }
+
+    Entity register_tag(std::string name = {}) {
+        ComponentDesc desc;
+        desc.name = std::move(name);
+        desc.size = 0;
+        desc.alignment = 1;
+
+        ComponentLifecycle lifecycle;
+        lifecycle.trivially_copyable = true;
+        return register_component_impl(std::move(desc), lifecycle, true, false, true, npos_type_id);
     }
 
     template <typename T>
@@ -346,7 +376,7 @@ public:
 
     template <
         typename T,
-        typename std::enable_if<!is_singleton_component<T>::value, int>::type = 0,
+        typename std::enable_if<!is_singleton_component<T>::value && !detail::is_tag_query<T>::value, int>::type = 0,
         typename... Args>
     T* add(Entity entity, Args&&... args) {
         const Entity component = registered_component<T>();
@@ -361,8 +391,35 @@ public:
         return value;
     }
 
+    template <typename T, typename std::enable_if<detail::is_tag_query<T>::value, int>::type = 0>
+    bool add(Entity entity) {
+        const Entity component = registered_component<T>();
+        return add_tag(entity, component);
+    }
+
+    bool add_tag(Entity entity, Entity tag) {
+        const ComponentRecord& record = require_component_record(tag);
+        if (!record.info.tag) {
+            throw std::logic_error("ecs component entity is not a tag");
+        }
+        if (!alive(entity)) {
+            return false;
+        }
+
+        storage_for(tag).emplace_or_replace_tag(entity_index(entity));
+        refresh_groups_after_add(entity_index(entity));
+        return true;
+    }
+
+    bool remove_tag(Entity entity, Entity tag) {
+        return remove(entity, tag);
+    }
+
     void* add(Entity entity, Entity component, const void* value = nullptr) {
         const ComponentRecord& record = require_component_record(component);
+        if (record.info.tag) {
+            throw std::logic_error("ecs tags cannot be added as writable components");
+        }
         if (record.singleton) {
             return storage_for(component).emplace_or_replace_bytes(entity_index(singleton_entity()), value);
         }
@@ -377,6 +434,9 @@ public:
 
     void* ensure(Entity entity, Entity component) {
         const ComponentRecord& record = require_component_record(component);
+        if (record.info.tag) {
+            throw std::logic_error("ecs tags cannot be ensured as writable components");
+        }
         if (record.singleton) {
             return storage_for(component).ensure(entity_index(singleton_entity()));
         }
@@ -416,7 +476,7 @@ public:
         return false;
     }
 
-    template <typename T>
+    template <typename T, typename std::enable_if<!detail::is_tag_query<T>::value, int>::type = 0>
     const T* get(Entity entity) const {
         const Entity component = registered_component<T>();
         if constexpr (is_singleton_component<T>::value) {
@@ -433,6 +493,9 @@ public:
 
     const void* get(Entity entity, Entity component) const {
         const ComponentRecord& record = require_component_record(component);
+        if (record.info.tag) {
+            throw std::logic_error("ecs tags cannot be read as components");
+        }
         if (record.singleton) {
             entity = singleton_entity_;
         }
@@ -444,7 +507,7 @@ public:
         return found != nullptr ? found->get(entity_index(entity)) : nullptr;
     }
 
-    template <typename T>
+    template <typename T, typename std::enable_if<!detail::is_tag_query<T>::value, int>::type = 0>
     T* write(Entity entity) {
         const Entity component = registered_component<T>();
         if constexpr (is_singleton_component<T>::value) {
@@ -461,6 +524,9 @@ public:
 
     void* write(Entity entity, Entity component) {
         const ComponentRecord& record = require_component_record(component);
+        if (record.info.tag) {
+            throw std::logic_error("ecs tags cannot be written");
+        }
         if (record.singleton) {
             entity = singleton_entity_;
         }
@@ -470,6 +536,25 @@ public:
 
         auto* found = find_storage(component);
         return found != nullptr ? found->write(entity_index(entity)) : nullptr;
+    }
+
+    template <typename T, typename std::enable_if<detail::is_tag_query<T>::value, int>::type = 0>
+    bool has(Entity entity) const {
+        const Entity component = registered_component<T>();
+        return has(entity, component);
+    }
+
+    bool has(Entity entity, Entity component) const {
+        const ComponentRecord& record = require_component_record(component);
+        if (!record.info.tag) {
+            throw std::logic_error("ecs component entity is not a tag");
+        }
+        if (!alive(entity)) {
+            return false;
+        }
+
+        const auto* found = find_storage(component);
+        return found != nullptr && found->contains_index(entity_index(entity));
     }
 
     template <typename T>
@@ -575,6 +660,9 @@ public:
 
     std::string debug_print(Entity entity, Entity component) const {
         const ComponentRecord& record = require_component_record(component);
+        if (record.info.tag) {
+            return has(entity, component) ? record.name + "{}" : "<missing>";
+        }
         const void* value = get(entity, component);
         if (value == nullptr) {
             return "<missing>";
@@ -710,6 +798,9 @@ private:
 
         template <typename T, typename... Args>
         T* emplace_or_replace(std::uint32_t index, Args&&... args) {
+            if (info_.tag) {
+                throw std::logic_error("ecs tags do not store component values");
+            }
             validate_type<T>();
 
             if (void* existing = get(index)) {
@@ -742,7 +833,30 @@ private:
             return static_cast<T*>(target);
         }
 
+        void emplace_or_replace_tag(std::uint32_t index) {
+            if (!info_.tag) {
+                throw std::logic_error("ecs component storage is not a tag");
+            }
+
+            if (contains(index)) {
+                dirty_[sparse_[index]] = true;
+                return;
+            }
+
+            ensure_sparse(index);
+            tombstones_[index] = no_tombstone;
+
+            const std::uint32_t dense = static_cast<std::uint32_t>(size_);
+            dense_indices_.push_back(index);
+            dirty_.push_back(true);
+            sparse_[index] = dense;
+            ++size_;
+        }
+
         void* emplace_or_replace_bytes(std::uint32_t index, const void* value) {
+            if (info_.tag) {
+                throw std::logic_error("ecs tags do not store component values");
+            }
             if (!info_.trivially_copyable) {
                 throw std::logic_error("runtime byte add requires a trivially copyable component");
             }
@@ -768,6 +882,10 @@ private:
         }
 
         void emplace_or_replace_copy(std::uint32_t index, const void* value) {
+            if (info_.tag) {
+                emplace_or_replace_tag(index);
+                return;
+            }
             if (void* existing = get(index)) {
                 dirty_[sparse_[index]] = true;
                 replace_copy(existing, value);
@@ -787,6 +905,9 @@ private:
         }
 
         void* ensure(std::uint32_t index) {
+            if (info_.tag) {
+                throw std::logic_error("ecs tags do not store component values");
+            }
             if (void* existing = write(index)) {
                 return existing;
             }
@@ -821,12 +942,18 @@ private:
             if (!contains(index)) {
                 return nullptr;
             }
+            if (info_.tag) {
+                return nullptr;
+            }
 
             return data_ + sparse_[index] * info_.size;
         }
 
         const void* get(std::uint32_t index) const {
             if (!contains(index)) {
+                return nullptr;
+            }
+            if (info_.tag) {
                 return nullptr;
             }
 
@@ -840,6 +967,9 @@ private:
 
             const std::uint32_t dense = sparse_[index];
             dirty_[dense] = true;
+            if (info_.tag) {
+                return nullptr;
+            }
             return data_ + dense * info_.size;
         }
 
@@ -919,28 +1049,30 @@ private:
                 throw std::out_of_range("ecs dense storage swap index is out of range");
             }
 
-            unsigned char* lhs_value = data_ + lhs * info_.size;
-            unsigned char* rhs_value = data_ + rhs * info_.size;
+            if (!info_.tag) {
+                unsigned char* lhs_value = data_ + lhs * info_.size;
+                unsigned char* rhs_value = data_ + rhs * info_.size;
 
-            if (info_.trivially_copyable) {
-                std::vector<unsigned char> temp(info_.size);
-                std::memcpy(temp.data(), lhs_value, info_.size);
-                std::memcpy(lhs_value, rhs_value, info_.size);
-                std::memcpy(rhs_value, temp.data(), info_.size);
-            } else {
-                unsigned char* temp = allocate(1, info_);
-                try {
-                    lifecycle_.move_construct(temp, lhs_value);
-                    lifecycle_.destroy(lhs_value);
-                    lifecycle_.move_construct(lhs_value, rhs_value);
-                    lifecycle_.destroy(rhs_value);
-                    lifecycle_.move_construct(rhs_value, temp);
-                    lifecycle_.destroy(temp);
-                } catch (...) {
+                if (info_.trivially_copyable) {
+                    std::vector<unsigned char> temp(info_.size);
+                    std::memcpy(temp.data(), lhs_value, info_.size);
+                    std::memcpy(lhs_value, rhs_value, info_.size);
+                    std::memcpy(rhs_value, temp.data(), info_.size);
+                } else {
+                    unsigned char* temp = allocate(1, info_);
+                    try {
+                        lifecycle_.move_construct(temp, lhs_value);
+                        lifecycle_.destroy(lhs_value);
+                        lifecycle_.move_construct(lhs_value, rhs_value);
+                        lifecycle_.destroy(rhs_value);
+                        lifecycle_.move_construct(rhs_value, temp);
+                        lifecycle_.destroy(temp);
+                    } catch (...) {
+                        deallocate(temp, info_.alignment);
+                        throw;
+                    }
                     deallocate(temp, info_.alignment);
-                    throw;
                 }
-                deallocate(temp, info_.alignment);
             }
 
             const std::uint32_t lhs_index = dense_indices_[lhs];
@@ -986,7 +1118,7 @@ private:
         }
 
         static unsigned char* allocate(std::size_t capacity, const ComponentInfo& info) {
-            if (capacity == 0) {
+            if (capacity == 0 || info.tag) {
                 return nullptr;
             }
 
@@ -1001,6 +1133,9 @@ private:
         }
 
         void assign_bytes(void* target, const void* value) {
+            if (info_.tag) {
+                throw std::logic_error("ecs tags do not store component values");
+            }
             if (value != nullptr) {
                 std::memcpy(target, value, info_.size);
             } else {
@@ -1009,6 +1144,9 @@ private:
         }
 
         void construct_copy(void* target, const void* value) {
+            if (info_.tag) {
+                return;
+            }
             if (info_.trivially_copyable) {
                 std::memcpy(target, value, info_.size);
                 return;
@@ -1020,6 +1158,9 @@ private:
         }
 
         void replace_copy(void* target, const void* value) {
+            if (info_.tag) {
+                return;
+            }
             if (info_.trivially_copyable) {
                 std::memcpy(target, value, info_.size);
                 return;
@@ -1063,6 +1204,10 @@ private:
         }
 
         void ensure_capacity(std::size_t required) {
+            if (info_.tag) {
+                capacity_ = std::max(capacity_, required);
+                return;
+            }
             if (required <= capacity_) {
                 return;
             }
@@ -1103,24 +1248,27 @@ private:
         void erase_at(std::uint32_t dense) {
             const std::uint32_t removed_index = dense_indices_[dense];
             const std::uint32_t last_dense = static_cast<std::uint32_t>(size_ - 1);
-            unsigned char* target = data_ + dense * info_.size;
-            unsigned char* last = data_ + last_dense * info_.size;
 
             if (dense != last_dense) {
                 const std::uint32_t moved_index = dense_indices_[last_dense];
 
-                if (info_.trivially_copyable) {
-                    std::memcpy(target, last, info_.size);
-                } else {
-                    lifecycle_.destroy(target);
-                    lifecycle_.move_construct(target, last);
-                    lifecycle_.destroy(last);
+                if (!info_.tag) {
+                    unsigned char* target = data_ + dense * info_.size;
+                    unsigned char* last = data_ + last_dense * info_.size;
+                    if (info_.trivially_copyable) {
+                        std::memcpy(target, last, info_.size);
+                    } else {
+                        lifecycle_.destroy(target);
+                        lifecycle_.move_construct(target, last);
+                        lifecycle_.destroy(last);
+                    }
                 }
 
                 dense_indices_[dense] = moved_index;
                 dirty_[dense] = dirty_[last_dense];
                 sparse_[moved_index] = dense;
-            } else if (!info_.trivially_copyable) {
+            } else if (!info_.tag && !info_.trivially_copyable) {
+                unsigned char* target = data_ + dense * info_.size;
                 lifecycle_.destroy(target);
             }
 
@@ -1131,7 +1279,7 @@ private:
         }
 
         void clear() noexcept {
-            if (!info_.trivially_copyable) {
+            if (!info_.tag && !info_.trivially_copyable) {
                 for (std::size_t i = 0; i < size_; ++i) {
                     lifecycle_.destroy(data_ + i * info_.size);
                 }
@@ -1156,7 +1304,7 @@ private:
         void copy_from(const TypeErasedStorage& other) {
             size_ = other.size_;
             capacity_ = other.capacity_;
-            if (capacity_ == 0) {
+            if (capacity_ == 0 || info_.tag) {
                 return;
             }
 
@@ -1484,8 +1632,9 @@ private:
         ComponentLifecycle lifecycle,
         bool trivially_copyable,
         bool singleton,
+        bool tag,
         std::size_t typed_id) {
-        if (desc.size == 0) {
+        if (desc.size == 0 && !tag) {
             throw std::invalid_argument("component size must be greater than zero");
         }
         if (desc.alignment == 0) {
@@ -1500,6 +1649,7 @@ private:
                 if (record.info.size != desc.size ||
                     record.info.alignment != desc.alignment ||
                     record.info.trivially_copyable != trivially_copyable ||
+                    record.info.tag != tag ||
                     record.singleton != singleton) {
                     throw std::logic_error("component name is already registered with different metadata");
                 }
@@ -1519,7 +1669,7 @@ private:
         ComponentRecord record;
         record.entity = component;
         record.name = std::move(desc.name);
-        record.info = ComponentInfo{desc.size, desc.alignment, trivially_copyable};
+        record.info = ComponentInfo{desc.size, desc.alignment, trivially_copyable, tag};
         record.fields = std::move(desc.fields);
         record.lifecycle = lifecycle;
         record.type_id = typed_id;
@@ -1600,6 +1750,13 @@ private:
         return found != storages_.end() ? found->second.get() : nullptr;
     }
 
+    void require_tag_component(Entity component) const {
+        const ComponentRecord& record = require_component_record(component);
+        if (!record.info.tag) {
+            throw std::logic_error("ecs component entity is not a tag");
+        }
+    }
+
     void unregister_component_entity(Entity component) {
         ComponentRecord* record = find_component_record(component);
         if (record == nullptr) {
@@ -1663,7 +1820,7 @@ private:
         ComponentLifecycle lifecycle;
         lifecycle.trivially_copyable = true;
 
-        const Entity type = register_component_impl(std::move(desc), lifecycle, true, false, npos_type_id);
+        const Entity type = register_component_impl(std::move(desc), lifecycle, true, false, false, npos_type_id);
         components_[entity_index(type)].primitive = kind;
         return type;
     }
@@ -1871,6 +2028,7 @@ inline void Registry::restore(const DeltaSnapshot& snapshot) {
             current.info.size != captured.info.size ||
             current.info.alignment != captured.info.alignment ||
             current.info.trivially_copyable != captured.info.trivially_copyable ||
+            current.info.tag != captured.info.tag ||
             current.singleton != captured.singleton) {
             throw std::logic_error("ecs delta snapshot component metadata does not match registry");
         }
@@ -1969,6 +2127,58 @@ public:
     template <typename... AccessComponents>
     AccessView<detail::type_list<Components...>, AccessComponents...> access() const {
         return AccessView<detail::type_list<Components...>, AccessComponents...>(*registry_, storages_);
+    }
+
+    template <typename... Tags>
+    TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<Tags...>, detail::type_list<>>
+    with_tags() const {
+        return TagFilteredView<
+            detail::type_list<Components...>,
+            detail::type_list<>,
+            detail::type_list<Tags...>,
+            detail::type_list<>>(*registry_, storages_, std::array<TypeErasedStorage*, 0>{});
+    }
+
+    TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
+    with_tags(std::initializer_list<Entity> tags) const {
+        TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
+            view(*registry_, storages_, std::array<TypeErasedStorage*, 0>{});
+        view.add_runtime_with_tags(tags, false);
+        return view;
+    }
+
+    TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
+    with_mutable_tags(std::initializer_list<Entity> tags) const {
+        TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
+            view(*registry_, storages_, std::array<TypeErasedStorage*, 0>{});
+        view.add_runtime_with_tags(tags, true);
+        return view;
+    }
+
+    template <typename... Tags>
+    TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<Tags...>>
+    without_tags() const {
+        return TagFilteredView<
+            detail::type_list<Components...>,
+            detail::type_list<>,
+            detail::type_list<>,
+            detail::type_list<Tags...>>(*registry_, storages_, std::array<TypeErasedStorage*, 0>{});
+    }
+
+    TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
+    without_tags(std::initializer_list<Entity> tags) const {
+        TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
+            view(*registry_, storages_, std::array<TypeErasedStorage*, 0>{});
+        view.add_runtime_without_tags(tags, false);
+        return view;
+    }
+
+    TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
+    without_mutable_tags(std::initializer_list<Entity> tags) const {
+        TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
+            view(*registry_, storages_, std::array<TypeErasedStorage*, 0>{});
+        view.add_runtime_without_tags(tags, true);
+        return view;
     }
 
     template <typename T, typename std::enable_if<detail::contains_component<T, Components...>::value, int>::type = 0>
@@ -2188,6 +2398,98 @@ public:
         }
     }
 
+    template <typename... Tags>
+    TagFilteredView<
+        detail::type_list<IterComponents...>,
+        detail::type_list<AccessComponents...>,
+        detail::type_list<Tags...>,
+        detail::type_list<>>
+    with_tags() const {
+        return TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<Tags...>,
+            detail::type_list<>>(*registry_, iter_storages_, access_storages_);
+    }
+
+    TagFilteredView<
+        detail::type_list<IterComponents...>,
+        detail::type_list<AccessComponents...>,
+        detail::type_list<>,
+        detail::type_list<>>
+    with_tags(std::initializer_list<Entity> tags) const {
+        TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<>,
+            detail::type_list<>>
+            view(*registry_, iter_storages_, access_storages_);
+        view.add_runtime_with_tags(tags, false);
+        return view;
+    }
+
+    TagFilteredView<
+        detail::type_list<IterComponents...>,
+        detail::type_list<AccessComponents...>,
+        detail::type_list<>,
+        detail::type_list<>>
+    with_mutable_tags(std::initializer_list<Entity> tags) const {
+        TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<>,
+            detail::type_list<>>
+            view(*registry_, iter_storages_, access_storages_);
+        view.add_runtime_with_tags(tags, true);
+        return view;
+    }
+
+    template <typename... Tags>
+    TagFilteredView<
+        detail::type_list<IterComponents...>,
+        detail::type_list<AccessComponents...>,
+        detail::type_list<>,
+        detail::type_list<Tags...>>
+    without_tags() const {
+        return TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<>,
+            detail::type_list<Tags...>>(*registry_, iter_storages_, access_storages_);
+    }
+
+    TagFilteredView<
+        detail::type_list<IterComponents...>,
+        detail::type_list<AccessComponents...>,
+        detail::type_list<>,
+        detail::type_list<>>
+    without_tags(std::initializer_list<Entity> tags) const {
+        TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<>,
+            detail::type_list<>>
+            view(*registry_, iter_storages_, access_storages_);
+        view.add_runtime_without_tags(tags, false);
+        return view;
+    }
+
+    TagFilteredView<
+        detail::type_list<IterComponents...>,
+        detail::type_list<AccessComponents...>,
+        detail::type_list<>,
+        detail::type_list<>>
+    without_mutable_tags(std::initializer_list<Entity> tags) const {
+        TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<>,
+            detail::type_list<>>
+            view(*registry_, iter_storages_, access_storages_);
+        view.add_runtime_without_tags(tags, true);
+        return view;
+    }
+
     template <
         typename T,
         typename std::enable_if<detail::contains_component<T, IterComponents..., AccessComponents...>::value, int>::
@@ -2377,6 +2679,449 @@ private:
     std::array<TypeErasedStorage*, sizeof...(IterComponents)> iter_storages_;
     std::array<TypeErasedStorage*, sizeof...(AccessComponents)> access_storages_;
     GroupRecord* group_ = nullptr;
+};
+
+template <
+    typename... IterComponents,
+    typename... AccessComponents,
+    typename... WithTags,
+    typename... WithoutTags>
+class Registry::TagFilteredView<
+    detail::type_list<IterComponents...>,
+    detail::type_list<AccessComponents...>,
+    detail::type_list<WithTags...>,
+    detail::type_list<WithoutTags...>> {
+    static_assert(sizeof...(IterComponents) > 0, "ecs views require at least one component");
+    static_assert((!detail::is_tag_query<IterComponents>::value && ...), "ecs tags must be view filters");
+    static_assert((!detail::is_tag_query<AccessComponents>::value && ...), "ecs tags cannot be access components");
+    static_assert((detail::is_tag_query<WithTags>::value && ...), "ecs with_tags types must be empty tags");
+    static_assert((detail::is_tag_query<WithoutTags>::value && ...), "ecs without_tags types must be empty tags");
+
+public:
+    TagFilteredView(
+        Registry& registry,
+        std::array<TypeErasedStorage*, sizeof...(IterComponents)> iter_storages,
+        std::array<TypeErasedStorage*, sizeof...(AccessComponents)> access_storages)
+        : registry_(&registry),
+          iter_storages_(iter_storages),
+          access_storages_(access_storages),
+          with_tag_storages_{{resolve_tag_storage<WithTags>(registry)...}},
+          without_tag_storages_{{resolve_tag_storage<WithoutTags>(registry)...}} {}
+
+    void add_runtime_with_tags(std::initializer_list<Entity> tags, bool mutable_access) {
+        append_runtime_tags(tags, runtime_with_tags_, mutable_access);
+    }
+
+    void add_runtime_without_tags(std::initializer_list<Entity> tags, bool mutable_access) {
+        append_runtime_tags(tags, runtime_without_tags_, mutable_access);
+    }
+
+    template <typename... Tags>
+    auto with_tags() const
+        -> TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            typename detail::type_list_concat<detail::type_list<WithTags...>, detail::type_list<Tags...>>::type,
+            detail::type_list<WithoutTags...>> {
+        using NextWith =
+            typename detail::type_list_concat<detail::type_list<WithTags...>, detail::type_list<Tags...>>::type;
+        TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            NextWith,
+            detail::type_list<WithoutTags...>>
+            view(*registry_, iter_storages_, access_storages_);
+        copy_runtime_filters_to(view);
+        return view;
+    }
+
+    auto with_tags(std::initializer_list<Entity> tags) const
+        -> TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<WithTags...>,
+            detail::type_list<WithoutTags...>> {
+        auto view = *this;
+        view.add_runtime_with_tags(tags, false);
+        return view;
+    }
+
+    auto with_mutable_tags(std::initializer_list<Entity> tags) const
+        -> TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<WithTags...>,
+            detail::type_list<WithoutTags...>> {
+        auto view = *this;
+        view.add_runtime_with_tags(tags, true);
+        return view;
+    }
+
+    template <typename... Tags>
+    auto without_tags() const
+        -> TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<WithTags...>,
+            typename detail::type_list_concat<detail::type_list<WithoutTags...>, detail::type_list<Tags...>>::type> {
+        using NextWithout =
+            typename detail::type_list_concat<detail::type_list<WithoutTags...>, detail::type_list<Tags...>>::type;
+        TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<WithTags...>,
+            NextWithout>
+            view(*registry_, iter_storages_, access_storages_);
+        copy_runtime_filters_to(view);
+        return view;
+    }
+
+    auto without_tags(std::initializer_list<Entity> tags) const
+        -> TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<WithTags...>,
+            detail::type_list<WithoutTags...>> {
+        auto view = *this;
+        view.add_runtime_without_tags(tags, false);
+        return view;
+    }
+
+    auto without_mutable_tags(std::initializer_list<Entity> tags) const
+        -> TagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<WithTags...>,
+            detail::type_list<WithoutTags...>> {
+        auto view = *this;
+        view.add_runtime_without_tags(tags, true);
+        return view;
+    }
+
+    template <typename Fn>
+    void each(Fn&& fn) {
+        TypeErasedStorage* driver = driver_storage();
+        if (driver == nullptr) {
+            return;
+        }
+
+        Fn& callback = fn;
+        const std::size_t dense_size = driver->dense_size();
+        for (std::size_t dense = 0; dense < dense_size; ++dense) {
+            const std::uint32_t index = driver->dense_index_at(dense);
+            if (!contains_all(index)) {
+                continue;
+            }
+
+            call_each(callback, Entity{registry_->entities_[index]}, index);
+        }
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<detail::contains_component<T, IterComponents..., AccessComponents...>::value, int>::
+            type = 0>
+    const detail::component_query_t<T>* get(Entity entity) const {
+        std::uint32_t index = entity_index(entity);
+        if constexpr (detail::is_singleton_query<T>::value) {
+            index = entity_index(registry_->singleton_entity_);
+        } else {
+            if (!registry_->alive(entity)) {
+                return nullptr;
+            }
+        }
+
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        if (storage == nullptr) {
+            return nullptr;
+        }
+
+        return static_cast<const detail::component_query_t<T>*>(storage->get(index));
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::is_singleton_query<T>::value &&
+                detail::contains_component<T, IterComponents..., AccessComponents...>::value,
+            int>::type = 0>
+    const detail::component_query_t<T>* get() const {
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        if (storage == nullptr) {
+            return nullptr;
+        }
+
+        return static_cast<const detail::component_query_t<T>*>(storage->get(entity_index(registry_->singleton_entity_)));
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            !std::is_const<typename std::remove_reference<T>::type>::value &&
+                detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
+            int>::type = 0>
+    detail::component_query_t<T>* write(Entity entity) {
+        std::uint32_t index = entity_index(entity);
+        if constexpr (detail::is_singleton_query<T>::value) {
+            index = entity_index(registry_->singleton_entity_);
+        } else {
+            if (!registry_->alive(entity)) {
+                return nullptr;
+            }
+        }
+
+        TypeErasedStorage* storage = storage_for_type<T>();
+        if (storage == nullptr) {
+            return nullptr;
+        }
+
+        return static_cast<detail::component_query_t<T>*>(storage->write(index));
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::is_singleton_query<T>::value &&
+                !std::is_const<typename std::remove_reference<T>::type>::value &&
+                detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
+            int>::type = 0>
+    detail::component_query_t<T>* write() {
+        TypeErasedStorage* storage = storage_for_type<T>();
+        if (storage == nullptr) {
+            return nullptr;
+        }
+
+        return static_cast<detail::component_query_t<T>*>(storage->write(entity_index(registry_->singleton_entity_)));
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::is_tag_query<T>::value && detail::contains_component<T, WithTags..., WithoutTags...>::value,
+            int>::type = 0>
+    bool has_tag(Entity entity) const {
+        return registry_->template has<detail::component_query_t<T>>(entity);
+    }
+
+    bool has_tag(Entity entity, Entity tag) const {
+        return registry_->has(entity, tag);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::is_tag_query<T>::value && detail::contains_mutable_component<T, WithTags..., WithoutTags...>::value,
+            int>::type = 0>
+    bool add_tag(Entity entity) {
+        return registry_->template add<detail::component_query_t<T>>(entity);
+    }
+
+    bool add_tag(Entity entity, Entity tag) {
+        require_mutable_runtime_tag(tag);
+        return registry_->add_tag(entity, tag);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::is_tag_query<T>::value && detail::contains_mutable_component<T, WithTags..., WithoutTags...>::value,
+            int>::type = 0>
+    bool remove_tag(Entity entity) {
+        return registry_->template remove<detail::component_query_t<T>>(entity);
+    }
+
+    bool remove_tag(Entity entity, Entity tag) {
+        require_mutable_runtime_tag(tag);
+        return registry_->remove_tag(entity, tag);
+    }
+
+private:
+    template <typename IterList, typename AccessList, typename WithList, typename WithoutList>
+    friend class Registry::TagFilteredView;
+
+    template <typename T>
+    using component_ref_t = typename std::conditional<
+        std::is_const<typename std::remove_reference<T>::type>::value,
+        const detail::component_query_t<T>&,
+        detail::component_query_t<T>&>::type;
+
+    template <typename T, typename First, typename... Rest>
+    static constexpr std::size_t component_position() {
+        if constexpr (std::is_same<detail::component_query_t<T>, detail::component_query_t<First>>::value) {
+            return 0;
+        } else {
+            return 1 + component_position<T, Rest...>();
+        }
+    }
+
+    template <typename T>
+    static TypeErasedStorage* resolve_tag_storage(Registry& registry) {
+        const Entity tag = registry.registered_component<detail::component_query_t<T>>();
+        registry.require_tag_component(tag);
+        return registry.find_storage(tag);
+    }
+
+    void append_runtime_tags(
+        std::initializer_list<Entity> tags,
+        std::vector<Entity>& target,
+        bool mutable_access) {
+        for (Entity tag : tags) {
+            registry_->require_tag_component(tag);
+            target.push_back(tag);
+            if (mutable_access && std::find(mutable_runtime_tags_.begin(), mutable_runtime_tags_.end(), tag) ==
+                                      mutable_runtime_tags_.end()) {
+                mutable_runtime_tags_.push_back(tag);
+            }
+        }
+    }
+
+    template <typename OtherView>
+    void copy_runtime_filters_to(OtherView& other) const {
+        other.runtime_with_tags_ = runtime_with_tags_;
+        other.runtime_without_tags_ = runtime_without_tags_;
+        other.mutable_runtime_tags_ = mutable_runtime_tags_;
+    }
+
+    TypeErasedStorage* driver_storage() const {
+        TypeErasedStorage* driver = nullptr;
+        constexpr bool singleton_flags[] = {detail::is_singleton_query<IterComponents>::value...};
+        for (std::size_t position = 0; position < iter_storages_.size(); ++position) {
+            TypeErasedStorage* storage = iter_storages_[position];
+            if (singleton_flags[position]) {
+                continue;
+            }
+            if (storage == nullptr) {
+                return nullptr;
+            }
+            if (driver == nullptr || storage->dense_size() < driver->dense_size()) {
+                driver = storage;
+            }
+        }
+
+        for (TypeErasedStorage* storage : with_tag_storages_) {
+            if (storage == nullptr) {
+                return nullptr;
+            }
+            if (driver == nullptr || storage->dense_size() < driver->dense_size()) {
+                driver = storage;
+            }
+        }
+
+        for (Entity tag : runtime_with_tags_) {
+            TypeErasedStorage* storage = registry_->find_storage(tag);
+            if (storage == nullptr) {
+                return nullptr;
+            }
+            if (driver == nullptr || storage->dense_size() < driver->dense_size()) {
+                driver = storage;
+            }
+        }
+
+        return driver;
+    }
+
+    bool contains_all(std::uint32_t index) const {
+        constexpr bool singleton_flags[] = {detail::is_singleton_query<IterComponents>::value...};
+        for (std::size_t position = 0; position < iter_storages_.size(); ++position) {
+            const TypeErasedStorage* storage = iter_storages_[position];
+            if (singleton_flags[position]) {
+                continue;
+            }
+            if (storage == nullptr || !storage->contains_index(index)) {
+                return false;
+            }
+        }
+        for (const TypeErasedStorage* storage : with_tag_storages_) {
+            if (storage == nullptr || !storage->contains_index(index)) {
+                return false;
+            }
+        }
+        for (const TypeErasedStorage* storage : without_tag_storages_) {
+            if (storage != nullptr && storage->contains_index(index)) {
+                return false;
+            }
+        }
+        for (Entity tag : runtime_with_tags_) {
+            const TypeErasedStorage* storage = registry_->find_storage(tag);
+            if (storage == nullptr || !storage->contains_index(index)) {
+                return false;
+            }
+        }
+        for (Entity tag : runtime_without_tags_) {
+            const TypeErasedStorage* storage = registry_->find_storage(tag);
+            if (storage != nullptr && storage->contains_index(index)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    template <typename T>
+    TypeErasedStorage* storage_for_type() {
+        if constexpr (detail::contains_component<T, IterComponents...>::value) {
+            constexpr std::size_t position = component_position<T, IterComponents...>();
+            return iter_storages_[position];
+        } else {
+            static_assert(
+                detail::contains_component<T, AccessComponents...>::value,
+                "component is not part of this ecs view");
+            constexpr std::size_t position = component_position<T, AccessComponents...>();
+            return access_storages_[position];
+        }
+    }
+
+    template <typename T>
+    const TypeErasedStorage* storage_for_type() const {
+        if constexpr (detail::contains_component<T, IterComponents...>::value) {
+            constexpr std::size_t position = component_position<T, IterComponents...>();
+            return iter_storages_[position];
+        } else {
+            static_assert(
+                detail::contains_component<T, AccessComponents...>::value,
+                "component is not part of this ecs view");
+            constexpr std::size_t position = component_position<T, AccessComponents...>();
+            return access_storages_[position];
+        }
+    }
+
+    template <typename Fn>
+    void call_each(Fn& callback, Entity entity, std::uint32_t index) {
+        if constexpr (std::is_invocable<Fn&, TagFilteredView&, Entity, component_ref_t<IterComponents>...>::value) {
+            callback(*this, entity, component_ref<IterComponents>(index)...);
+        } else {
+            callback(entity, component_ref<IterComponents>(index)...);
+        }
+    }
+
+    template <typename T>
+    component_ref_t<T> component_ref(std::uint32_t index) {
+        TypeErasedStorage* storage = storage_for_type<T>();
+        if constexpr (detail::is_singleton_query<T>::value) {
+            index = entity_index(registry_->singleton_entity_);
+        }
+        if constexpr (std::is_const<typename std::remove_reference<T>::type>::value) {
+            return *static_cast<const detail::component_query_t<T>*>(storage->get(index));
+        } else {
+            return *static_cast<detail::component_query_t<T>*>(storage->write(index));
+        }
+    }
+
+    void require_mutable_runtime_tag(Entity tag) const {
+        registry_->require_tag_component(tag);
+        if (std::find(mutable_runtime_tags_.begin(), mutable_runtime_tags_.end(), tag) ==
+            mutable_runtime_tags_.end()) {
+            throw std::logic_error("ecs runtime tag was not added as mutable view access");
+        }
+    }
+
+    Registry* registry_;
+    std::array<TypeErasedStorage*, sizeof...(IterComponents)> iter_storages_;
+    std::array<TypeErasedStorage*, sizeof...(AccessComponents)> access_storages_;
+    std::array<TypeErasedStorage*, sizeof...(WithTags)> with_tag_storages_;
+    std::array<TypeErasedStorage*, sizeof...(WithoutTags)> without_tag_storages_;
+    std::vector<Entity> runtime_with_tags_;
+    std::vector<Entity> runtime_without_tags_;
+    std::vector<Entity> mutable_runtime_tags_;
 };
 
 template <typename... Components>

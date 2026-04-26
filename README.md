@@ -43,6 +43,41 @@ int main() {
 
 Typed methods resolve `T` through a per-registry cached component id instead of hashing `std::type_index` on each call.
 
+## Tags
+
+Empty non-singleton typed components are tags. A tag has no stored value, so it cannot be read or written, but it can be added to or removed from entities and used as a view filter.
+
+```cpp
+struct Active {};
+struct Disabled {};
+
+registry.register_component<Active>("Active");
+registry.register_component<Disabled>("Disabled");
+
+registry.add<Active>(entity);
+
+registry.view<Position>()
+    .with_tags<const Active>()
+    .without_tags<const Disabled>()
+    .each([](ecs::Entity entity, Position& position) {
+        position.x += 1;
+    });
+```
+
+`with_tags<T>()` requires the tag and `without_tags<T>()` excludes it. Constness controls whether the view can mutate that tag: `const Active` is filter-only, while `Active` enables `view.add_tag<Active>(entity)` and `view.remove_tag<Active>(entity)`.
+
+Runtime tags are registered separately:
+
+```cpp
+ecs::Entity selected = registry.register_tag("Selected");
+registry.add_tag(entity, selected);
+
+auto view = registry.view<Position>().with_mutable_tags({selected});
+view.each([&](auto& active_view, ecs::Entity entity, Position&) {
+    active_view.remove_tag(entity, selected);
+});
+```
+
 ## Singleton Components
 
 Typed components can opt into singleton storage by specializing `ecs::is_singleton_component<T>`. Singleton components are compile-time only, must be default-constructible, and are created when the component is registered.
@@ -197,16 +232,22 @@ std::string text = registry.debug_print(entity, position_type);
 - `bool Registry::alive(Entity entity) const`
 - `Entity Registry::register_component<T>(std::string name = {})`
 - `Entity Registry::register_component(ComponentDesc desc)`
+- `Entity Registry::register_tag(std::string name = {})`
 - `Entity Registry::component<T>() const`
 - `const ComponentInfo* Registry::component_info(Entity component) const`
 - `const std::vector<ComponentField>* Registry::component_fields(Entity component) const`
 - `bool Registry::set_component_fields(Entity component, std::vector<ComponentField> fields)`
 - `bool Registry::add_component_field(Entity component, ComponentField field)`
 - `T* Registry::add<T>(Entity entity, Args&&... args)`
+- `bool Registry::add<T>(Entity entity)` (tag components only)
 - `void* Registry::add(Entity entity, Entity component, const void* value = nullptr)`
+- `bool Registry::add_tag(Entity entity, Entity tag)`
 - `void* Registry::ensure(Entity entity, Entity component)`
 - `bool Registry::remove<T>(Entity entity)`
 - `bool Registry::remove(Entity entity, Entity component)`
+- `bool Registry::remove_tag(Entity entity, Entity tag)`
+- `bool Registry::has<T>(Entity entity) const` (tag components only)
+- `bool Registry::has(Entity entity, Entity tag) const`
 - `const T* Registry::get<T>(Entity entity) const`
 - `const T* Registry::get<T>() const` (singleton components only)
 - `const void* Registry::get(Entity entity, Entity component) const`
@@ -232,6 +273,18 @@ std::string text = registry.debug_print(entity, position_type);
 - `void Registry::declare_owned_group<Owned...>()`
 - `void View<Components...>::each(Fn&& callback)`
 - `auto View<Components...>::access<AccessComponents...>() const`
+- `auto View<Components...>::with_tags<Tags...>() const`
+- `auto View<Components...>::without_tags<Tags...>() const`
+- `auto View<Components...>::with_tags(std::initializer_list<Entity> tags) const`
+- `auto View<Components...>::without_tags(std::initializer_list<Entity> tags) const`
+- `auto View<Components...>::with_mutable_tags(std::initializer_list<Entity> tags) const`
+- `auto View<Components...>::without_mutable_tags(std::initializer_list<Entity> tags) const`
+- `bool filtered_view.has_tag<T>(Entity entity) const`
+- `bool filtered_view.add_tag<T>(Entity entity)` (non-const tag filters only)
+- `bool filtered_view.remove_tag<T>(Entity entity)` (non-const tag filters only)
+- `bool filtered_view.has_tag(Entity entity, Entity tag) const`
+- `bool filtered_view.add_tag(Entity entity, Entity tag)` (mutable runtime tag filters only)
+- `bool filtered_view.remove_tag(Entity entity, Entity tag)` (mutable runtime tag filters only)
 - `const T* View<Components...>::get<T>(Entity entity) const`
 - `const T* View<Components...>::get<T>() const` (singleton components only)
 - `T* View<Components...>::write<T>(Entity entity)`
@@ -247,13 +300,13 @@ Each component entity has one sparse set:
 - sparse index: entity index to dense component slot
 - dense entity index list
 - dense dirty bit array
-- dense component storage
+- dense component storage, except tags which store presence only
 
 Trivially copyable components are relocated with `memcpy`. Non-trivially copyable typed components use placement construction, move construction, and explicit destruction.
 
 Component pointers remain valid until that component storage is removed or mutated in a way that reallocates or moves dense storage.
 
-`add<T>()`, runtime `add()`, `ensure()`, and `write()` mark the component dirty because they return writable storage. `get()` is read-only and does not modify dirty state.
+`add<T>()`, runtime `add()`, `ensure()`, and `write()` mark the component dirty because they return writable storage. Tag add/remove marks tag membership dirty. `get()` and `has()` are read-only and do not modify dirty state.
 
 Snapshots capture entity/component world state for later restoration. Delta snapshots validate against a baseline snapshot token, copy current entity slot state, and save only dirty component values plus dirty component-removal tombstones. Trivially copyable component storage is byte-copied, copy-constructible typed components are cloned through their lifecycle hook, and move-only non-trivial component storage rejects snapshot creation when captured. Registered jobs are not part of snapshots.
 
