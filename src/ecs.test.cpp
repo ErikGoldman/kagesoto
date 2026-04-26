@@ -708,6 +708,55 @@ TEST_CASE("runtime tag filters support mutable and readonly view access") {
     REQUIRE_FALSE(registry.has(hidden, selected_tag));
 }
 
+TEST_CASE("runtime tag filters refresh cached storage after view construction") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    const ecs::Entity selected_tag = registry.register_tag("Selected");
+    const ecs::Entity hidden_tag = registry.register_tag("Hidden");
+
+    const ecs::Entity selected = registry.create();
+    const ecs::Entity hidden = registry.create();
+    REQUIRE(registry.add<Position>(selected, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Position>(hidden, Position{2, 0}) != nullptr);
+
+    auto selected_view = registry.view<const Position>().with_tags({selected_tag});
+    auto visible_view = registry.view<const Position>().without_tags({hidden_tag});
+
+    REQUIRE(registry.add_tag(selected, selected_tag));
+    REQUIRE(registry.add_tag(hidden, hidden_tag));
+
+    std::vector<ecs::Entity> selected_entities;
+    selected_view.each([&](ecs::Entity entity, const Position&) {
+        selected_entities.push_back(entity);
+    });
+    REQUIRE(selected_entities == std::vector<ecs::Entity>{selected});
+
+    std::vector<ecs::Entity> visible_entities;
+    visible_view.each([&](ecs::Entity entity, const Position&) {
+        visible_entities.push_back(entity);
+    });
+    REQUIRE(visible_entities == std::vector<ecs::Entity>{selected});
+}
+
+TEST_CASE("mutable runtime tag filters refresh cached storage after view add") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    const ecs::Entity selected_tag = registry.register_tag("Selected");
+
+    const ecs::Entity selected = registry.create();
+    REQUIRE(registry.add<Position>(selected, Position{1, 0}) != nullptr);
+
+    auto mutable_view = registry.view<Position>().with_mutable_tags({selected_tag});
+    REQUIRE(mutable_view.add_tag(selected, selected_tag));
+
+    int calls = 0;
+    mutable_view.each([&](ecs::Entity entity, Position&) {
+        REQUIRE(entity == selected);
+        ++calls;
+    });
+    REQUIRE(calls == 1);
+}
+
 TEST_CASE("access views preserve access components while filtering tags") {
     ecs::Registry registry;
     registry.register_component<Position>("Position");

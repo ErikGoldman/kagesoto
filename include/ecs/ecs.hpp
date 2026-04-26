@@ -3215,11 +3215,11 @@ public:
           without_tag_storages_{{resolve_tag_storage<WithoutTags>(registry)...}} {}
 
     void add_runtime_with_tags(std::initializer_list<Entity> tags, bool mutable_access) {
-        append_runtime_tags(tags, runtime_with_tags_, mutable_access);
+        append_runtime_tags(tags, runtime_with_tags_, runtime_with_tag_storages_, mutable_access);
     }
 
     void add_runtime_without_tags(std::initializer_list<Entity> tags, bool mutable_access) {
-        append_runtime_tags(tags, runtime_without_tags_, mutable_access);
+        append_runtime_tags(tags, runtime_without_tags_, runtime_without_tag_storages_, mutable_access);
     }
 
     template <typename... Tags>
@@ -3306,6 +3306,7 @@ public:
 
     template <typename Fn>
     void each(Fn&& fn) {
+        refresh_runtime_tag_storages();
         TypeErasedStorage* driver = driver_storage();
         if (driver == nullptr) {
             return;
@@ -3440,7 +3441,9 @@ public:
 
     bool add_tag(Entity entity, Entity tag) {
         require_mutable_runtime_tag(tag);
-        return registry_->add_tag(entity, tag);
+        const bool added = registry_->add_tag(entity, tag);
+        refresh_runtime_tag_storages();
+        return added;
     }
 
     template <
@@ -3486,10 +3489,12 @@ private:
     void append_runtime_tags(
         std::initializer_list<Entity> tags,
         std::vector<Entity>& target,
+        std::vector<TypeErasedStorage*>& storage_target,
         bool mutable_access) {
         for (Entity tag : tags) {
             registry_->require_tag_component(tag);
             target.push_back(tag);
+            storage_target.push_back(registry_->find_storage(tag));
             if (mutable_access && std::find(mutable_runtime_tags_.begin(), mutable_runtime_tags_.end(), tag) ==
                                       mutable_runtime_tags_.end()) {
                 mutable_runtime_tags_.push_back(tag);
@@ -3501,7 +3506,23 @@ private:
     void copy_runtime_filters_to(OtherView& other) const {
         other.runtime_with_tags_ = runtime_with_tags_;
         other.runtime_without_tags_ = runtime_without_tags_;
+        other.runtime_with_tag_storages_ = runtime_with_tag_storages_;
+        other.runtime_without_tag_storages_ = runtime_without_tag_storages_;
         other.mutable_runtime_tags_ = mutable_runtime_tags_;
+    }
+
+    void refresh_runtime_tag_storages() {
+        refresh_runtime_tag_storages(runtime_with_tags_, runtime_with_tag_storages_);
+        refresh_runtime_tag_storages(runtime_without_tags_, runtime_without_tag_storages_);
+    }
+
+    void refresh_runtime_tag_storages(
+        const std::vector<Entity>& tags,
+        std::vector<TypeErasedStorage*>& storages) {
+        assert(tags.size() == storages.size());
+        for (std::size_t i = 0; i < tags.size(); ++i) {
+            storages[i] = registry_->find_storage(tags[i]);
+        }
     }
 
     TypeErasedStorage* driver_storage() const {
@@ -3529,8 +3550,7 @@ private:
             }
         }
 
-        for (Entity tag : runtime_with_tags_) {
-            TypeErasedStorage* storage = registry_->find_storage(tag);
+        for (TypeErasedStorage* storage : runtime_with_tag_storages_) {
             if (storage == nullptr) {
                 return nullptr;
             }
@@ -3563,14 +3583,12 @@ private:
                 return false;
             }
         }
-        for (Entity tag : runtime_with_tags_) {
-            const TypeErasedStorage* storage = registry_->find_storage(tag);
+        for (const TypeErasedStorage* storage : runtime_with_tag_storages_) {
             if (storage == nullptr || !storage->contains_index(index)) {
                 return false;
             }
         }
-        for (Entity tag : runtime_without_tags_) {
-            const TypeErasedStorage* storage = registry_->find_storage(tag);
+        for (const TypeErasedStorage* storage : runtime_without_tag_storages_) {
             if (storage != nullptr && storage->contains_index(index)) {
                 return false;
             }
@@ -3643,6 +3661,8 @@ private:
     std::array<TypeErasedStorage*, sizeof...(WithoutTags)> without_tag_storages_;
     std::vector<Entity> runtime_with_tags_;
     std::vector<Entity> runtime_without_tags_;
+    std::vector<TypeErasedStorage*> runtime_with_tag_storages_;
+    std::vector<TypeErasedStorage*> runtime_without_tag_storages_;
     std::vector<Entity> mutable_runtime_tags_;
 };
 
