@@ -90,6 +90,10 @@ struct Tracker {
     }
 };
 
+struct CopyableName {
+    std::string value;
+};
+
 template <typename View, typename T, typename = void>
 struct HasViewGet : std::false_type {};
 
@@ -290,6 +294,8 @@ TEST_CASE("trivial components can be added, read, written, replaced, and removed
 
     REQUIRE(registry.remove<Position>(entity));
     REQUIRE(registry.get<Position>(entity) == nullptr);
+    REQUIRE(registry.is_dirty<Position>(entity));
+    REQUIRE(registry.clear_dirty<Position>(entity));
     REQUIRE_FALSE(registry.clear_dirty<Position>(entity));
     REQUIRE_FALSE(registry.remove<Position>(entity));
 }
@@ -394,6 +400,8 @@ TEST_CASE("dirty bits move with components in dense storage") {
     REQUIRE(registry.remove<Position>(first));
     REQUIRE(registry.get<Position>(second)->x == 2);
     REQUIRE(registry.is_dirty<Position>(second));
+    REQUIRE(registry.is_dirty<Position>(first));
+    REQUIRE(registry.clear_dirty<Position>(first));
     REQUIRE_FALSE(registry.is_dirty<Position>(first));
 }
 
@@ -1576,6 +1584,245 @@ TEST_CASE("moved registries retain entities components metadata singletons and d
     REQUIRE(fields != nullptr);
     REQUIRE(fields->size() == 1);
     REQUIRE((*fields)[0].name == "x");
+}
+
+TEST_CASE("registry snapshots restore entities components metadata groups singletons and dirty bits") {
+    ecs::Registry registry;
+    const ecs::Entity position_component = registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+    const ecs::Entity game_time_component = registry.register_component<GameTime>("GameTime");
+
+    REQUIRE(registry.set_component_fields(
+        position_component,
+        {ecs::ComponentField{"x", offsetof(Position, x), registry.primitive_type(ecs::PrimitiveType::I32), 1}}));
+
+    registry.declare_owned_group<Position, Velocity>();
+
+    const ecs::Entity kept = registry.create();
+    const ecs::Entity removed_before_snapshot = registry.create();
+    REQUIRE(registry.add<Position>(kept, Position{1, 2}) != nullptr);
+    REQUIRE(registry.add<Velocity>(kept, Velocity{3.0f, 4.0f}) != nullptr);
+    REQUIRE(registry.clear_dirty<Position>(kept));
+    registry.write<GameTime>()->tick = 7;
+    REQUIRE(registry.destroy(removed_before_snapshot));
+
+    auto snapshot = registry.snapshot();
+
+    const ecs::Entity reused_after_snapshot = registry.create();
+    REQUIRE(ecs::Registry::entity_index(reused_after_snapshot) == ecs::Registry::entity_index(removed_before_snapshot));
+    REQUIRE(registry.add<Position>(reused_after_snapshot, Position{9, 9}) != nullptr);
+    REQUIRE(registry.remove<Velocity>(kept));
+    registry.write<Position>(kept)->x = 42;
+    registry.write<GameTime>()->tick = 99;
+    registry.register_component<Health>("Health");
+
+    registry.restore(snapshot);
+
+    REQUIRE(registry.alive(kept));
+    REQUIRE_FALSE(registry.alive(reused_after_snapshot));
+    REQUIRE(registry.get<Position>(kept)->x == 1);
+    REQUIRE(registry.get<Position>(kept)->y == 2);
+    REQUIRE(registry.get<Velocity>(kept)->dx == 3.0f);
+    REQUIRE(registry.get<Velocity>(kept)->dy == 4.0f);
+    REQUIRE_FALSE(registry.is_dirty<Position>(kept));
+    REQUIRE(registry.is_dirty<Velocity>(kept));
+    REQUIRE(registry.component<Position>() == position_component);
+    REQUIRE(registry.component<GameTime>() == game_time_component);
+    REQUIRE(registry.get<GameTime>()->tick == 7);
+    REQUIRE(registry.is_dirty<GameTime>());
+    REQUIRE_THROWS_AS(registry.component<Health>(), std::logic_error);
+
+    const std::vector<ecs::ComponentField>* fields = registry.component_fields(position_component);
+    REQUIRE(fields != nullptr);
+    REQUIRE(fields->size() == 1);
+    REQUIRE((*fields)[0].name == "x");
+
+    std::vector<ecs::Entity> grouped;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        grouped.push_back(entity);
+    });
+    REQUIRE(grouped == std::vector<ecs::Entity>{kept});
+
+    const ecs::Entity reused_after_restore = registry.create();
+    REQUIRE(reused_after_restore == reused_after_snapshot);
+}
+
+TEST_CASE("registry snapshots deep copy copyable non-trivial component storage") {
+    ecs::Registry registry;
+    registry.register_component<CopyableName>("CopyableName");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<CopyableName>(entity, CopyableName{"before"}) != nullptr);
+
+    auto snapshot = registry.snapshot();
+    registry.write<CopyableName>(entity)->value = "after";
+
+    registry.restore(snapshot);
+
+    REQUIRE(registry.get<CopyableName>(entity)->value == "before");
+    registry.write<CopyableName>(entity)->value = "restored";
+    registry.restore(snapshot);
+    REQUIRE(registry.get<CopyableName>(entity)->value == "before");
+}
+
+TEST_CASE("registry snapshots reject move-only non-trivial component storage") {
+    ecs::Registry registry;
+    registry.register_component<std::unique_ptr<int>>("OwnedInt");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<std::unique_ptr<int>>(entity, new int(5)) != nullptr);
+
+    REQUIRE_THROWS_AS(registry.snapshot(), std::logic_error);
+}
+
+TEST_CASE("restoring a registry snapshot leaves registered jobs unchanged") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+
+    int calls = 0;
+    registry.job<Position>(0).each([&](ecs::Registry::View<Position>& view, ecs::Entity current, Position&) {
+        ++calls;
+        view.write<Position>(current)->x += 1;
+    });
+
+    auto snapshot = registry.snapshot();
+    REQUIRE(registry.add<Position>(entity, Position{10, 0}) != nullptr);
+
+    registry.restore(snapshot);
+    registry.run_jobs();
+
+    REQUIRE(calls == 1);
+    REQUIRE(registry.get<Position>(entity)->x == 2);
+}
+
+TEST_CASE("delta snapshots restore dirty values additions removals and destroyed entities") {
+    ecs::Registry source;
+    source.register_component<Position>("Position");
+    source.register_component<Velocity>("Velocity");
+    source.register_component<Health>("Health");
+    source.declare_owned_group<Position, Velocity>();
+
+    const ecs::Entity updated = source.create();
+    const ecs::Entity removed_component = source.create();
+    const ecs::Entity destroyed = source.create();
+    REQUIRE(source.add<Position>(updated, Position{1, 1}) != nullptr);
+    REQUIRE(source.add<Velocity>(updated, Velocity{1.0f, 1.0f}) != nullptr);
+    REQUIRE(source.add<Position>(removed_component, Position{2, 2}) != nullptr);
+    REQUIRE(source.add<Velocity>(removed_component, Velocity{2.0f, 2.0f}) != nullptr);
+    REQUIRE(source.add<Position>(destroyed, Position{3, 3}) != nullptr);
+    REQUIRE(source.add<Health>(destroyed, Health{30}) != nullptr);
+    source.clear_all_dirty<Position>();
+    source.clear_all_dirty<Velocity>();
+    source.clear_all_dirty<Health>();
+
+    auto baseline = source.snapshot();
+    ecs::Registry replay;
+    replay.register_component<Position>("Position");
+    replay.register_component<Velocity>("Velocity");
+    replay.register_component<Health>("Health");
+    replay.declare_owned_group<Position, Velocity>();
+    replay.restore(baseline);
+
+    source.write<Position>(updated)->x = 10;
+    const ecs::Entity added = source.create();
+    REQUIRE(source.add<Position>(added, Position{4, 4}) != nullptr);
+    REQUIRE(source.add<Velocity>(added, Velocity{4.0f, 4.0f}) != nullptr);
+    REQUIRE(source.remove<Velocity>(removed_component));
+    REQUIRE(source.destroy(destroyed));
+
+    auto delta = source.delta_snapshot(baseline);
+    replay.restore(delta);
+
+    REQUIRE(replay.alive(updated));
+    REQUIRE(replay.get<Position>(updated)->x == 10);
+    REQUIRE(replay.get<Position>(updated)->y == 1);
+    REQUIRE(replay.get<Velocity>(updated)->dx == 1.0f);
+    REQUIRE(replay.alive(added));
+    REQUIRE(replay.get<Position>(added)->x == 4);
+    REQUIRE(replay.get<Velocity>(added)->dx == 4.0f);
+    REQUIRE(replay.alive(removed_component));
+    REQUIRE(replay.get<Position>(removed_component)->x == 2);
+    REQUIRE(replay.get<Velocity>(removed_component) == nullptr);
+    REQUIRE_FALSE(replay.alive(destroyed));
+    REQUIRE(replay.get<Position>(destroyed) == nullptr);
+    REQUIRE(replay.get<Health>(destroyed) == nullptr);
+    REQUIRE(replay.is_dirty<Position>(updated));
+    REQUIRE(replay.is_dirty<Position>(added));
+    REQUIRE(replay.is_dirty<Velocity>(removed_component));
+
+    std::vector<ecs::Entity> grouped;
+    replay.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+        grouped.push_back(entity);
+    });
+    REQUIRE(std::find(grouped.begin(), grouped.end(), updated) != grouped.end());
+    REQUIRE(std::find(grouped.begin(), grouped.end(), added) != grouped.end());
+    REQUIRE(std::find(grouped.begin(), grouped.end(), removed_component) == grouped.end());
+}
+
+TEST_CASE("delta snapshots restore singleton dirty values") {
+    ecs::Registry source;
+    source.register_component<GameTime>("GameTime");
+    source.clear_all_dirty<GameTime>();
+
+    auto baseline = source.snapshot();
+    ecs::Registry replay;
+    replay.register_component<GameTime>("GameTime");
+    replay.restore(baseline);
+
+    source.write<GameTime>()->tick = 55;
+    auto delta = source.delta_snapshot(baseline);
+    replay.restore(delta);
+
+    REQUIRE(replay.get<GameTime>()->tick == 55);
+    REQUIRE(replay.is_dirty<GameTime>());
+}
+
+TEST_CASE("delta restore validates baseline token component metadata and removal state") {
+    ecs::Registry source;
+    source.register_component<Position>("Position");
+    source.register_component<Velocity>("Velocity");
+    const ecs::Entity entity = source.create();
+    REQUIRE(source.add<Position>(entity, Position{1, 1}) != nullptr);
+    REQUIRE(source.add<Velocity>(entity, Velocity{1.0f, 1.0f}) != nullptr);
+    source.clear_all_dirty<Position>();
+    source.clear_all_dirty<Velocity>();
+
+    auto baseline = source.snapshot();
+    source.write<Position>(entity)->x = 2;
+    REQUIRE(source.remove<Velocity>(entity));
+    auto delta = source.delta_snapshot(baseline);
+
+    ecs::Registry wrong_baseline;
+    wrong_baseline.register_component<Position>("Position");
+    wrong_baseline.register_component<Velocity>("Velocity");
+    REQUIRE_THROWS_AS(wrong_baseline.restore(delta), std::logic_error);
+
+    ecs::Registry missing_component;
+    missing_component.register_component<Position>("Position");
+    missing_component.restore(baseline);
+    REQUIRE(missing_component.destroy(missing_component.component<Velocity>()));
+    REQUIRE_THROWS_AS(missing_component.restore(delta), std::logic_error);
+
+    ecs::Registry missing_removed_value;
+    missing_removed_value.register_component<Position>("Position");
+    missing_removed_value.register_component<Velocity>("Velocity");
+    missing_removed_value.restore(baseline);
+    REQUIRE(missing_removed_value.remove<Velocity>(entity));
+    REQUIRE_THROWS_AS(missing_removed_value.restore(delta), std::logic_error);
+}
+
+TEST_CASE("delta snapshots reject dirty move-only non-trivial component storage") {
+    ecs::Registry source;
+    source.register_component<std::unique_ptr<int>>("OwnedInt");
+    auto baseline = source.snapshot();
+
+    const ecs::Entity entity = source.create();
+    REQUIRE(source.add<std::unique_ptr<int>>(entity, new int(1)) != nullptr);
+
+    REQUIRE_THROWS_AS(source.delta_snapshot(baseline), std::logic_error);
 }
 
 TEST_CASE("field metadata supports simple debug printing") {

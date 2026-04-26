@@ -221,6 +221,11 @@ std::string text = registry.debug_print(entity, position_type);
 - `bool Registry::is_dirty(Entity entity, Entity component) const`
 - `void Registry::clear_all_dirty<T>()`
 - `void Registry::clear_all_dirty(Entity component)`
+- `Registry::Snapshot Registry::snapshot() const`
+- `Registry::DeltaSnapshot Registry::delta_snapshot(const Registry::Snapshot& baseline) const`
+- `Registry::DeltaSnapshot Registry::delta_snapshot(const Registry::DeltaSnapshot& baseline) const`
+- `void Registry::restore(const Registry::Snapshot& snapshot)`
+- `void Registry::restore(const Registry::DeltaSnapshot& snapshot)`
 - `Registry::View<Components...> Registry::view<Components...>()`
 - `Registry::JobView<Components...> Registry::job<Components...>(int order)`
 - `void Registry::run_jobs()`
@@ -249,6 +254,8 @@ Trivially copyable components are relocated with `memcpy`. Non-trivially copyabl
 Component pointers remain valid until that component storage is removed or mutated in a way that reallocates or moves dense storage.
 
 `add<T>()`, runtime `add()`, `ensure()`, and `write()` mark the component dirty because they return writable storage. `get()` is read-only and does not modify dirty state.
+
+Snapshots capture entity/component world state for later restoration. Delta snapshots validate against a baseline snapshot token, copy current entity slot state, and save only dirty component values plus dirty component-removal tombstones. Trivially copyable component storage is byte-copied, copy-constructible typed components are cloned through their lifecycle hook, and move-only non-trivial component storage rejects snapshot creation when captured. Registered jobs are not part of snapshots.
 
 View callbacks mark non-const listed components dirty before passing mutable references. Structurally mutating viewed component storage during `each()` is unsupported.
 

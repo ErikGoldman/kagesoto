@@ -434,6 +434,83 @@ void BM_AddRemoveEntities(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(entity_count) * 2);
 }
 
+void BM_Snapshot(benchmark::State& state) {
+    const int entity_count = static_cast<int>(state.range(0));
+    ecs::Registry registry;
+    register_first_n_components(registry, 8);
+    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    add_first_n_components(registry, entities, 8);
+    registry.clear_all_dirty<C0>();
+    registry.clear_all_dirty<C1>();
+    registry.clear_all_dirty<C2>();
+    registry.clear_all_dirty<C3>();
+    registry.clear_all_dirty<C4>();
+    registry.clear_all_dirty<C5>();
+    registry.clear_all_dirty<C6>();
+    registry.clear_all_dirty<C7>();
+
+    for (auto _ : state) {
+        auto snapshot = registry.snapshot();
+        benchmark::DoNotOptimize(&snapshot);
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(entity_count) * 8);
+}
+
+void BM_DeltaSnapshotDirtyValues(benchmark::State& state) {
+    const int entity_count = static_cast<int>(state.range(0));
+    ecs::Registry registry;
+    register_first_n_components(registry, 8);
+    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    add_first_n_components(registry, entities, 8);
+    registry.clear_all_dirty<C0>();
+    registry.clear_all_dirty<C1>();
+    registry.clear_all_dirty<C2>();
+    registry.clear_all_dirty<C3>();
+    registry.clear_all_dirty<C4>();
+    registry.clear_all_dirty<C5>();
+    registry.clear_all_dirty<C6>();
+    registry.clear_all_dirty<C7>();
+    auto baseline = registry.snapshot();
+
+    for (std::size_t i = 0; i < entities.size(); i += 16) {
+        registry.write<C0>(entities[i])->value += 1;
+        registry.write<C1>(entities[i])->value += 1;
+    }
+
+    for (auto _ : state) {
+        auto snapshot = registry.delta_snapshot(baseline);
+        benchmark::DoNotOptimize(&snapshot);
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(entity_count / 16) * 2);
+}
+
+void BM_DeltaSnapshotStructuralChanges(benchmark::State& state) {
+    const int entity_count = static_cast<int>(state.range(0));
+    ecs::Registry registry;
+    register_first_n_components(registry, 2);
+    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    add_first_n_components(registry, entities, 2);
+    registry.clear_all_dirty<C0>();
+    registry.clear_all_dirty<C1>();
+    auto baseline = registry.snapshot();
+
+    for (std::size_t i = 0; i < entities.size(); i += 32) {
+        registry.remove<C1>(entities[i]);
+    }
+    for (std::size_t i = 16; i < entities.size(); i += 32) {
+        registry.destroy(entities[i]);
+    }
+
+    for (auto _ : state) {
+        auto snapshot = registry.delta_snapshot(baseline);
+        benchmark::DoNotOptimize(&snapshot);
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(entity_count / 16));
+}
+
 void BasicOperationArgs(benchmark::internal::Benchmark* benchmark) {
     benchmark->Arg(1024)->Arg(16384)->Arg(65536);
 }
@@ -450,5 +527,8 @@ BENCHMARK(BM_IterateWriteSameComponent)->Apply(BasicOperationArgs);
 BENCHMARK(BM_IterateWriteEightComponents)->Apply(BasicOperationArgs);
 BENCHMARK(BM_IterateWriteOwnedGroupViewEightComponents)->Apply(BasicOperationArgs);
 BENCHMARK(BM_AddRemoveEntities)->Apply(BasicOperationArgs);
+BENCHMARK(BM_Snapshot)->Apply(BasicOperationArgs);
+BENCHMARK(BM_DeltaSnapshotDirtyValues)->Apply(BasicOperationArgs);
+BENCHMARK(BM_DeltaSnapshotStructuralChanges)->Apply(BasicOperationArgs);
 
 }  // namespace

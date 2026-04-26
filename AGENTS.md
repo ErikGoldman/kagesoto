@@ -1,79 +1,49 @@
 # Benchmarking Guide
 
-Use this repo's benchmark scripts for any performance work. Do not compare ad hoc runs unless you are debugging a script problem.
+Use this repo's benchmark target for performance work. The older `scripts/bench/*.sh` helpers are not present in this checkout; `benchmark.sh` currently delegates to that missing path, so do not rely on it unless the script tree is restored.
 
 ## Rules
 
-- Run benchmark backends serially. Never run `flat_sorted` and `optimized_bplus` at the same time when collecting numbers.
-- Do not read `.json` or `.log` artifacts until the benchmark process has exited successfully.
-- Treat partially written `.json` files as invalid.
-- Use `RelWithDebInfo` for benchmark numbers.
-- Use Tracy and `gprof` for hotspot direction only, not authoritative timings.
+- Build benchmark numbers with `RelWithDebInfo`.
+- Run benchmark configurations serially. Never overlap long benchmark jobs when collecting numbers.
 - For confirmation runs, prefer an exact benchmark filter over a broad suite.
-- Record the artifact paths you used in any summary.
-- Keep the machine idle for scene benchmarks. Avoid overlapping long benchmark jobs.
-- Note that some project benchmark components declare explicit index types such as `FlatIndex` or `OptimizedUniqueIndex`; `--index-backend` is not always the whole story.
+- Keep the machine idle for benchmark runs.
+- If writing benchmark output to `.json` or `.log`, do not read it until the process exits successfully.
+- Treat partially written benchmark artifacts as invalid.
+- Record the command and artifact path used in any summary.
+- Direct benchmark executable runs are acceptable in this checkout because the benchmark scripts are absent. Call out when a run is only a smoke test rather than authoritative timing data.
 
 ## Recommended Workflow
 
-Baseline run for one backend:
+Configure a `RelWithDebInfo` benchmark build:
 
 ```bash
-bash scripts/bench/run.sh \
-  --target ecs_benchmark_project \
-  --index-backend flat_sorted \
-  --min-time 0.2s
+cmake -S . -B build-bench \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DBUILD_TESTING=ON \
+  -DECS_BUILD_BENCHMARKS=ON
 ```
 
-Run the other backend only after the first command finishes:
+Build the benchmark target:
 
 ```bash
-bash scripts/bench/run.sh \
-  --target ecs_benchmark_project \
-  --index-backend optimized_bplus \
-  --min-time 0.2s
+cmake --build build-bench --target basic_operations_benchmark
 ```
 
-Focused single-case confirmation:
+Focused benchmark run:
 
 ```bash
-bash scripts/bench/run.sh \
-  --target ecs_benchmark_project \
-  --index-backend flat_sorted \
-  --filter '^BM_ComplexSceneVisibilityQuery/16384$' \
-  --min-time 0.2s
+build-bench/benchmarks/basic_operations_benchmark \
+  --benchmark_filter='^BM_Snapshot/16384$' \
+  --benchmark_min_time=0.2s
 ```
 
-Focused multi-case comparison set:
+Focused snapshot comparison set:
 
 ```bash
-bash scripts/bench/run.sh \
-  --target ecs_benchmark_project \
-  --index-backend flat_sorted \
-  --filter '^(BM_IndexedViewWhereEq/65536|BM_IndexedViewPredicateComposeOr/65536|BM_IndexedViewWithSecondaryFetch/65536|BM_ComplexSceneFrame/16384|BM_ComplexSceneFrameGrouped/16384|BM_ComplexSceneFrameWithChurn/16384|BM_ComplexSceneVisibilityQuery/16384)$' \
-  --min-time 0.2s
-```
-
-Compare-suite microbenchmarks:
-
-```bash
-bash scripts/bench/compare.sh --index-backend flat_sorted --min-time 0.2s
-```
-
-Tracy profiling:
-
-```bash
-bash scripts/bench/profile.sh \
-  --index-backend flat_sorted \
-  --target ecs_benchmark_project \
-  --filter '^BM_ComplexSceneFrame/2048$' \
-  --min-time 0.5s
-```
-
-`gprof` hotspot collection:
-
-```bash
-bash scripts/bench/gprof.sh --index-backend flat_sorted
+build-bench/benchmarks/basic_operations_benchmark \
+  --benchmark_filter='^(BM_Snapshot/16384|BM_DeltaSnapshotDirtyValues/16384|BM_DeltaSnapshotStructuralChanges/16384)$' \
+  --benchmark_min_time=0.2s
 ```
 
 ## Comparison Discipline
@@ -82,3 +52,4 @@ bash scripts/bench/gprof.sh --index-backend flat_sorted
 - Prefer fresh before/after runs on the same machine state over historical artifacts.
 - If a number looks extreme, rerun that exact case in isolation before treating it as real.
 - If a suite is long, use isolated exact-case reruns to validate the interesting regressions or wins.
+- Do not mix `Debug` smoke-test timings with `RelWithDebInfo` benchmark numbers.
