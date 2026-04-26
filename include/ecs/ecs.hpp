@@ -427,7 +427,7 @@ public:
         T* value = storage_for(component).emplace_or_replace<T>(
             entity_index(entity),
             std::forward<Args>(args)...);
-        refresh_groups_after_add(entity_index(entity));
+        refresh_group_after_add(entity_index(entity), entity_index(component));
         return value;
     }
 
@@ -447,7 +447,7 @@ public:
         }
 
         storage_for(tag).emplace_or_replace_tag(entity_index(entity));
-        refresh_groups_after_add(entity_index(entity));
+        refresh_group_after_add(entity_index(entity), entity_index(tag));
         return true;
     }
 
@@ -468,7 +468,7 @@ public:
         }
 
         void* added = storage_for(component).emplace_or_replace_bytes(entity_index(entity), value);
-        refresh_groups_after_add(entity_index(entity));
+        refresh_group_after_add(entity_index(entity), entity_index(component));
         return added;
     }
 
@@ -485,7 +485,7 @@ public:
         }
 
         void* ensured = storage_for(component).ensure(entity_index(entity));
-        refresh_groups_after_add(entity_index(entity));
+        refresh_group_after_add(entity_index(entity), entity_index(component));
         return ensured;
     }
 
@@ -1682,22 +1682,6 @@ private:
         return std::includes(lhs.begin(), lhs.end(), rhs.begin(), rhs.end());
     }
 
-    static bool intersects(const std::vector<std::uint32_t>& lhs, const std::vector<std::uint32_t>& rhs) {
-        auto left = lhs.begin();
-        auto right = rhs.begin();
-        while (left != lhs.end() && right != rhs.end()) {
-            if (*left == *right) {
-                return true;
-            }
-            if (*left < *right) {
-                ++left;
-            } else {
-                ++right;
-            }
-        }
-        return false;
-    }
-
     GroupRecord& group_for_key(const std::vector<std::uint32_t>& key) {
         for (const auto& group : groups_) {
             if (group->owned == key) {
@@ -1711,17 +1695,29 @@ private:
         groups_.push_back(std::move(group));
         GroupRecord& created = *groups_.back();
         build_group(created);
+        register_group_ownership(created);
         return created;
     }
 
     void validate_group_key(const std::vector<std::uint32_t>& key) const {
+        for (std::uint32_t component : key) {
+            auto found = owned_component_groups_.find(component);
+            if (found != owned_component_groups_.end() && found->second->owned != key) {
+                throw std::logic_error("ecs owned components cannot be shared by distinct owned groups");
+            }
+        }
+    }
+
+    void register_group_ownership(GroupRecord& group) {
+        for (std::uint32_t component : group.owned) {
+            owned_component_groups_[component] = &group;
+        }
+    }
+
+    void rebuild_group_ownership() {
+        owned_component_groups_.clear();
         for (const auto& group : groups_) {
-            if (!intersects(key, group->owned)) {
-                continue;
-            }
-            if (!includes_all(key, group->owned) && !includes_all(group->owned, key)) {
-                throw std::logic_error("ecs owned groups with shared components must be nested");
-            }
+            register_group_ownership(*group);
         }
     }
 
@@ -1803,26 +1799,23 @@ private:
         }
     }
 
-    void refresh_groups_after_add(std::uint32_t index) {
-        std::sort(groups_.begin(), groups_.end(), [](const auto& lhs, const auto& rhs) {
-            return lhs->owned.size() < rhs->owned.size();
-        });
-        for (const auto& group : groups_) {
-            if (group_contains_all(*group, index)) {
-                enter_group(*group, index);
-            }
+    void refresh_group_after_add(std::uint32_t index, std::uint32_t component) {
+        auto found = owned_component_groups_.find(component);
+        if (found == owned_component_groups_.end()) {
+            return;
+        }
+        GroupRecord& group = *found->second;
+        if (group_contains_all(group, index)) {
+            enter_group(group, index);
         }
     }
 
     void remove_from_groups_before_component_removal(std::uint32_t index, std::uint32_t component) {
-        std::sort(groups_.begin(), groups_.end(), [](const auto& lhs, const auto& rhs) {
-            return lhs->owned.size() > rhs->owned.size();
-        });
-        for (const auto& group : groups_) {
-            if (group_contains_component(*group, component)) {
-                leave_group(*group, index);
-            }
+        auto found = owned_component_groups_.find(component);
+        if (found == owned_component_groups_.end()) {
+            return;
         }
+        leave_group(*found->second, index);
     }
 
     static constexpr std::uint64_t pack(std::uint32_t index, std::uint32_t version) noexcept {
@@ -2063,6 +2056,7 @@ private:
                 return group_contains_component(*group, component_index);
             }),
             groups_.end());
+        rebuild_group_ownership();
         storages_.erase(component_index);
 
         if (!record->name.empty()) {
@@ -2298,6 +2292,7 @@ private:
     std::vector<Entity> typed_components_;
     std::vector<TypeErasedStorage*> typed_storages_;
     std::vector<std::unique_ptr<GroupRecord>> groups_;
+    std::unordered_map<std::uint32_t, GroupRecord*> owned_component_groups_;
     std::vector<JobRecord> jobs_;
     JobThreadExecutor job_thread_executor_;
     std::uint64_t next_job_sequence_ = 0;
@@ -2466,6 +2461,7 @@ inline void Registry::restore(const Snapshot& snapshot) {
     typed_components_ = snapshot.typed_components_;
     rebuild_typed_storages();
     groups_ = std::move(groups);
+    rebuild_group_ownership();
     singleton_entity_ = snapshot.singleton_entity_;
     system_tag_ = snapshot.system_tag_;
     state_token_ = snapshot.state_token_;
@@ -2547,7 +2543,7 @@ inline void Registry::restore(const DeltaSnapshot& snapshot) {
                 throw std::logic_error("ecs delta snapshot entity is not alive");
             }
             storage_for(component).emplace_or_replace_copy(entity_index, delta_storage.get(entity_index));
-            refresh_groups_after_add(entity_index);
+            refresh_group_after_add(entity_index, component_index);
         }
     }
 

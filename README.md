@@ -231,7 +231,7 @@ registry.view<Position, Velocity>().each([](ecs::Entity entity, Position& positi
 
 View callbacks mark owned components dirty before passing mutable references, just like ordinary mutable views.
 
-Multiple owned groups can share components only when the owned sets are identical or nested. For example, `declare_owned_group<Position>()` and `declare_owned_group<Position, Velocity>()` can coexist, but `declare_owned_group<Position, Velocity>()` and `declare_owned_group<Position, Health>()` conflict.
+Multiple owned groups can share components only when the owned sets are identical. For example, declaring both `declare_owned_group<Position, Velocity>()` and `declare_owned_group<Velocity, Position>()` is valid, but `declare_owned_group<Position>()`, `declare_owned_group<Position, Velocity>()`, and `declare_owned_group<Position, Health>()` cannot coexist with one another because they all try to own `Position`.
 
 ## Runtime Components
 
