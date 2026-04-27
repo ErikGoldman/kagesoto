@@ -95,12 +95,7 @@ if(ECS_BUILD_PROFILING)
 endif()
 
 if(ECS_BUILD_EXAMPLE)
-    add_executable(ecs_example
-        examples/main.cpp
-            src/registry.hpp
-    )
-
-    target_link_libraries(ecs_example PRIVATE ecs::ecs)
+    add_subdirectory(examples)
 endif()
 
 if(BUILD_TESTING OR ECS_BUILD_BENCHMARKS)
