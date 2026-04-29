@@ -216,6 +216,11 @@ class Registry {
 public:
     static constexpr std::uint32_t invalid_index = std::numeric_limits<std::uint32_t>::max();
 
+    struct ComponentRemoval {
+        std::uint32_t entity_index = invalid_index;
+        bool entity_destroyed = false;
+    };
+
     template <typename... Components>
     class View;
 
@@ -703,6 +708,55 @@ public:
         }
     }
 
+    template <typename T, typename Fn>
+    void each_dirty(Fn&& fn) const {
+        const Entity component = registered_component<T>();
+        each_dirty(component, std::forward<Fn>(fn));
+    }
+
+    template <typename Fn>
+    void each_dirty(Entity component, Fn&& fn) const {
+        const ComponentRecord& record = require_component_record(component);
+        Entity singleton = Entity{};
+        if (record.singleton) {
+            singleton = singleton_entity_;
+        }
+
+        const auto* found = find_storage(component);
+        if (found == nullptr) {
+            return;
+        }
+
+        Fn& callback = fn;
+        found->each_dirty([&](std::uint32_t index, const void* value) {
+            callback(record.singleton ? singleton : Entity{entities_[index]}, value);
+        });
+    }
+
+    template <typename T, typename Fn>
+    void each_removed(Fn&& fn) const {
+        const Entity component = registered_component<T>();
+        each_removed(component, std::forward<Fn>(fn));
+    }
+
+    template <typename Fn>
+    void each_removed(Entity component, Fn&& fn) const {
+        const ComponentRecord& record = require_component_record(component);
+        if (record.singleton) {
+            return;
+        }
+
+        const auto* found = find_storage(component);
+        if (found == nullptr) {
+            return;
+        }
+
+        Fn& callback = fn;
+        found->each_removed([&](ComponentRemoval removal) {
+            callback(removal);
+        });
+    }
+
     template <typename... Components>
     View<Components...> view();
 
@@ -1125,6 +1179,32 @@ private:
 
         bool has_dirty_entries() const {
             return dirty_count_ != 0 || tombstone_count_ != 0;
+        }
+
+        template <typename Fn>
+        void each_dirty(Fn&& fn) const {
+            Fn& callback = fn;
+            for (std::size_t dense = 0; dense < size_; ++dense) {
+                if (dirty_[dense] == 0) {
+                    continue;
+                }
+                callback(dense_indices_[dense], info_.tag ? nullptr : get_dense(dense));
+            }
+        }
+
+        template <typename Fn>
+        void each_removed(Fn&& fn) const {
+            Fn& callback = fn;
+            for (std::size_t position = 0; position < tombstone_entry_count(); ++position) {
+                if (!has_dirty_tombstone_at_position(position)) {
+                    continue;
+                }
+
+                callback(ComponentRemoval{
+                    tombstone_index_at(position),
+                    has_destroy_tombstone_at_position(position),
+                });
+            }
         }
 
         bool has_destroy_tombstone(std::uint32_t index) const {

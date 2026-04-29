@@ -424,6 +424,66 @@ TEST_CASE("trivial components can be added, read, written, replaced, and removed
     REQUIRE_FALSE(registry.remove<Position>(entity));
 }
 
+TEST_CASE("dirty component iteration exposes current values and removal tombstones") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    const ecs::Entity first = registry.create();
+    const ecs::Entity second = registry.create();
+    const ecs::Entity destroyed = registry.create();
+
+    REQUIRE(registry.add<Position>(first, Position{1, 2}) != nullptr);
+    REQUIRE(registry.add<Position>(second, Position{3, 4}) != nullptr);
+    REQUIRE(registry.add<Position>(destroyed, Position{5, 6}) != nullptr);
+    registry.clear_all_dirty<Position>();
+
+    REQUIRE(registry.add<Position>(first, Position{7, 8}) != nullptr);
+    REQUIRE(registry.remove<Position>(second));
+    REQUIRE(registry.destroy(destroyed));
+
+    std::vector<ecs::Entity> dirty_entities;
+    std::vector<Position> dirty_values;
+    registry.each_dirty<Position>([&](ecs::Entity entity, const void* value) {
+        dirty_entities.push_back(entity);
+        dirty_values.push_back(*static_cast<const Position*>(value));
+    });
+
+    REQUIRE(dirty_entities == std::vector<ecs::Entity>{first});
+    REQUIRE(dirty_values.size() == 1);
+    REQUIRE(dirty_values[0].x == 7);
+    REQUIRE(dirty_values[0].y == 8);
+
+    std::vector<ecs::Registry::ComponentRemoval> removals;
+    registry.each_removed<Position>([&](ecs::Registry::ComponentRemoval removal) {
+        removals.push_back(removal);
+    });
+
+    REQUIRE(removals.size() == 2);
+    auto second_removal = std::find_if(removals.begin(), removals.end(), [&](const auto& removal) {
+        return removal.entity_index == ecs::Registry::entity_index(second);
+    });
+    REQUIRE(second_removal != removals.end());
+    REQUIRE_FALSE(second_removal->entity_destroyed);
+
+    auto destroyed_removal = std::find_if(removals.begin(), removals.end(), [&](const auto& removal) {
+        return removal.entity_index == ecs::Registry::entity_index(destroyed);
+    });
+    REQUIRE(destroyed_removal != removals.end());
+    REQUIRE(destroyed_removal->entity_destroyed);
+
+    registry.clear_all_dirty<Position>();
+
+    int dirty_count = 0;
+    int removal_count = 0;
+    registry.each_dirty<Position>([&](ecs::Entity, const void*) {
+        ++dirty_count;
+    });
+    registry.each_removed<Position>([&](ecs::Registry::ComponentRemoval) {
+        ++removal_count;
+    });
+    REQUIRE(dirty_count == 0);
+    REQUIRE(removal_count == 0);
+}
+
 TEST_CASE("runtime components use component entities and the shared write path") {
     ecs::Registry registry;
 
