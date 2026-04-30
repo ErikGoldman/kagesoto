@@ -1343,6 +1343,111 @@ TEST_CASE("job registration returns alive entities and the orchestrator schedule
     REQUIRE(schedule.stages[0].jobs == std::vector<ecs::Entity>{job});
 }
 
+TEST_CASE("run jobs can exclude jobs by job entity tag") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Disabled>("Disabled");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+
+    int calls = 0;
+    const ecs::Entity job = registry.job<Position>(0).each([&](ecs::Entity, Position&) {
+        ++calls;
+    });
+    REQUIRE(registry.add<Disabled>(job));
+
+    const ecs::Entity disabled = registry.component<Disabled>();
+    ecs::RunJobsOptions options;
+    options.excluded_job_tags = &disabled;
+    options.excluded_job_tag_count = 1;
+    registry.run_jobs(options);
+    REQUIRE(calls == 0);
+
+    registry.run_jobs();
+    REQUIRE(calls == 1);
+}
+
+TEST_CASE("run jobs for entities can exclude jobs by job entity tag") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Disabled>("Disabled");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+
+    int calls = 0;
+    const ecs::Entity job = registry.job<Position>(0).each([&](ecs::Entity, Position&) {
+        ++calls;
+    });
+    REQUIRE(registry.add<Disabled>(job));
+
+    const ecs::Entity disabled = registry.component<Disabled>();
+    ecs::RunJobsOptions options;
+    options.excluded_job_tags = &disabled;
+    options.excluded_job_tag_count = 1;
+    registry.run_jobs_for_entities({entity}, options);
+    REQUIRE(calls == 0);
+
+    registry.run_jobs_for_entities({entity});
+    REQUIRE(calls == 1);
+}
+
+TEST_CASE("jobs can filter iterated entities by typed tags") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Health>("Health");
+    registry.register_component<Active>("Active");
+    registry.register_component<Disabled>("Disabled");
+
+    std::vector<ecs::Entity> entities;
+    for (int i = 0; i < 4; ++i) {
+        const ecs::Entity entity = registry.create();
+        entities.push_back(entity);
+        REQUIRE(registry.add<Position>(entity, Position{i, 0}) != nullptr);
+        REQUIRE(registry.add<Health>(entity, Health{0}) != nullptr);
+    }
+    REQUIRE(registry.add<Disabled>(entities[1]));
+    REQUIRE(registry.add<Disabled>(entities[3]));
+
+    registry.job<Position>(0)
+        .without_tags<const Disabled>()
+        .access<Health>()
+        .max_threads(4)
+        .min_entities_per_thread(1)
+        .each([](auto& view, ecs::Entity entity, Position& position) {
+            position.x += 10;
+            view.template write<Health>(entity).value += 1;
+        });
+    registry.job<const Position>(1)
+        .without_tags<const Disabled>()
+        .structural<Active>()
+        .each([](auto& view, ecs::Entity entity, const Position&) {
+            REQUIRE(view.template add<Active>(entity));
+        });
+
+    registry.set_job_thread_executor([](const std::vector<ecs::JobThreadTask>& tasks) {
+        for (const ecs::JobThreadTask& task : tasks) {
+            task.run();
+        }
+    });
+
+    registry.run_jobs();
+
+    REQUIRE(registry.get<Position>(entities[0]).x == 10);
+    REQUIRE(registry.get<Position>(entities[1]).x == 1);
+    REQUIRE(registry.get<Position>(entities[2]).x == 12);
+    REQUIRE(registry.get<Position>(entities[3]).x == 3);
+    REQUIRE(registry.get<Health>(entities[0]).value == 1);
+    REQUIRE(registry.get<Health>(entities[1]).value == 0);
+    REQUIRE(registry.get<Health>(entities[2]).value == 1);
+    REQUIRE(registry.get<Health>(entities[3]).value == 0);
+    REQUIRE(registry.has<Active>(entities[0]));
+    REQUIRE_FALSE(registry.has<Active>(entities[1]));
+    REQUIRE(registry.has<Active>(entities[2]));
+    REQUIRE_FALSE(registry.has<Active>(entities[3]));
+}
+
 TEST_CASE("orchestrator returns no stages when no jobs are registered") {
     ecs::Registry registry;
 
