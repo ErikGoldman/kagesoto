@@ -1448,6 +1448,64 @@ TEST_CASE("jobs can filter iterated entities by typed tags") {
     REQUIRE_FALSE(registry.has<Active>(entities[3]));
 }
 
+TEST_CASE("compiled job graphs run only supplied jobs") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{0, 0}) != nullptr);
+
+    const ecs::Entity first = registry.job<Position>(0).each([](ecs::Entity, Position& position) {
+        position.x += 1;
+    });
+    registry.job<Position>(1).each([](ecs::Entity, Position& position) {
+        position.y += 1;
+    });
+
+    ecs::JobGraph graph = registry.compile_job_graph({first});
+    graph.tick(registry);
+
+    REQUIRE(registry.get<Position>(entity).x == 1);
+    REQUIRE(registry.get<Position>(entity).y == 0);
+}
+
+TEST_CASE("compiled job graphs schedule only supplied job dependencies") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    registry.job<Position>(0).each([](ecs::Entity, Position&) {});
+    const ecs::Entity position_reader = registry.job<const Position>(1).each([](ecs::Entity, const Position&) {});
+    const ecs::Entity velocity_writer = registry.job<Velocity>(2).each([](ecs::Entity, Velocity&) {});
+
+    const ecs::JobGraph full = registry.compile_all_jobs_graph();
+    const ecs::JobGraph subset = registry.compile_job_graph({position_reader, velocity_writer});
+
+    REQUIRE(full.schedule().stages.size() == 2);
+    REQUIRE(subset.schedule().stages.size() == 1);
+    REQUIRE(subset.schedule().stages[0].jobs == std::vector<ecs::Entity>{position_reader, velocity_writer});
+}
+
+TEST_CASE("compiled job graphs can run only target entities") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ecs::Entity first_entity = registry.create();
+    const ecs::Entity second_entity = registry.create();
+    REQUIRE(registry.add<Position>(first_entity, Position{0, 0}) != nullptr);
+    REQUIRE(registry.add<Position>(second_entity, Position{0, 0}) != nullptr);
+
+    const ecs::Entity job = registry.job<Position>(0).each([](ecs::Entity, Position& position) {
+        position.x += 1;
+    });
+
+    ecs::JobGraph graph = registry.compile_job_graph({job});
+    graph.tick_for_entities(registry, {second_entity});
+
+    REQUIRE(registry.get<Position>(first_entity).x == 0);
+    REQUIRE(registry.get<Position>(second_entity).x == 1);
+}
+
 TEST_CASE("orchestrator returns no stages when no jobs are registered") {
     ecs::Registry registry;
 

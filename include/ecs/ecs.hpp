@@ -202,6 +202,25 @@ struct JobThreadTask {
 
 using JobThreadExecutor = std::function<void(const std::vector<JobThreadTask>&)>;
 
+class Registry;
+
+class JobGraph {
+public:
+    JobGraph() = default;
+    explicit JobGraph(JobSchedule schedule)
+        : schedule_(std::move(schedule)) {}
+
+    const JobSchedule& schedule() const noexcept {
+        return schedule_;
+    }
+
+    void tick(Registry& registry, RunJobsOptions options = {}) const;
+    void tick_for_entities(Registry& registry, const std::vector<Entity>& entities, RunJobsOptions options = {}) const;
+
+private:
+    JobSchedule schedule_;
+};
+
 enum class PrimitiveType {
     Bool,
     I32,
@@ -214,6 +233,7 @@ enum class PrimitiveType {
 
 class Registry {
     friend class Orchestrator;
+    friend class JobGraph;
 
 public:
     static constexpr std::uint32_t invalid_index = std::numeric_limits<std::uint32_t>::max();
@@ -777,6 +797,8 @@ public:
 
     void run_jobs(RunJobsOptions options = {});
     void run_jobs_for_entities(const std::vector<Entity>& entities, RunJobsOptions options = {});
+    JobGraph compile_job_graph(const std::vector<Entity>& jobs) const;
+    JobGraph compile_all_jobs_graph() const;
 
     template <typename... Owned>
     void declare_owned_group();
@@ -1896,6 +1918,7 @@ private:
         const Entity entity = create();
         add_system_tag(entity);
         job_schedule_cache_valid_ = false;
+        job_graph_cache_valid_ = false;
         ordered_job_indices_cache_valid_ = false;
         const std::size_t job_index = jobs_.size();
         job_index_by_entity_[entity.value] = job_index;
@@ -2598,6 +2621,8 @@ private:
         return false;
     }
 
+    const JobGraph& cached_all_jobs_graph() const;
+
     std::vector<std::uint64_t> entities_;
     std::uint32_t free_head_ = invalid_index;
     std::unordered_map<std::uint32_t, ComponentRecord> components_;
@@ -2612,6 +2637,8 @@ private:
     JobThreadExecutor job_thread_executor_;
     mutable JobSchedule cached_job_schedule_;
     mutable bool job_schedule_cache_valid_ = false;
+    mutable JobGraph cached_job_graph_;
+    mutable bool job_graph_cache_valid_ = false;
     mutable std::vector<std::size_t> ordered_job_indices_cache_;
     mutable bool ordered_job_indices_cache_valid_ = false;
     std::uint64_t next_job_sequence_ = 0;
@@ -4828,6 +4855,35 @@ public:
             return registry_->cached_job_schedule_;
         }
 
+        JobSchedule result = build_schedule(registry_->ordered_job_indices());
+        registry_->cached_job_schedule_ = result;
+        registry_->job_schedule_cache_valid_ = true;
+        return result;
+    }
+
+    JobSchedule schedule_for_jobs(const std::vector<Entity>& jobs) const {
+        std::vector<std::size_t> ordered_indices;
+        ordered_indices.reserve(jobs.size());
+        for (Entity job : jobs) {
+            ordered_indices.push_back(registry_->job_index(job));
+        }
+        std::sort(
+            ordered_indices.begin(),
+            ordered_indices.end(),
+            [&](std::size_t lhs, std::size_t rhs) {
+                const Registry::JobRecord& left = registry_->jobs_[lhs];
+                const Registry::JobRecord& right = registry_->jobs_[rhs];
+                if (left.order != right.order) {
+                    return left.order < right.order;
+                }
+                return left.sequence < right.sequence;
+            });
+        ordered_indices.erase(std::unique(ordered_indices.begin(), ordered_indices.end()), ordered_indices.end());
+        return build_schedule(ordered_indices);
+    }
+
+private:
+    JobSchedule build_schedule(const std::vector<std::size_t>& ordered_indices) const {
         JobSchedule result;
 
         std::unordered_map<std::uint32_t, std::size_t> last_reader_stage;
@@ -4837,7 +4893,7 @@ public:
         bool has_previous_job = false;
         bool has_structural_barrier = false;
 
-        for (std::size_t job_index : registry_->ordered_job_indices()) {
+        for (std::size_t job_index : ordered_indices) {
             const Registry::JobRecord& job = registry_->jobs_[job_index];
 
             std::size_t stage_index = has_structural_barrier ? structural_barrier_stage + 1 : 0;
@@ -4866,12 +4922,9 @@ public:
             record_write_stage(job.writes, last_writer_stage, stage_index);
         }
 
-        registry_->cached_job_schedule_ = result;
-        registry_->job_schedule_cache_valid_ = true;
         return result;
     }
 
-private:
     static void apply_read_dependencies(
         const std::vector<std::uint32_t>& reads,
         const std::unordered_map<std::uint32_t, std::size_t>& last_writer_stage,
@@ -4925,14 +4978,17 @@ private:
     const Registry* registry_;
 };
 
-inline void Registry::run_jobs(RunJobsOptions options) {
-    const std::size_t job_count = jobs_.size();
+inline void JobGraph::tick(Registry& registry, RunJobsOptions options) const {
+    const std::size_t job_count = registry.jobs_.size();
     if (options.force_single_threaded) {
-        for (std::size_t index : ordered_job_indices()) {
-            if (job_excluded_by_options(jobs_[index], options)) {
-                continue;
+        for (const JobScheduleStage& stage : schedule_.stages) {
+            for (Entity job_entity : stage.jobs) {
+                const std::size_t index = registry.job_index(job_entity);
+                if (index >= job_count || registry.job_excluded_by_options(registry.jobs_[index], options)) {
+                    continue;
+                }
+                registry.jobs_[index].run(registry);
             }
-            jobs_[index].run(*this);
         }
         return;
     }
@@ -4953,17 +5009,16 @@ inline void Registry::run_jobs(RunJobsOptions options) {
         return task;
     };
 
-    const JobSchedule schedule = Orchestrator(*this).schedule();
-    for (const JobScheduleStage& stage : schedule.stages) {
+    for (const JobScheduleStage& stage : schedule_.stages) {
         std::vector<JobThreadTask> tasks;
         for (Entity job_entity : stage.jobs) {
-            const std::size_t index = job_index(job_entity);
+            const std::size_t index = registry.job_index(job_entity);
             if (index >= job_count) {
                 continue;
             }
 
-            JobRecord& job = jobs_[index];
-            if (job_excluded_by_options(job, options)) {
+            Registry::JobRecord& job = registry.jobs_[index];
+            if (registry.job_excluded_by_options(job, options)) {
                 continue;
             }
             if (job.single_thread || job.structural || job.max_threads <= 1) {
@@ -4971,21 +5026,21 @@ inline void Registry::run_jobs(RunJobsOptions options) {
                     job.entity,
                     0,
                     1,
-                    [this, index]() {
-                        jobs_[index].run(*this);
+                    [&registry, index]() {
+                        registry.jobs_[index].run(registry);
                     }}));
                 continue;
             }
 
-            auto indices = std::make_shared<std::vector<std::uint32_t>>(job.collect_indices(*this));
+            auto indices = std::make_shared<std::vector<std::uint32_t>>(job.collect_indices(registry));
             const std::size_t entity_count = indices->size();
             if (entity_count == 0) {
                 tasks.push_back(make_safe_task(JobThreadTask{
                     job.entity,
                     0,
                     1,
-                    [this, index]() {
-                        jobs_[index].run(*this);
+                    [&registry, index]() {
+                        registry.jobs_[index].run(registry);
                     }}));
                 continue;
             }
@@ -5000,14 +5055,14 @@ inline void Registry::run_jobs(RunJobsOptions options) {
                     job.entity,
                     thread_index,
                     thread_count,
-                    [this, index, indices, begin, end]() {
-                        jobs_[index].run_range(*this, *indices, begin, end);
+                    [&registry, index, indices, begin, end]() {
+                        registry.jobs_[index].run_range(registry, *indices, begin, end);
                     }}));
             }
         }
 
-        if (job_thread_executor_) {
-            job_thread_executor_(tasks);
+        if (registry.job_thread_executor_) {
+            registry.job_thread_executor_(tasks);
         } else {
             for (const JobThreadTask& task : tasks) {
                 task.run();
@@ -5020,7 +5075,10 @@ inline void Registry::run_jobs(RunJobsOptions options) {
     }
 }
 
-inline void Registry::run_jobs_for_entities(const std::vector<Entity>& entities, RunJobsOptions options) {
+inline void JobGraph::tick_for_entities(
+    Registry& registry,
+    const std::vector<Entity>& entities,
+    RunJobsOptions options) const {
     if (entities.empty()) {
         return;
     }
@@ -5028,8 +5086,8 @@ inline void Registry::run_jobs_for_entities(const std::vector<Entity>& entities,
     std::vector<std::uint32_t> target_indices;
     target_indices.reserve(entities.size());
     for (Entity entity : entities) {
-        if (alive(entity)) {
-            target_indices.push_back(entity_index(entity));
+        if (registry.alive(entity)) {
+            target_indices.push_back(Registry::entity_index(entity));
         }
     }
     if (target_indices.empty()) {
@@ -5038,23 +5096,26 @@ inline void Registry::run_jobs_for_entities(const std::vector<Entity>& entities,
     std::sort(target_indices.begin(), target_indices.end());
     target_indices.erase(std::unique(target_indices.begin(), target_indices.end()), target_indices.end());
 
-    const std::size_t job_count = jobs_.size();
+    const std::size_t job_count = registry.jobs_.size();
     if (options.force_single_threaded) {
-        for (std::size_t index : ordered_job_indices()) {
-            if (job_excluded_by_options(jobs_[index], options)) {
-                continue;
-            }
-            std::vector<std::uint32_t> indices = jobs_[index].collect_indices(*this);
-            indices.erase(
-                std::remove_if(
-                    indices.begin(),
-                    indices.end(),
-                    [&](std::uint32_t entity_index) {
-                        return !std::binary_search(target_indices.begin(), target_indices.end(), entity_index);
-                    }),
-                indices.end());
-            if (!indices.empty()) {
-                jobs_[index].run_range(*this, indices, 0, indices.size());
+        for (const JobScheduleStage& stage : schedule_.stages) {
+            for (Entity job_entity : stage.jobs) {
+                const std::size_t index = registry.job_index(job_entity);
+                if (index >= job_count || registry.job_excluded_by_options(registry.jobs_[index], options)) {
+                    continue;
+                }
+                std::vector<std::uint32_t> indices = registry.jobs_[index].collect_indices(registry);
+                indices.erase(
+                    std::remove_if(
+                        indices.begin(),
+                        indices.end(),
+                        [&](std::uint32_t entity_index) {
+                            return !std::binary_search(target_indices.begin(), target_indices.end(), entity_index);
+                        }),
+                    indices.end());
+                if (!indices.empty()) {
+                    registry.jobs_[index].run_range(registry, indices, 0, indices.size());
+                }
             }
         }
         return;
@@ -5076,20 +5137,19 @@ inline void Registry::run_jobs_for_entities(const std::vector<Entity>& entities,
         return task;
     };
 
-    const JobSchedule schedule = Orchestrator(*this).schedule();
-    for (const JobScheduleStage& stage : schedule.stages) {
+    for (const JobScheduleStage& stage : schedule_.stages) {
         std::vector<JobThreadTask> tasks;
         for (Entity job_entity : stage.jobs) {
-            const std::size_t index = job_index(job_entity);
+            const std::size_t index = registry.job_index(job_entity);
             if (index >= job_count) {
                 continue;
             }
 
-            JobRecord& job = jobs_[index];
-            if (job_excluded_by_options(job, options)) {
+            Registry::JobRecord& job = registry.jobs_[index];
+            if (registry.job_excluded_by_options(job, options)) {
                 continue;
             }
-            auto indices = std::make_shared<std::vector<std::uint32_t>>(job.collect_indices(*this));
+            auto indices = std::make_shared<std::vector<std::uint32_t>>(job.collect_indices(registry));
             indices->erase(
                 std::remove_if(
                     indices->begin(),
@@ -5107,8 +5167,8 @@ inline void Registry::run_jobs_for_entities(const std::vector<Entity>& entities,
                     job.entity,
                     0,
                     1,
-                    [this, index, indices]() {
-                        jobs_[index].run_range(*this, *indices, 0, indices->size());
+                    [&registry, index, indices]() {
+                        registry.jobs_[index].run_range(registry, *indices, 0, indices->size());
                     }}));
                 continue;
             }
@@ -5124,14 +5184,14 @@ inline void Registry::run_jobs_for_entities(const std::vector<Entity>& entities,
                     job.entity,
                     thread_index,
                     thread_count,
-                    [this, index, indices, begin, end]() {
-                        jobs_[index].run_range(*this, *indices, begin, end);
+                    [&registry, index, indices, begin, end]() {
+                        registry.jobs_[index].run_range(registry, *indices, begin, end);
                     }}));
             }
         }
 
-        if (job_thread_executor_) {
-            job_thread_executor_(tasks);
+        if (registry.job_thread_executor_) {
+            registry.job_thread_executor_(tasks);
         } else {
             for (const JobThreadTask& task : tasks) {
                 task.run();
@@ -5142,6 +5202,30 @@ inline void Registry::run_jobs_for_entities(const std::vector<Entity>& entities,
             std::rethrow_exception(first_exception);
         }
     }
+}
+
+inline JobGraph Registry::compile_job_graph(const std::vector<Entity>& jobs) const {
+    return JobGraph(Orchestrator(*this).schedule_for_jobs(jobs));
+}
+
+inline JobGraph Registry::compile_all_jobs_graph() const {
+    return JobGraph(Orchestrator(*this).schedule());
+}
+
+inline const JobGraph& Registry::cached_all_jobs_graph() const {
+    if (!job_graph_cache_valid_) {
+        cached_job_graph_ = compile_all_jobs_graph();
+        job_graph_cache_valid_ = true;
+    }
+    return cached_job_graph_;
+}
+
+inline void Registry::run_jobs(RunJobsOptions options) {
+    cached_all_jobs_graph().tick(*this, options);
+}
+
+inline void Registry::run_jobs_for_entities(const std::vector<Entity>& entities, RunJobsOptions options) {
+    cached_all_jobs_graph().tick_for_entities(*this, entities, options);
 }
 
 template <typename... Owned>
