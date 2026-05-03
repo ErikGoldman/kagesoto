@@ -2168,6 +2168,7 @@ private:
         auto group = std::make_unique<GroupRecord>();
         group->owned = key;
         groups_.push_back(std::move(group));
+        bump_view_topology_token();
         GroupRecord& created = *groups_.back();
         build_group(created);
         register_group_ownership(created);
@@ -2469,6 +2470,7 @@ private:
         if (found == storages_.end()) {
             auto inserted = storages_.emplace(component_index, std::make_unique<TypeErasedStorage>(record));
             found = inserted.first;
+            bump_view_topology_token();
         }
 
         if (record.type_id != npos_type_id) {
@@ -2477,6 +2479,13 @@ private:
         }
 
         return *found->second;
+    }
+
+    void bump_view_topology_token() noexcept {
+        ++view_topology_token_;
+        if (view_topology_token_ == 0) {
+            view_topology_token_ = 1;
+        }
     }
 
     template <typename T>
@@ -2814,6 +2823,7 @@ private:
     mutable bool ordered_job_indices_cache_valid_ = false;
     std::uint64_t next_job_sequence_ = 0;
     std::uint64_t state_token_ = next_state_token();
+    std::uint64_t view_topology_token_ = 1;
     Entity singleton_entity_;
     Entity primitive_types_[7]{};
     Entity system_tag_;
@@ -3000,6 +3010,7 @@ inline void Registry::restore(const Snapshot& snapshot) {
     singleton_entity_ = snapshot.singleton_entity_;
     system_tag_ = snapshot.system_tag_;
     state_token_ = snapshot.state_token_;
+    bump_view_topology_token();
     std::copy(std::begin(snapshot.primitive_types_), std::end(snapshot.primitive_types_), std::begin(primitive_types_));
     restore_internal_bookkeeping_tags();
 }
@@ -3090,6 +3101,7 @@ inline void Registry::restore(const DeltaSnapshot& snapshot) {
     }
 
     state_token_ = snapshot.state_token_;
+    bump_view_topology_token();
     restore_internal_bookkeeping_tags();
 }
 
@@ -3102,10 +3114,12 @@ public:
     explicit View(Registry& registry)
         : registry_(&registry),
           storages_{{resolve_storage<Components>(registry)...}},
-          group_(registry.best_group_for_view<Components...>()) {}
+          group_(registry.best_group_for_view<Components...>()),
+          cache_token_(registry.view_topology_token_) {}
 
     template <typename Fn>
     void each(Fn&& fn) {
+        refresh_cache_if_needed();
         TypeErasedStorage* driver = driver_storage();
         if (driver == nullptr) {
             if constexpr (!detail::contains_non_singleton_component<Components...>::value) {
@@ -3128,6 +3142,7 @@ public:
     }
 
     std::vector<std::uint32_t> matching_indices() const {
+        refresh_cache_if_needed();
         std::vector<std::uint32_t> indices;
         TypeErasedStorage* driver = driver_storage();
         if (driver == nullptr) {
@@ -3150,6 +3165,7 @@ public:
 
     template <typename Fn>
     void each_index_range(Fn&& fn, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end) {
+        refresh_cache_if_needed();
         Fn& callback = fn;
         for (std::size_t position = begin; position < end; ++position) {
             const std::uint32_t index = indices[position];
@@ -3162,6 +3178,7 @@ public:
 
     template <typename... AccessComponents>
     AccessView<detail::type_list<Components...>, detail::type_list<AccessComponents...>, detail::type_list<>> access() const {
+        refresh_cache_if_needed();
         return AccessView<detail::type_list<Components...>, detail::type_list<AccessComponents...>, detail::type_list<>>(
             *registry_,
             storages_);
@@ -3170,6 +3187,7 @@ public:
     template <typename... OptionalComponents>
     AccessView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<OptionalComponents...>> optional()
         const {
+        refresh_cache_if_needed();
         return AccessView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<OptionalComponents...>>(
             *registry_,
             storages_);
@@ -3183,6 +3201,7 @@ public:
         detail::type_list<Tags...>,
         detail::type_list<>>
     with_tags() const {
+        refresh_cache_if_needed();
         return TagFilteredView<
             detail::type_list<Components...>,
             detail::type_list<>,
@@ -3202,6 +3221,7 @@ public:
         detail::type_list<>,
         detail::type_list<>>
     with_tags(std::initializer_list<Entity> tags) const {
+        refresh_cache_if_needed();
         TagFilteredView<
             detail::type_list<Components...>,
             detail::type_list<>,
@@ -3224,6 +3244,7 @@ public:
         detail::type_list<>,
         detail::type_list<>>
     with_mutable_tags(std::initializer_list<Entity> tags) const {
+        refresh_cache_if_needed();
         TagFilteredView<
             detail::type_list<Components...>,
             detail::type_list<>,
@@ -3247,6 +3268,7 @@ public:
         detail::type_list<>,
         detail::type_list<Tags...>>
     without_tags() const {
+        refresh_cache_if_needed();
         return TagFilteredView<
             detail::type_list<Components...>,
             detail::type_list<>,
@@ -3266,6 +3288,7 @@ public:
         detail::type_list<>,
         detail::type_list<>>
     without_tags(std::initializer_list<Entity> tags) const {
+        refresh_cache_if_needed();
         TagFilteredView<
             detail::type_list<Components...>,
             detail::type_list<>,
@@ -3288,6 +3311,7 @@ public:
         detail::type_list<>,
         detail::type_list<>>
     without_mutable_tags(std::initializer_list<Entity> tags) const {
+        refresh_cache_if_needed();
         TagFilteredView<
             detail::type_list<Components...>,
             detail::type_list<>,
@@ -3323,6 +3347,7 @@ public:
             detail::contains_component<T, Components...>::value && !detail::is_singleton_query<T>::value,
             int>::type = 0>
     bool contains(Entity entity) const {
+        refresh_cache_if_needed();
         if (!registry_->alive(entity)) {
             return false;
         }
@@ -3337,6 +3362,7 @@ public:
             detail::contains_component<T, Components...>::value && !detail::is_singleton_query<T>::value,
             int>::type = 0>
     const detail::component_query_t<T>* try_get(Entity entity) const {
+        refresh_cache_if_needed();
         if (!registry_->alive(entity)) {
             return nullptr;
         }
@@ -3348,6 +3374,7 @@ public:
 
     template <typename T, typename std::enable_if<detail::contains_component<T, Components...>::value, int>::type = 0>
     const detail::component_query_t<T>& get(Entity entity) const {
+        refresh_cache_if_needed();
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
             index = entity_index(registry_->singleton_entity_);
@@ -3365,6 +3392,7 @@ public:
             detail::is_singleton_query<T>::value && detail::contains_component<T, Components...>::value,
             int>::type = 0>
     const detail::component_query_t<T>& get() const {
+        refresh_cache_if_needed();
         const TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
@@ -3377,6 +3405,7 @@ public:
                                   detail::contains_mutable_component<T, Components...>::value,
                               int>::type = 0>
     detail::component_query_t<T>& write(Entity entity) {
+        refresh_cache_if_needed();
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
             index = entity_index(registry_->singleton_entity_);
@@ -3396,6 +3425,7 @@ public:
                 detail::contains_mutable_component<T, Components...>::value,
             int>::type = 0>
     detail::component_query_t<T>& write() {
+        refresh_cache_if_needed();
         TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
@@ -3430,6 +3460,15 @@ private:
     static TypeErasedStorage* resolve_storage(Registry& registry) {
         const Entity component = registry.registered_component<detail::component_query_t<T>>();
         return registry.find_storage(component);
+    }
+
+    void refresh_cache_if_needed() const {
+        if (cache_token_ == registry_->view_topology_token_) {
+            return;
+        }
+        storages_ = {{resolve_storage<Components>(*registry_)...}};
+        group_ = registry_->best_group_for_view<Components...>();
+        cache_token_ = registry_->view_topology_token_;
     }
 
     TypeErasedStorage* driver_storage() const {
@@ -3517,8 +3556,9 @@ private:
     }
 
     Registry* registry_;
-    std::array<TypeErasedStorage*, component_count> storages_;
-    GroupRecord* group_ = nullptr;
+    mutable std::array<TypeErasedStorage*, component_count> storages_;
+    mutable GroupRecord* group_ = nullptr;
+    mutable std::uint64_t cache_token_ = 0;
     bool job_callback_scope_ = false;
 };
 
@@ -3549,10 +3589,12 @@ public:
           iter_storages_(iter_storages),
           access_storages_{{resolve_storage<AccessComponents>(registry)...}},
           optional_storages_{{resolve_storage<OptionalComponents>(registry)...}},
-          group_(registry.best_group_for_view<IterComponents...>()) {}
+          group_(registry.best_group_for_view<IterComponents...>()),
+          cache_token_(registry.view_topology_token_) {}
 
     template <typename Fn>
     void each(Fn&& fn) {
+        refresh_cache_if_needed();
         TypeErasedStorage* driver = driver_storage();
         if (driver == nullptr) {
             if constexpr (!detail::contains_non_singleton_component<IterComponents...>::value) {
@@ -3575,6 +3617,7 @@ public:
     }
 
     std::vector<std::uint32_t> matching_indices() const {
+        refresh_cache_if_needed();
         std::vector<std::uint32_t> indices;
         TypeErasedStorage* driver = driver_storage();
         if (driver == nullptr) {
@@ -3597,6 +3640,7 @@ public:
 
     template <typename Fn>
     void each_index_range(Fn&& fn, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end) {
+        refresh_cache_if_needed();
         Fn& callback = fn;
         for (std::size_t position = begin; position < end; ++position) {
             const std::uint32_t index = indices[position];
@@ -3615,6 +3659,7 @@ public:
             typename detail::type_list_concat<
                 detail::type_list<OptionalComponents...>,
                 detail::type_list<MoreOptionalComponents...>>::type> {
+        refresh_cache_if_needed();
         using NextOptional = typename detail::type_list_concat<
             detail::type_list<OptionalComponents...>,
             detail::type_list<MoreOptionalComponents...>>::type;
@@ -3631,6 +3676,7 @@ public:
                 detail::type_list<AccessComponents...>,
                 detail::type_list<MoreAccessComponents...>>::type,
             detail::type_list<OptionalComponents...>> {
+        refresh_cache_if_needed();
         using NextAccess = typename detail::type_list_concat<
             detail::type_list<AccessComponents...>,
             detail::type_list<MoreAccessComponents...>>::type;
@@ -3647,6 +3693,7 @@ public:
         detail::type_list<Tags...>,
         detail::type_list<>>
     with_tags() const {
+        refresh_cache_if_needed();
         return TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
@@ -3662,6 +3709,7 @@ public:
         detail::type_list<>,
         detail::type_list<>>
     with_tags(std::initializer_list<Entity> tags) const {
+        refresh_cache_if_needed();
         TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
@@ -3680,6 +3728,7 @@ public:
         detail::type_list<>,
         detail::type_list<>>
     with_mutable_tags(std::initializer_list<Entity> tags) const {
+        refresh_cache_if_needed();
         TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
@@ -3699,6 +3748,7 @@ public:
         detail::type_list<>,
         detail::type_list<Tags...>>
     without_tags() const {
+        refresh_cache_if_needed();
         return TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
@@ -3714,6 +3764,7 @@ public:
         detail::type_list<>,
         detail::type_list<>>
     without_tags(std::initializer_list<Entity> tags) const {
+        refresh_cache_if_needed();
         TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
@@ -3732,6 +3783,7 @@ public:
         detail::type_list<>,
         detail::type_list<>>
     without_mutable_tags(std::initializer_list<Entity> tags) const {
+        refresh_cache_if_needed();
         TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
@@ -3764,6 +3816,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     bool contains(Entity entity) const {
+        refresh_cache_if_needed();
         if (!registry_->alive(entity)) {
             return false;
         }
@@ -3778,6 +3831,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     bool contains() const {
+        refresh_cache_if_needed();
         if (active_callback_index_ == invalid_index) {
             return false;
         }
@@ -3792,6 +3846,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     const detail::component_query_t<T>* try_get(Entity entity) const {
+        refresh_cache_if_needed();
         if (!registry_->alive(entity)) {
             return nullptr;
         }
@@ -3809,6 +3864,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     const detail::component_query_t<T>* try_get() const {
+        refresh_cache_if_needed();
         if (active_callback_index_ == invalid_index) {
             return nullptr;
         }
@@ -3825,6 +3881,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     const detail::component_query_t<T>& get(Entity entity) const {
+        refresh_cache_if_needed();
         const TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
@@ -3838,6 +3895,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     const detail::component_query_t<T>& get() const {
+        refresh_cache_if_needed();
         assert(active_callback_index_ != invalid_index);
         const TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
@@ -3852,6 +3910,7 @@ public:
                 detail::contains_component<T, IterComponents..., AccessComponents...>::value,
             int>::type = 0>
     const detail::component_query_t<T>& get() const {
+        refresh_cache_if_needed();
         const TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
@@ -3867,6 +3926,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     detail::component_query_t<T>& write(Entity entity) {
+        refresh_cache_if_needed();
         TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
@@ -3881,6 +3941,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     detail::component_query_t<T>& write() {
+        refresh_cache_if_needed();
         assert(active_callback_index_ != invalid_index);
         TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
@@ -3896,6 +3957,7 @@ public:
                 detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
             int>::type = 0>
     detail::component_query_t<T>& write() {
+        refresh_cache_if_needed();
         TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
@@ -3923,6 +3985,17 @@ private:
     static TypeErasedStorage* resolve_storage(Registry& registry) {
         const Entity component = registry.registered_component<detail::component_query_t<T>>();
         return registry.find_storage(component);
+    }
+
+    void refresh_cache_if_needed() const {
+        if (cache_token_ == registry_->view_topology_token_) {
+            return;
+        }
+        iter_storages_ = {{resolve_storage<IterComponents>(*registry_)...}};
+        access_storages_ = {{resolve_storage<AccessComponents>(*registry_)...}};
+        optional_storages_ = {{resolve_storage<OptionalComponents>(*registry_)...}};
+        group_ = registry_->best_group_for_view<IterComponents...>();
+        cache_token_ = registry_->view_topology_token_;
     }
 
     TypeErasedStorage* driver_storage() const {
@@ -4054,10 +4127,11 @@ private:
     }
 
     Registry* registry_;
-    std::array<TypeErasedStorage*, sizeof...(IterComponents)> iter_storages_;
-    std::array<TypeErasedStorage*, sizeof...(AccessComponents)> access_storages_;
-    std::array<TypeErasedStorage*, sizeof...(OptionalComponents)> optional_storages_;
-    GroupRecord* group_ = nullptr;
+    mutable std::array<TypeErasedStorage*, sizeof...(IterComponents)> iter_storages_;
+    mutable std::array<TypeErasedStorage*, sizeof...(AccessComponents)> access_storages_;
+    mutable std::array<TypeErasedStorage*, sizeof...(OptionalComponents)> optional_storages_;
+    mutable GroupRecord* group_ = nullptr;
+    mutable std::uint64_t cache_token_ = 0;
     std::uint32_t active_callback_index_ = invalid_index;
     bool job_callback_scope_ = false;
 };
@@ -4092,7 +4166,8 @@ public:
           access_storages_(access_storages),
           optional_storages_(optional_storages),
           with_tag_storages_{{resolve_tag_storage<WithTags>(registry)...}},
-          without_tag_storages_{{resolve_tag_storage<WithoutTags>(registry)...}} {}
+          without_tag_storages_{{resolve_tag_storage<WithoutTags>(registry)...}},
+          cache_token_(registry.view_topology_token_) {}
 
     void add_runtime_with_tags(std::initializer_list<Entity> tags, bool mutable_access) {
         append_runtime_tags(tags, runtime_with_tags_, runtime_with_tag_storages_, mutable_access);
@@ -4110,6 +4185,7 @@ public:
             detail::type_list<OptionalComponents...>,
             typename detail::type_list_concat<detail::type_list<WithTags...>, detail::type_list<Tags...>>::type,
             detail::type_list<WithoutTags...>> {
+        refresh_cache_if_needed();
         using NextWith =
             typename detail::type_list_concat<detail::type_list<WithTags...>, detail::type_list<Tags...>>::type;
         TagFilteredView<
@@ -4130,6 +4206,7 @@ public:
             detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             detail::type_list<WithoutTags...>> {
+        refresh_cache_if_needed();
         auto view = *this;
         view.add_runtime_with_tags(tags, false);
         return view;
@@ -4142,6 +4219,7 @@ public:
             detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             detail::type_list<WithoutTags...>> {
+        refresh_cache_if_needed();
         auto view = *this;
         view.add_runtime_with_tags(tags, true);
         return view;
@@ -4155,6 +4233,7 @@ public:
             detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             typename detail::type_list_concat<detail::type_list<WithoutTags...>, detail::type_list<Tags...>>::type> {
+        refresh_cache_if_needed();
         using NextWithout =
             typename detail::type_list_concat<detail::type_list<WithoutTags...>, detail::type_list<Tags...>>::type;
         TagFilteredView<
@@ -4175,6 +4254,7 @@ public:
             detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             detail::type_list<WithoutTags...>> {
+        refresh_cache_if_needed();
         auto view = *this;
         view.add_runtime_without_tags(tags, false);
         return view;
@@ -4187,6 +4267,7 @@ public:
             detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             detail::type_list<WithoutTags...>> {
+        refresh_cache_if_needed();
         auto view = *this;
         view.add_runtime_without_tags(tags, true);
         return view;
@@ -4194,7 +4275,7 @@ public:
 
     template <typename Fn>
     void each(Fn&& fn) {
-        refresh_runtime_tag_storages();
+        refresh_cache_if_needed();
         TypeErasedStorage* driver = driver_storage();
         if (driver == nullptr) {
             return;
@@ -4213,7 +4294,7 @@ public:
     }
 
     std::vector<std::uint32_t> matching_indices() {
-        refresh_runtime_tag_storages();
+        refresh_cache_if_needed();
         std::vector<std::uint32_t> indices;
         TypeErasedStorage* driver = driver_storage();
         if (driver == nullptr) {
@@ -4233,7 +4314,7 @@ public:
 
     template <typename Fn>
     void each_index_range(Fn&& fn, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end) {
-        refresh_runtime_tag_storages();
+        refresh_cache_if_needed();
         Fn& callback = fn;
         for (std::size_t position = begin; position < end; ++position) {
             const std::uint32_t index = indices[position];
@@ -4251,6 +4332,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     bool contains(Entity entity) const {
+        refresh_cache_if_needed();
         if (!registry_->alive(entity)) {
             return false;
         }
@@ -4266,6 +4348,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     bool contains() const {
+        refresh_cache_if_needed();
         if (active_callback_index_ == invalid_index) {
             return false;
         }
@@ -4280,6 +4363,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     const detail::component_query_t<T>* try_get(Entity entity) const {
+        refresh_cache_if_needed();
         if (!registry_->alive(entity)) {
             return nullptr;
         }
@@ -4297,6 +4381,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     const detail::component_query_t<T>* try_get() const {
+        refresh_cache_if_needed();
         if (active_callback_index_ == invalid_index) {
             return nullptr;
         }
@@ -4313,6 +4398,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     const detail::component_query_t<T>& get(Entity entity) const {
+        refresh_cache_if_needed();
         const TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
@@ -4326,6 +4412,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     const detail::component_query_t<T>& get() const {
+        refresh_cache_if_needed();
         assert(active_callback_index_ != invalid_index);
         const TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
@@ -4340,6 +4427,7 @@ public:
                 detail::contains_component<T, IterComponents..., AccessComponents...>::value,
             int>::type = 0>
     const detail::component_query_t<T>& get() const {
+        refresh_cache_if_needed();
         const TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
@@ -4355,6 +4443,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     detail::component_query_t<T>& write(Entity entity) {
+        refresh_cache_if_needed();
         TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
@@ -4369,6 +4458,7 @@ public:
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     detail::component_query_t<T>& write() {
+        refresh_cache_if_needed();
         assert(active_callback_index_ != invalid_index);
         TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
@@ -4384,6 +4474,7 @@ public:
                 detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
             int>::type = 0>
     detail::component_query_t<T>& write() {
+        refresh_cache_if_needed();
         TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
@@ -4428,7 +4519,7 @@ public:
         detail::RegistryAccessAllowedScope scope;
 #endif
         const bool added = registry_->add_tag(entity, tag);
-        refresh_runtime_tag_storages();
+        refresh_cache_if_needed();
         return added;
     }
 
@@ -4496,6 +4587,12 @@ private:
         return registry.find_storage(tag);
     }
 
+    template <typename T>
+    static TypeErasedStorage* resolve_storage(Registry& registry) {
+        const Entity component = registry.registered_component<detail::component_query_t<T>>();
+        return registry.find_storage(component);
+    }
+
     void append_runtime_tags(
         std::initializer_list<Entity> tags,
         std::vector<Entity>& target,
@@ -4521,14 +4618,27 @@ private:
         other.mutable_runtime_tags_ = mutable_runtime_tags_;
     }
 
-    void refresh_runtime_tag_storages() {
+    void refresh_cache_if_needed() const {
+        if (cache_token_ == registry_->view_topology_token_) {
+            return;
+        }
+        iter_storages_ = {{resolve_storage<IterComponents>(*registry_)...}};
+        access_storages_ = {{resolve_storage<AccessComponents>(*registry_)...}};
+        optional_storages_ = {{resolve_storage<OptionalComponents>(*registry_)...}};
+        with_tag_storages_ = {{resolve_tag_storage<WithTags>(*registry_)...}};
+        without_tag_storages_ = {{resolve_tag_storage<WithoutTags>(*registry_)...}};
+        refresh_runtime_tag_storages();
+        cache_token_ = registry_->view_topology_token_;
+    }
+
+    void refresh_runtime_tag_storages() const {
         refresh_runtime_tag_storages(runtime_with_tags_, runtime_with_tag_storages_);
         refresh_runtime_tag_storages(runtime_without_tags_, runtime_without_tag_storages_);
     }
 
     void refresh_runtime_tag_storages(
         const std::vector<Entity>& tags,
-        std::vector<TypeErasedStorage*>& storages) {
+        std::vector<TypeErasedStorage*>& storages) const {
         assert(tags.size() == storages.size());
         for (std::size_t i = 0; i < tags.size(); ++i) {
             storages[i] = registry_->find_storage(tags[i]);
@@ -4707,16 +4817,17 @@ private:
     }
 
     Registry* registry_;
-    std::array<TypeErasedStorage*, sizeof...(IterComponents)> iter_storages_;
-    std::array<TypeErasedStorage*, sizeof...(AccessComponents)> access_storages_;
-    std::array<TypeErasedStorage*, sizeof...(OptionalComponents)> optional_storages_;
-    std::array<TypeErasedStorage*, sizeof...(WithTags)> with_tag_storages_;
-    std::array<TypeErasedStorage*, sizeof...(WithoutTags)> without_tag_storages_;
+    mutable std::array<TypeErasedStorage*, sizeof...(IterComponents)> iter_storages_;
+    mutable std::array<TypeErasedStorage*, sizeof...(AccessComponents)> access_storages_;
+    mutable std::array<TypeErasedStorage*, sizeof...(OptionalComponents)> optional_storages_;
+    mutable std::array<TypeErasedStorage*, sizeof...(WithTags)> with_tag_storages_;
+    mutable std::array<TypeErasedStorage*, sizeof...(WithoutTags)> without_tag_storages_;
     std::vector<Entity> runtime_with_tags_;
     std::vector<Entity> runtime_without_tags_;
-    std::vector<TypeErasedStorage*> runtime_with_tag_storages_;
-    std::vector<TypeErasedStorage*> runtime_without_tag_storages_;
+    mutable std::vector<TypeErasedStorage*> runtime_with_tag_storages_;
+    mutable std::vector<TypeErasedStorage*> runtime_without_tag_storages_;
     std::vector<Entity> mutable_runtime_tags_;
+    mutable std::uint64_t cache_token_ = 0;
     std::uint32_t active_callback_index_ = invalid_index;
     bool job_callback_scope_ = false;
 };

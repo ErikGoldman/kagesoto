@@ -1121,7 +1121,7 @@ TEST_CASE("missing access-only storage does not suppress view iteration") {
     REQUIRE(calls == 1);
 }
 
-TEST_CASE("views keep storage pointers captured at construction") {
+TEST_CASE("stored views refresh storage pointers after construction") {
     ecs::Registry registry;
     registry.register_component<Position>("Position");
 
@@ -1130,11 +1130,11 @@ TEST_CASE("views keep storage pointers captured at construction") {
     const ecs::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{1, 2}) != nullptr);
 
-    int stale_view_calls = 0;
+    int refreshed_view_calls = 0;
     view_before_storage.each([&](ecs::Entity, Position&) {
-        ++stale_view_calls;
+        ++refreshed_view_calls;
     });
-    REQUIRE(stale_view_calls == 0);
+    REQUIRE(refreshed_view_calls == 1);
 
     auto view_after_storage = registry.view<Position>();
     int live_view_calls = 0;
@@ -1204,6 +1204,106 @@ TEST_CASE("view iteration tolerates later entities gaining non-driver components
     REQUIRE(std::find(after.begin(), after.end(), first) != after.end());
     REQUIRE(std::find(after.begin(), after.end(), later) != after.end());
     REQUIRE(registry.get<Velocity>(later).dx == 2.0f);
+}
+
+TEST_CASE("stored view sees entities added after view construction") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    auto view = registry.view<Position>();
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+
+    std::vector<ecs::Entity> visited;
+    view.each([&](ecs::Entity current, Position& position) {
+        visited.push_back(current);
+        position.x = 7;
+    });
+
+    REQUIRE(visited == std::vector<ecs::Entity>{entity});
+    REQUIRE(registry.get<Position>(entity).x == 7);
+}
+
+TEST_CASE("stored access and optional views see entities added after view construction") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+    registry.register_component<Health>("Health");
+
+    auto access_view = registry.view<Position>().access<Velocity>();
+    auto optional_view = registry.view<Position>().optional<Health>();
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(entity, Velocity{2.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Health>(entity, Health{3}) != nullptr);
+
+    std::vector<ecs::Entity> access_visited;
+    access_view.each([&](auto& view, ecs::Entity current, Position& position) {
+        access_visited.push_back(current);
+        view.template write<Velocity>(current).dx += static_cast<float>(position.x);
+    });
+
+    int optional_calls = 0;
+    int health_sum = 0;
+    optional_view.each([&](auto& view, ecs::Entity current, Position& position) {
+        REQUIRE(current == entity);
+        ++optional_calls;
+        position.x = 5;
+        if (const Health* health = view.template try_get<Health>()) {
+            health_sum += health->value;
+        }
+    });
+
+    REQUIRE(access_visited == std::vector<ecs::Entity>{entity});
+    REQUIRE(registry.get<Velocity>(entity).dx == 3.0f);
+    REQUIRE(optional_calls == 1);
+    REQUIRE(health_sum == 3);
+    REQUIRE(registry.get<Position>(entity).x == 5);
+}
+
+TEST_CASE("stored view matching indices sees entities added after view construction") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    auto view = registry.view<Position>();
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+
+    const std::vector<std::uint32_t> indices = view.matching_indices();
+
+    REQUIRE(indices.size() == 1);
+}
+
+TEST_CASE("stored tag filtered view sees entities tagged after view construction") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Active>("Active");
+
+    auto typed_tag_view = registry.view<Position>().with_tags<const Active>();
+    const ecs::Entity active_tag = registry.component<Active>();
+    auto runtime_tag_view = registry.view<Position>().with_tags({active_tag});
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Active>(entity));
+
+    std::vector<ecs::Entity> typed_visited;
+    typed_tag_view.each([&](ecs::Entity current, Position& position) {
+        typed_visited.push_back(current);
+        position.x = 2;
+    });
+
+    std::vector<ecs::Entity> runtime_visited;
+    runtime_tag_view.each([&](ecs::Entity current, Position& position) {
+        runtime_visited.push_back(current);
+        position.y = 3;
+    });
+
+    REQUIRE(typed_visited == std::vector<ecs::Entity>{entity});
+    REQUIRE(runtime_visited == std::vector<ecs::Entity>{entity});
+    REQUIRE(registry.get<Position>(entity).x == 2);
+    REQUIRE(registry.get<Position>(entity).y == 3);
 }
 
 TEST_CASE("view iteration tolerates later entities losing non-driver components") {
