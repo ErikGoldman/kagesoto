@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -2752,6 +2753,135 @@ TEST_CASE("registry snapshots exclude system-tagged job bookkeeping entities") {
 
     registry.run_jobs();
     REQUIRE(calls == 1);
+}
+
+TEST_CASE("registry full snapshots write read and restore from disk format") {
+    ecs::Registry source;
+    const ecs::Entity position_component = source.register_component<Position>("Position");
+    source.register_component<Velocity>("Velocity");
+    source.register_component<Active>("Active");
+    source.register_component<GameTime>("GameTime");
+    REQUIRE(source.set_component_fields(
+        position_component,
+        {ecs::ComponentField{"x", offsetof(Position, x), source.primitive_type(ecs::PrimitiveType::I32), 1}}));
+
+    const ecs::Entity entity = source.create();
+    REQUIRE(source.add<Position>(entity, Position{3, 4}) != nullptr);
+    REQUIRE(source.add<Velocity>(entity, Velocity{1.5f, 2.5f}) != nullptr);
+    REQUIRE(source.add<Active>(entity));
+    REQUIRE(source.clear_dirty<Position>(entity));
+    source.write<GameTime>().tick = 99;
+
+    std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
+    source.snapshot().write(stream);
+
+    ecs::Registry::Snapshot loaded = ecs::Registry::Snapshot::read(stream);
+    ecs::Registry restored;
+    restored.restore(loaded);
+
+    REQUIRE(restored.alive(entity));
+    REQUIRE(restored.component<Position>() == position_component);
+    REQUIRE(restored.get<Position>(entity).x == 3);
+    REQUIRE(restored.get<Position>(entity).y == 4);
+    REQUIRE(restored.get<Velocity>(entity).dx == 1.5f);
+    REQUIRE(restored.has<Active>(entity));
+    REQUIRE_FALSE(restored.is_dirty<Position>(entity));
+    REQUIRE(restored.is_dirty<Velocity>(entity));
+    REQUIRE(restored.get<GameTime>().tick == 99);
+    REQUIRE(restored.is_dirty<GameTime>());
+    REQUIRE(restored.component_fields(position_component)->size() == 1);
+}
+
+TEST_CASE("registry delta snapshots write read and restore from disk format") {
+    ecs::Registry source;
+    source.register_component<Position>("Position");
+    source.register_component<Velocity>("Velocity");
+    source.register_component<Active>("Active");
+
+    const ecs::Entity updated = source.create();
+    const ecs::Entity removed_component = source.create();
+    const ecs::Entity destroyed = source.create();
+    REQUIRE(source.add<Position>(updated, Position{1, 1}) != nullptr);
+    REQUIRE(source.add<Velocity>(updated, Velocity{1.0f, 1.0f}) != nullptr);
+    REQUIRE(source.add<Position>(removed_component, Position{2, 2}) != nullptr);
+    REQUIRE(source.add<Velocity>(removed_component, Velocity{2.0f, 2.0f}) != nullptr);
+    REQUIRE(source.add<Position>(destroyed, Position{3, 3}) != nullptr);
+    REQUIRE(source.add<Active>(destroyed));
+    source.clear_all_dirty<Position>();
+    source.clear_all_dirty<Velocity>();
+    source.clear_all_dirty<Active>();
+
+    auto baseline = source.snapshot();
+    ecs::Registry replay;
+    replay.register_component<Position>("Position");
+    replay.register_component<Velocity>("Velocity");
+    replay.register_component<Active>("Active");
+    replay.restore(baseline);
+
+    source.write<Position>(updated).x = 10;
+    REQUIRE(source.remove<Velocity>(removed_component));
+    REQUIRE(source.destroy(destroyed));
+
+    std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
+    source.delta_snapshot(baseline).write(stream);
+
+    ecs::Registry::DeltaSnapshot loaded = ecs::Registry::DeltaSnapshot::read(stream);
+    replay.restore(loaded);
+
+    REQUIRE(replay.get<Position>(updated).x == 10);
+    REQUIRE(replay.get<Position>(updated).y == 1);
+    REQUIRE_FALSE(replay.contains<Velocity>(removed_component));
+    REQUIRE_FALSE(replay.alive(destroyed));
+    REQUIRE_FALSE(replay.contains<Position>(destroyed));
+    REQUIRE_FALSE(replay.has<Active>(destroyed));
+    REQUIRE(replay.is_dirty<Position>(updated));
+    REQUIRE(replay.is_dirty<Velocity>(removed_component));
+}
+
+TEST_CASE("registry disk snapshot component filters include and exclude storage") {
+    ecs::Registry source;
+    source.register_component<Position>("Position");
+    source.register_component<Velocity>("Velocity");
+
+    const ecs::Entity entity = source.create();
+    REQUIRE(source.add<Position>(entity, Position{8, 9}) != nullptr);
+    REQUIRE(source.add<Velocity>(entity, Velocity{3.0f, 4.0f}) != nullptr);
+
+    ecs::SnapshotIoOptions options;
+    options.include_components.push_back(source.component<Position>());
+    std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
+    source.snapshot().write(stream, options);
+
+    ecs::Registry restored;
+    restored.restore(ecs::Registry::Snapshot::read(stream));
+
+    REQUIRE(restored.contains<Position>(entity));
+    REQUIRE(restored.get<Position>(entity).x == 8);
+    REQUIRE_THROWS_AS(restored.component<Velocity>(), std::logic_error);
+}
+
+TEST_CASE("registry disk snapshots reject selected non-trivial component storage") {
+    ecs::Registry source;
+    source.register_component<Position>("Position");
+    source.register_component<CopyableName>("CopyableName");
+
+    const ecs::Entity entity = source.create();
+    REQUIRE(source.add<Position>(entity, Position{1, 2}) != nullptr);
+    REQUIRE(source.add<CopyableName>(entity, CopyableName{"not raw serializable"}) != nullptr);
+
+    std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
+    REQUIRE_THROWS_AS(source.snapshot().write(stream), std::logic_error);
+
+    ecs::SnapshotIoOptions options;
+    options.include_components.push_back(source.component<Position>());
+    std::stringstream filtered(std::ios::in | std::ios::out | std::ios::binary);
+    REQUIRE_NOTHROW(source.snapshot().write(filtered, options));
+}
+
+TEST_CASE("registry disk snapshot read rejects invalid headers") {
+    std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
+    stream.write("bad", 3);
+    REQUIRE_THROWS_AS(ecs::Registry::Snapshot::read(stream), std::runtime_error);
 }
 
 TEST_CASE("delta snapshots restore dirty values additions removals and destroyed entities") {

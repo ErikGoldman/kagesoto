@@ -10,12 +10,14 @@
 #include <exception>
 #include <functional>
 #include <initializer_list>
+#include <istream>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <numeric>
+#include <ostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -260,6 +262,11 @@ struct RunJobsOptions {
     bool force_single_threaded = false;
     const Entity* excluded_job_tags = nullptr;
     std::size_t excluded_job_tag_count = 0;
+};
+
+struct SnapshotIoOptions {
+    std::vector<Entity> include_components;
+    std::vector<Entity> exclude_components;
 };
 
 struct JobThreadTask {
@@ -1526,6 +1533,11 @@ private:
             return clone_compact_filtered(excluded, true);
         }
 
+        friend void write_storage(std::ostream& out, const Registry::TypeErasedStorage& storage);
+        friend std::unique_ptr<Registry::TypeErasedStorage> read_storage(
+            std::istream& in,
+            const Registry::ComponentRecord& record);
+
     private:
         TypeErasedStorage(ComponentInfo info, ComponentLifecycle lifecycle)
             : info_(info), lifecycle_(lifecycle) {}
@@ -1964,6 +1976,45 @@ private:
         std::vector<std::uint32_t> owned;
         std::size_t size = 0;
     };
+
+    friend void write_component_record(std::ostream& out, const Registry::ComponentRecord& record);
+    friend Registry::ComponentRecord read_component_record(std::istream& in);
+    friend void write_storage(std::ostream& out, const Registry::TypeErasedStorage& storage);
+    friend std::unique_ptr<Registry::TypeErasedStorage> read_storage(
+        std::istream& in,
+        const Registry::ComponentRecord& record);
+    friend void validate_serializable_component(const Registry::ComponentRecord& record);
+    friend void write_snapshot_common(
+        std::ostream& out,
+        std::uint32_t kind,
+        const std::vector<std::uint64_t>& entities,
+        std::uint32_t free_head,
+        const std::unordered_map<std::uint32_t, Registry::ComponentRecord>& components,
+        const std::unordered_map<std::uint32_t, std::unique_ptr<Registry::TypeErasedStorage>>& storages,
+        const std::vector<Entity>& typed_components,
+        const std::vector<std::unique_ptr<Registry::GroupRecord>>* groups,
+        Entity singleton_entity,
+        const Entity* primitive_types,
+        Entity system_tag,
+        bool has_entities,
+        std::uint64_t baseline_token,
+        std::uint64_t state_token,
+        const SnapshotIoOptions& options);
+    friend void read_snapshot_header(
+        std::istream& in,
+        std::uint32_t expected_kind,
+        bool& has_entities,
+        std::uint64_t& baseline_token,
+        std::uint64_t& state_token,
+        std::uint32_t& free_head,
+        Entity& singleton_entity,
+        Entity* primitive_types,
+        Entity& system_tag,
+        std::vector<std::uint64_t>& entities,
+        std::unordered_map<std::uint32_t, Registry::ComponentRecord>& components,
+        std::vector<Entity>& typed_components,
+        std::vector<std::unique_ptr<Registry::GroupRecord>>& groups,
+        std::unordered_map<std::uint32_t, std::unique_ptr<Registry::TypeErasedStorage>>& storages);
 
     struct JobRecord {
         Entity entity;
@@ -2838,6 +2889,9 @@ public:
     Snapshot& operator=(Snapshot&&) noexcept = default;
     ~Snapshot() = default;
 
+    void write(std::ostream& out, const SnapshotIoOptions& options = {}) const;
+    static Snapshot read(std::istream& in);
+
 private:
     friend class Registry;
 
@@ -2863,6 +2917,9 @@ public:
     DeltaSnapshot& operator=(DeltaSnapshot&&) noexcept = default;
     ~DeltaSnapshot() = default;
 
+    void write(std::ostream& out, const SnapshotIoOptions& options = {}) const;
+    static DeltaSnapshot read(std::istream& in);
+
 private:
     friend class Registry;
 
@@ -2874,6 +2931,442 @@ private:
     std::uint64_t baseline_token_ = 0;
     std::uint64_t state_token_ = 0;
 };
+
+namespace detail {
+
+inline void write_exact(std::ostream& out, const void* data, std::size_t size) {
+    out.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+    if (!out) {
+        throw std::runtime_error("ecs snapshot write failed");
+    }
+}
+
+inline void read_exact(std::istream& in, void* data, std::size_t size) {
+    in.read(static_cast<char*>(data), static_cast<std::streamsize>(size));
+    if (!in) {
+        throw std::runtime_error("ecs snapshot read failed");
+    }
+}
+
+template <typename T>
+inline void write_pod(std::ostream& out, T value) {
+    static_assert(std::is_trivially_copyable<T>::value, "snapshot POD I/O requires trivially copyable values");
+    write_exact(out, &value, sizeof(T));
+}
+
+template <typename T>
+inline T read_pod(std::istream& in) {
+    static_assert(std::is_trivially_copyable<T>::value, "snapshot POD I/O requires trivially copyable values");
+    T value{};
+    read_exact(in, &value, sizeof(T));
+    return value;
+}
+
+inline void write_string(std::ostream& out, const std::string& value) {
+    write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(value.size()));
+    if (!value.empty()) {
+        write_exact(out, value.data(), value.size());
+    }
+}
+
+inline std::string read_string(std::istream& in) {
+    const auto size = read_pod<std::uint64_t>(in);
+    if (size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::runtime_error("ecs snapshot string is too large");
+    }
+    std::string value(static_cast<std::size_t>(size), '\0');
+    if (!value.empty()) {
+        read_exact(in, &value[0], value.size());
+    }
+    return value;
+}
+
+}  // namespace detail
+
+inline bool snapshot_component_selected(ecs::Entity component, const SnapshotIoOptions& options) {
+    const bool included = options.include_components.empty() ||
+        std::find(options.include_components.begin(), options.include_components.end(), component) !=
+            options.include_components.end();
+    if (!included) {
+        return false;
+    }
+    return std::find(options.exclude_components.begin(), options.exclude_components.end(), component) ==
+        options.exclude_components.end();
+}
+
+inline void write_component_record(std::ostream& out, const Registry::ComponentRecord& record) {
+    detail::write_pod<std::uint64_t>(out, record.entity.value);
+    detail::write_string(out, record.name);
+    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(record.info.size));
+    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(record.info.alignment));
+    detail::write_pod<std::uint8_t>(out, record.info.trivially_copyable ? 1U : 0U);
+    detail::write_pod<std::uint8_t>(out, record.info.tag ? 1U : 0U);
+    detail::write_pod<std::uint8_t>(out, record.singleton ? 1U : 0U);
+    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(record.type_id));
+    detail::write_pod<std::uint32_t>(out, static_cast<std::uint32_t>(record.primitive));
+    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(record.fields.size()));
+    for (const ComponentField& field : record.fields) {
+        detail::write_string(out, field.name);
+        detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(field.offset));
+        detail::write_pod<std::uint64_t>(out, field.type.value);
+        detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(field.count));
+    }
+}
+
+inline Registry::ComponentRecord read_component_record(std::istream& in) {
+    Registry::ComponentRecord record;
+    record.entity = Entity{detail::read_pod<std::uint64_t>(in)};
+    record.name = detail::read_string(in);
+    const auto size = detail::read_pod<std::uint64_t>(in);
+    const auto alignment = detail::read_pod<std::uint64_t>(in);
+    record.info.size = static_cast<std::size_t>(size);
+    record.info.alignment = static_cast<std::size_t>(alignment);
+    record.info.trivially_copyable = detail::read_pod<std::uint8_t>(in) != 0U;
+    record.info.tag = detail::read_pod<std::uint8_t>(in) != 0U;
+    record.singleton = detail::read_pod<std::uint8_t>(in) != 0U;
+    const auto type_id = detail::read_pod<std::uint64_t>(in);
+    record.type_id = type_id > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())
+        ? Registry::npos_type_id
+        : static_cast<std::size_t>(type_id);
+    record.primitive = static_cast<Registry::PrimitiveKind>(detail::read_pod<std::uint32_t>(in));
+    record.lifecycle.trivially_copyable = record.info.trivially_copyable;
+    const auto field_count = detail::read_pod<std::uint64_t>(in);
+    record.fields.reserve(static_cast<std::size_t>(field_count));
+    for (std::uint64_t index = 0; index < field_count; ++index) {
+        ComponentField field;
+        field.name = detail::read_string(in);
+        field.offset = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        field.type = Entity{detail::read_pod<std::uint64_t>(in)};
+        field.count = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        record.fields.push_back(std::move(field));
+    }
+    return record;
+}
+
+inline void write_storage(std::ostream& out, const Registry::TypeErasedStorage& storage) {
+    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(storage.dense_size()));
+    for (std::size_t dense = 0; dense < storage.dense_size(); ++dense) {
+        detail::write_pod<std::uint32_t>(out, storage.dense_index_at(dense));
+        detail::write_pod<std::uint8_t>(out, storage.dirty_[dense]);
+        if (!storage.info_.tag) {
+            detail::write_exact(out, storage.get_dense(dense), storage.info_.size);
+        }
+    }
+    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(storage.tombstone_entry_count()));
+    for (std::size_t position = 0; position < storage.tombstone_entry_count(); ++position) {
+        detail::write_pod<std::uint32_t>(out, storage.tombstone_index_at(position));
+        detail::write_pod<unsigned char>(out, storage.tombstone_flags_at(position));
+    }
+}
+
+inline std::unique_ptr<Registry::TypeErasedStorage> read_storage(
+    std::istream& in,
+    const Registry::ComponentRecord& record) {
+    auto storage = std::make_unique<Registry::TypeErasedStorage>(record);
+    const auto dense_count = detail::read_pod<std::uint64_t>(in);
+    for (std::uint64_t dense = 0; dense < dense_count; ++dense) {
+        const auto entity_index = detail::read_pod<std::uint32_t>(in);
+        const auto dirty = detail::read_pod<std::uint8_t>(in);
+        if (record.info.tag) {
+            storage->emplace_or_replace_tag(entity_index);
+        } else {
+            std::vector<unsigned char> bytes(record.info.size);
+            if (!bytes.empty()) {
+                detail::read_exact(in, bytes.data(), bytes.size());
+            }
+            storage->emplace_or_replace_bytes(entity_index, bytes.empty() ? nullptr : bytes.data());
+        }
+        if (dirty == 0U) {
+            storage->clear_dirty(entity_index);
+        }
+    }
+    const auto tombstone_count = detail::read_pod<std::uint64_t>(in);
+    for (std::uint64_t position = 0; position < tombstone_count; ++position) {
+        const auto entity_index = detail::read_pod<std::uint32_t>(in);
+        const auto flags = detail::read_pod<unsigned char>(in);
+        storage->mark_tombstone(entity_index, flags);
+    }
+    storage->rebuild_lookup();
+    return storage;
+}
+
+inline void validate_serializable_component(const Registry::ComponentRecord& record) {
+    if (!record.info.tag && !record.info.trivially_copyable) {
+        throw std::logic_error("ecs snapshot selected component is not disk serializable");
+    }
+}
+
+inline void write_snapshot_common(
+    std::ostream& out,
+    std::uint32_t kind,
+    const std::vector<std::uint64_t>& entities,
+    std::uint32_t free_head,
+    const std::unordered_map<std::uint32_t, Registry::ComponentRecord>& components,
+    const std::unordered_map<std::uint32_t, std::unique_ptr<Registry::TypeErasedStorage>>& storages,
+    const std::vector<Entity>& typed_components,
+    const std::vector<std::unique_ptr<Registry::GroupRecord>>* groups,
+    Entity singleton_entity,
+    const Entity* primitive_types,
+    Entity system_tag,
+    bool has_entities,
+    std::uint64_t baseline_token,
+    std::uint64_t state_token,
+    const SnapshotIoOptions& options) {
+    constexpr std::uint32_t magic = 0x53534345U;  // ECSS
+    constexpr std::uint32_t version = 1U;
+    detail::write_pod<std::uint32_t>(out, magic);
+    detail::write_pod<std::uint32_t>(out, version);
+    detail::write_pod<std::uint32_t>(out, kind);
+    detail::write_pod<std::uint8_t>(out, has_entities ? 1U : 0U);
+    detail::write_pod<std::uint64_t>(out, baseline_token);
+    detail::write_pod<std::uint64_t>(out, state_token);
+    detail::write_pod<std::uint32_t>(out, free_head);
+    detail::write_pod<std::uint64_t>(out, singleton_entity.value);
+    detail::write_pod<std::uint64_t>(out, system_tag.value);
+    for (std::size_t index = 0; index < 7U; ++index) {
+        detail::write_pod<std::uint64_t>(out, primitive_types[index].value);
+    }
+
+    auto selected = [&](Entity component) {
+        if (component == system_tag) {
+            return true;
+        }
+        for (std::size_t index = 0; index < 7U; ++index) {
+            if (component == primitive_types[index]) {
+                return true;
+            }
+        }
+        return snapshot_component_selected(component, options);
+    };
+
+    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(entities.size()));
+    for (std::uint64_t slot : entities) {
+        detail::write_pod<std::uint64_t>(out, slot);
+    }
+
+    std::vector<std::uint32_t> component_indices;
+    component_indices.reserve(components.size());
+    for (const auto& component : components) {
+        if (selected(component.second.entity)) {
+            validate_serializable_component(component.second);
+            component_indices.push_back(component.first);
+        }
+    }
+    std::sort(component_indices.begin(), component_indices.end());
+    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(component_indices.size()));
+    for (std::uint32_t index : component_indices) {
+        detail::write_pod<std::uint32_t>(out, index);
+        write_component_record(out, components.at(index));
+    }
+
+    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(typed_components.size()));
+    for (Entity component : typed_components) {
+        detail::write_pod<std::uint64_t>(
+            out,
+            selected(component) ? component.value : std::uint64_t{0});
+    }
+
+    if (groups == nullptr) {
+        detail::write_pod<std::uint64_t>(out, 0U);
+    } else {
+        detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(groups->size()));
+        for (const auto& group : *groups) {
+            detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(group->owned.size()));
+            for (std::uint32_t owned : group->owned) {
+                detail::write_pod<std::uint32_t>(out, owned);
+            }
+            detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(group->size));
+        }
+    }
+
+    std::vector<std::uint32_t> storage_indices;
+    storage_indices.reserve(storages.size());
+    for (const auto& storage : storages) {
+        const auto found_component = components.find(storage.first);
+        if (found_component == components.end() ||
+            !selected(found_component->second.entity)) {
+            continue;
+        }
+        validate_serializable_component(found_component->second);
+        storage_indices.push_back(storage.first);
+    }
+    std::sort(storage_indices.begin(), storage_indices.end());
+    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(storage_indices.size()));
+    for (std::uint32_t index : storage_indices) {
+        detail::write_pod<std::uint32_t>(out, index);
+        write_storage(out, *storages.at(index));
+    }
+}
+
+inline void read_snapshot_header(
+    std::istream& in,
+    std::uint32_t expected_kind,
+    bool& has_entities,
+    std::uint64_t& baseline_token,
+    std::uint64_t& state_token,
+    std::uint32_t& free_head,
+    Entity& singleton_entity,
+    Entity* primitive_types,
+    Entity& system_tag,
+    std::vector<std::uint64_t>& entities,
+    std::unordered_map<std::uint32_t, Registry::ComponentRecord>& components,
+    std::vector<Entity>& typed_components,
+    std::vector<std::unique_ptr<Registry::GroupRecord>>& groups,
+    std::unordered_map<std::uint32_t, std::unique_ptr<Registry::TypeErasedStorage>>& storages) {
+    constexpr std::uint32_t magic = 0x53534345U;
+    constexpr std::uint32_t version = 1U;
+    if (detail::read_pod<std::uint32_t>(in) != magic ||
+        detail::read_pod<std::uint32_t>(in) != version ||
+        detail::read_pod<std::uint32_t>(in) != expected_kind) {
+        throw std::runtime_error("ecs snapshot header is invalid");
+    }
+    has_entities = detail::read_pod<std::uint8_t>(in) != 0U;
+    baseline_token = detail::read_pod<std::uint64_t>(in);
+    state_token = detail::read_pod<std::uint64_t>(in);
+    free_head = detail::read_pod<std::uint32_t>(in);
+    singleton_entity = Entity{detail::read_pod<std::uint64_t>(in)};
+    system_tag = Entity{detail::read_pod<std::uint64_t>(in)};
+    for (std::size_t index = 0; index < 7U; ++index) {
+        primitive_types[index] = Entity{detail::read_pod<std::uint64_t>(in)};
+    }
+
+    const auto entity_count = detail::read_pod<std::uint64_t>(in);
+    entities.resize(static_cast<std::size_t>(entity_count));
+    for (std::uint64_t& slot : entities) {
+        slot = detail::read_pod<std::uint64_t>(in);
+    }
+
+    const auto component_count = detail::read_pod<std::uint64_t>(in);
+    for (std::uint64_t offset = 0; offset < component_count; ++offset) {
+        const auto index = detail::read_pod<std::uint32_t>(in);
+        Registry::ComponentRecord record = read_component_record(in);
+        components[index] = std::move(record);
+    }
+
+    const auto typed_count = detail::read_pod<std::uint64_t>(in);
+    typed_components.resize(static_cast<std::size_t>(typed_count));
+    for (Entity& component : typed_components) {
+        component = Entity{detail::read_pod<std::uint64_t>(in)};
+    }
+
+    const auto group_count = detail::read_pod<std::uint64_t>(in);
+    groups.reserve(static_cast<std::size_t>(group_count));
+    for (std::uint64_t group_index = 0; group_index < group_count; ++group_index) {
+        auto group = std::make_unique<Registry::GroupRecord>();
+        const auto owned_count = detail::read_pod<std::uint64_t>(in);
+        group->owned.reserve(static_cast<std::size_t>(owned_count));
+        for (std::uint64_t owned_index = 0; owned_index < owned_count; ++owned_index) {
+            group->owned.push_back(detail::read_pod<std::uint32_t>(in));
+        }
+        group->size = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        groups.push_back(std::move(group));
+    }
+
+    const auto storage_count = detail::read_pod<std::uint64_t>(in);
+    for (std::uint64_t offset = 0; offset < storage_count; ++offset) {
+        const auto index = detail::read_pod<std::uint32_t>(in);
+        const auto found = components.find(index);
+        if (found == components.end()) {
+            throw std::runtime_error("ecs snapshot storage references missing component metadata");
+        }
+        storages[index] = read_storage(in, found->second);
+    }
+}
+
+inline void Registry::Snapshot::write(std::ostream& out, const SnapshotIoOptions& options) const {
+    write_snapshot_common(
+        out,
+        1U,
+        entities_,
+        free_head_,
+        components_,
+        storages_,
+        typed_components_,
+        &groups_,
+        singleton_entity_,
+        primitive_types_,
+        system_tag_,
+        true,
+        0U,
+        state_token_,
+        options);
+}
+
+inline Registry::Snapshot Registry::Snapshot::read(std::istream& in) {
+    Snapshot snapshot;
+    bool has_entities = false;
+    std::uint64_t baseline_token = 0;
+    read_snapshot_header(
+        in,
+        1U,
+        has_entities,
+        baseline_token,
+        snapshot.state_token_,
+        snapshot.free_head_,
+        snapshot.singleton_entity_,
+        snapshot.primitive_types_,
+        snapshot.system_tag_,
+        snapshot.entities_,
+        snapshot.components_,
+        snapshot.typed_components_,
+        snapshot.groups_,
+        snapshot.storages_);
+    if (!has_entities || baseline_token != 0U) {
+        throw std::runtime_error("ecs full snapshot payload is invalid");
+    }
+    for (const auto& component : snapshot.components_) {
+        if (!component.second.name.empty()) {
+            snapshot.component_names_[component.second.name] = component.first;
+        }
+    }
+    return snapshot;
+}
+
+inline void Registry::DeltaSnapshot::write(std::ostream& out, const SnapshotIoOptions& options) const {
+    std::vector<Entity> empty_typed_components;
+    std::array<Entity, 7> empty_primitives{};
+    write_snapshot_common(
+        out,
+        2U,
+        entities_,
+        free_head_,
+        components_,
+        storages_,
+        empty_typed_components,
+        nullptr,
+        Entity{},
+        empty_primitives.data(),
+        Entity{},
+        has_entities_,
+        baseline_token_,
+        state_token_,
+        options);
+}
+
+inline Registry::DeltaSnapshot Registry::DeltaSnapshot::read(std::istream& in) {
+    DeltaSnapshot snapshot;
+    Entity singleton_entity;
+    Entity system_tag;
+    std::array<Entity, 7> primitive_types{};
+    std::vector<Entity> typed_components;
+    std::vector<std::unique_ptr<Registry::GroupRecord>> groups;
+    read_snapshot_header(
+        in,
+        2U,
+        snapshot.has_entities_,
+        snapshot.baseline_token_,
+        snapshot.state_token_,
+        snapshot.free_head_,
+        singleton_entity,
+        primitive_types.data(),
+        system_tag,
+        snapshot.entities_,
+        snapshot.components_,
+        typed_components,
+        groups,
+        snapshot.storages_);
+    return snapshot;
+}
 
 inline Registry::Snapshot Registry::snapshot() const {
     require_runtime_registry_access_allowed("snapshot");
