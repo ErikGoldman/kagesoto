@@ -999,7 +999,7 @@ private:
             std::string message = "ecs Registry::";
             message += operation;
             message += " cannot be used inside an ecs job callback; use the callback view/context and declare";
-            message += " required components on the job with job<...>(), access<...>(), or structural<...>()";
+            message += " required components on the job with job<...>(), access_other_entities<...>(), or structural<...>()";
             throw std::logic_error(message);
         }
 #else
@@ -2042,12 +2042,24 @@ private:
         }
     }
 
+    template <typename T>
+    void append_job_filter_component(JobAccessMetadata& metadata) const {
+        const Entity component = registered_component<detail::component_query_t<T>>();
+        append_unique_component(metadata.reads, entity_index(component));
+    }
+
     template <typename... Components>
     JobAccessMetadata make_job_access_metadata() const {
         JobAccessMetadata metadata;
         (append_job_access_component<Components>(metadata), ...);
         canonicalize_job_metadata(metadata);
         return metadata;
+    }
+
+    template <typename... Components>
+    void append_job_filter_metadata(JobAccessMetadata& metadata) const {
+        (append_job_filter_component<Components>(metadata), ...);
+        canonicalize_job_metadata(metadata);
     }
 
     template <typename... Components>
@@ -3611,6 +3623,22 @@ public:
             iter_storages_);
     }
 
+    template <typename... MoreAccessComponents>
+    auto access() const
+        -> AccessView<
+            detail::type_list<IterComponents...>,
+            typename detail::type_list_concat<
+                detail::type_list<AccessComponents...>,
+                detail::type_list<MoreAccessComponents...>>::type,
+            detail::type_list<OptionalComponents...>> {
+        using NextAccess = typename detail::type_list_concat<
+            detail::type_list<AccessComponents...>,
+            detail::type_list<MoreAccessComponents...>>::type;
+        return AccessView<detail::type_list<IterComponents...>, NextAccess, detail::type_list<OptionalComponents...>>(
+            *registry_,
+            iter_storages_);
+    }
+
     template <typename... Tags>
     TagFilteredView<
         detail::type_list<IterComponents...>,
@@ -3732,7 +3760,7 @@ public:
     template <
         typename T,
         typename std::enable_if<
-            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value &&
+            detail::contains_component<T, AccessComponents...>::value &&
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     bool contains(Entity entity) const {
@@ -3746,7 +3774,21 @@ public:
     template <
         typename T,
         typename std::enable_if<
-            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value &&
+            detail::contains_component<T, IterComponents..., OptionalComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    bool contains() const {
+        if (active_callback_index_ == invalid_index) {
+            return false;
+        }
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        return storage != nullptr && storage->contains_index(active_callback_index_);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::contains_component<T, AccessComponents...>::value &&
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     const detail::component_query_t<T>* try_get(Entity entity) const {
@@ -3754,7 +3796,6 @@ public:
             return nullptr;
         }
         const std::uint32_t index = entity_index(entity);
-        require_optional_entity<T>(index);
         const TypeErasedStorage* storage = storage_for_type<T>();
         return storage != nullptr
             ? static_cast<const detail::component_query_t<T>*>(storage->get(index))
@@ -3764,20 +3805,44 @@ public:
     template <
         typename T,
         typename std::enable_if<
-            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
-            int>::
-            type = 0>
-    const detail::component_query_t<T>& get(Entity entity) const {
-        std::uint32_t index = entity_index(entity);
-        if constexpr (detail::is_singleton_query<T>::value) {
-            index = entity_index(registry_->singleton_entity_);
+            detail::contains_component<T, IterComponents..., OptionalComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    const detail::component_query_t<T>* try_get() const {
+        if (active_callback_index_ == invalid_index) {
+            return nullptr;
         }
-        require_optional_entity<T>(index);
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        return storage != nullptr
+            ? static_cast<const detail::component_query_t<T>*>(storage->get(active_callback_index_))
+            : nullptr;
+    }
 
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::contains_component<T, AccessComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    const detail::component_query_t<T>& get(Entity entity) const {
         const TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
-        return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(index));
+        return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(entity_index(entity)));
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::contains_component<T, IterComponents..., OptionalComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    const detail::component_query_t<T>& get() const {
+        assert(active_callback_index_ != invalid_index);
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        assert(storage != nullptr);
+
+        return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(active_callback_index_));
     }
 
     template <
@@ -3798,19 +3863,29 @@ public:
         typename T,
         typename std::enable_if<
             !std::is_const<typename std::remove_reference<T>::type>::value &&
-                detail::contains_mutable_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
+                detail::contains_mutable_component<T, AccessComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
             int>::type = 0>
     detail::component_query_t<T>& write(Entity entity) {
-        std::uint32_t index = entity_index(entity);
-        if constexpr (detail::is_singleton_query<T>::value) {
-            index = entity_index(registry_->singleton_entity_);
-        }
-        require_optional_entity<T>(index);
-
         TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
-        return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(index));
+        return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(entity_index(entity)));
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            !std::is_const<typename std::remove_reference<T>::type>::value &&
+                detail::contains_mutable_component<T, IterComponents..., OptionalComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    detail::component_query_t<T>& write() {
+        assert(active_callback_index_ != invalid_index);
+        TypeErasedStorage* storage = storage_for_type<T>();
+        assert(storage != nullptr);
+
+        return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(active_callback_index_));
     }
 
     template <
@@ -4172,7 +4247,7 @@ public:
     template <
         typename T,
         typename std::enable_if<
-            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value &&
+            detail::contains_component<T, AccessComponents...>::value &&
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     bool contains(Entity entity) const {
@@ -4180,7 +4255,6 @@ public:
             return false;
         }
         const std::uint32_t index = entity_index(entity);
-        require_optional_entity<T>(index);
         const TypeErasedStorage* storage = storage_for_type<T>();
         return storage != nullptr && storage->contains_index(index);
     }
@@ -4188,7 +4262,21 @@ public:
     template <
         typename T,
         typename std::enable_if<
-            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value &&
+            detail::contains_component<T, IterComponents..., OptionalComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    bool contains() const {
+        if (active_callback_index_ == invalid_index) {
+            return false;
+        }
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        return storage != nullptr && storage->contains_index(active_callback_index_);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::contains_component<T, AccessComponents...>::value &&
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     const detail::component_query_t<T>* try_get(Entity entity) const {
@@ -4196,7 +4284,6 @@ public:
             return nullptr;
         }
         const std::uint32_t index = entity_index(entity);
-        require_optional_entity<T>(index);
         const TypeErasedStorage* storage = storage_for_type<T>();
         return storage != nullptr
             ? static_cast<const detail::component_query_t<T>*>(storage->get(index))
@@ -4206,20 +4293,44 @@ public:
     template <
         typename T,
         typename std::enable_if<
-            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
-            int>::
-            type = 0>
-    const detail::component_query_t<T>& get(Entity entity) const {
-        std::uint32_t index = entity_index(entity);
-        if constexpr (detail::is_singleton_query<T>::value) {
-            index = entity_index(registry_->singleton_entity_);
+            detail::contains_component<T, IterComponents..., OptionalComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    const detail::component_query_t<T>* try_get() const {
+        if (active_callback_index_ == invalid_index) {
+            return nullptr;
         }
-        require_optional_entity<T>(index);
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        return storage != nullptr
+            ? static_cast<const detail::component_query_t<T>*>(storage->get(active_callback_index_))
+            : nullptr;
+    }
 
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::contains_component<T, AccessComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    const detail::component_query_t<T>& get(Entity entity) const {
         const TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
-        return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(index));
+        return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(entity_index(entity)));
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            detail::contains_component<T, IterComponents..., OptionalComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    const detail::component_query_t<T>& get() const {
+        assert(active_callback_index_ != invalid_index);
+        const TypeErasedStorage* storage = storage_for_type<T>();
+        assert(storage != nullptr);
+
+        return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(active_callback_index_));
     }
 
     template <
@@ -4240,19 +4351,29 @@ public:
         typename T,
         typename std::enable_if<
             !std::is_const<typename std::remove_reference<T>::type>::value &&
-                detail::contains_mutable_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
+                detail::contains_mutable_component<T, AccessComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
             int>::type = 0>
     detail::component_query_t<T>& write(Entity entity) {
-        std::uint32_t index = entity_index(entity);
-        if constexpr (detail::is_singleton_query<T>::value) {
-            index = entity_index(registry_->singleton_entity_);
-        }
-        require_optional_entity<T>(index);
-
         TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
 
-        return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(index));
+        return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(entity_index(entity)));
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<
+            !std::is_const<typename std::remove_reference<T>::type>::value &&
+                detail::contains_mutable_component<T, IterComponents..., OptionalComponents...>::value &&
+                !detail::is_singleton_query<T>::value,
+            int>::type = 0>
+    detail::component_query_t<T>& write() {
+        assert(active_callback_index_ != invalid_index);
+        TypeErasedStorage* storage = storage_for_type<T>();
+        assert(storage != nullptr);
+
+        return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(active_callback_index_));
     }
 
     template <
@@ -4621,13 +4742,34 @@ public:
     template <
         typename T,
         typename std::enable_if<!detail::is_singleton_query<T>::value, int>::type = 0>
+    bool contains() const {
+        return view_->template contains<T>();
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<!detail::is_singleton_query<T>::value, int>::type = 0>
     const detail::component_query_t<T>* try_get(Entity entity) const {
         return view_->template try_get<T>(entity);
     }
 
     template <
         typename T,
+        typename std::enable_if<!detail::is_singleton_query<T>::value, int>::type = 0>
+    const detail::component_query_t<T>* try_get() const {
+        return view_->template try_get<T>();
+    }
+
+    template <
+        typename T,
         typename std::enable_if<detail::is_singleton_query<T>::value, int>::type = 0>
+    const detail::component_query_t<T>& get() const {
+        return view_->template get<T>();
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<!detail::is_singleton_query<T>::value, int>::type = 0>
     const detail::component_query_t<T>& get() const {
         return view_->template get<T>();
     }
@@ -4640,6 +4782,13 @@ public:
     template <
         typename T,
         typename std::enable_if<detail::is_singleton_query<T>::value, int>::type = 0>
+    detail::component_query_t<T>& write() {
+        return view_->template write<T>();
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<!detail::is_singleton_query<T>::value, int>::type = 0>
     detail::component_query_t<T>& write() {
         return view_->template write<T>();
     }
@@ -4727,10 +4876,12 @@ public:
     Entity each(Fn&& fn) {
         using Callback = typename std::decay<Fn>::type;
         auto callback = std::make_shared<Callback>(std::forward<Fn>(fn));
+        JobAccessMetadata metadata =
+            registry_->template make_job_access_metadata<IterComponents..., AccessComponents..., OptionalComponents...>();
+        registry_->template append_job_filter_metadata<WithTags..., WithoutTags...>(metadata);
         return registry_->add_job(
             order_,
-            registry_
-                ->template make_job_access_metadata<IterComponents..., AccessComponents..., OptionalComponents...>(),
+            std::move(metadata),
             [callback](Registry& registry) mutable {
                 auto view = make_view(registry);
                 view.job_callback_scope().each(*callback);
@@ -4899,9 +5050,6 @@ public:
 
 private:
     static auto make_view(Registry& registry) {
-        static_assert(
-            sizeof...(AccessComponents) == 0 || sizeof...(OptionalComponents) == 0,
-            "ecs jobs cannot combine access_other_entities and optional components");
         if constexpr (sizeof...(AccessComponents) == 0 && sizeof...(OptionalComponents) == 0) {
             return registry.template view<IterComponents...>()
                 .template with_tags<WithTags...>()
@@ -4914,6 +5062,7 @@ private:
         } else {
             return registry.template view<IterComponents...>()
                 .template access<AccessComponents...>()
+                .template optional<OptionalComponents...>()
                 .template with_tags<WithTags...>()
                 .template without_tags<WithoutTags...>();
         }
@@ -4946,6 +5095,7 @@ public:
         using Callback = typename std::decay<Fn>::type;
         auto callback = std::make_shared<Callback>(std::forward<Fn>(fn));
         JobAccessMetadata metadata = registry_->template make_job_access_metadata<IterComponents..., AccessComponents...>();
+        registry_->template append_job_filter_metadata<WithTags..., WithoutTags...>(metadata);
         registry_->template append_job_structural_metadata<StructuralComponents...>(metadata);
         threading_.single_thread = true;
         threading_.max_threads = 1;
@@ -5199,6 +5349,54 @@ public:
         return *this;
     }
 
+    template <typename... MoreAccessComponents>
+    auto access_other_entities() const
+        -> JobAccessView<
+            detail::type_list<IterComponents...>,
+            typename detail::type_list_concat<
+                detail::type_list<AccessComponents...>,
+                detail::type_list<MoreAccessComponents...>>::type,
+            detail::type_list<OptionalComponents...>> {
+        if (!threading_.single_thread || threading_.max_threads > 1) {
+            throw std::logic_error("ecs access_other_entities jobs must be single threaded");
+        }
+        using NextAccess = typename detail::type_list_concat<
+            detail::type_list<AccessComponents...>,
+            detail::type_list<MoreAccessComponents...>>::type;
+        JobThreadingOptions threading = threading_;
+        threading.single_thread = true;
+        threading.max_threads = 1;
+        return JobAccessView<
+            detail::type_list<IterComponents...>,
+            NextAccess,
+            detail::type_list<OptionalComponents...>>(
+            *registry_,
+            order_,
+            view_.template access<MoreAccessComponents...>(),
+            threading);
+    }
+
+    template <typename... MoreOptionalComponents>
+    auto optional() const
+        -> JobAccessView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            typename detail::type_list_concat<
+                detail::type_list<OptionalComponents...>,
+                detail::type_list<MoreOptionalComponents...>>::type> {
+        using NextOptional = typename detail::type_list_concat<
+            detail::type_list<OptionalComponents...>,
+            detail::type_list<MoreOptionalComponents...>>::type;
+        return JobAccessView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            NextOptional>(
+            *registry_,
+            order_,
+            view_.template optional<MoreOptionalComponents...>(),
+            threading_);
+    }
+
     template <typename Fn>
     Entity each(Fn&& fn) {
         using Callback = typename std::decay<Fn>::type;
@@ -5272,8 +5470,9 @@ public:
 
     template <
         typename T,
-        typename std::enable_if<detail::contains_component<T, IterComponents..., AccessComponents...>::value, int>::
-            type = 0>
+        typename std::enable_if<
+            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
+            int>::type = 0>
     const detail::component_query_t<T>& get(Entity entity) const {
         return view_.template get<T>(entity);
     }
@@ -5282,7 +5481,7 @@ public:
         typename T,
         typename std::enable_if<
             detail::is_singleton_query<T>::value &&
-                detail::contains_component<T, IterComponents..., AccessComponents...>::value,
+                detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
             int>::type = 0>
     const detail::component_query_t<T>& get() const {
         return view_.template get<T>();
@@ -5303,7 +5502,7 @@ public:
         typename std::enable_if<
             detail::is_singleton_query<T>::value &&
                 !std::is_const<typename std::remove_reference<T>::type>::value &&
-                detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
+                detail::contains_mutable_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
             int>::type = 0>
     detail::component_query_t<T>& write() {
         return view_.template write<T>();

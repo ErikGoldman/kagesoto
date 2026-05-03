@@ -110,6 +110,13 @@ struct HasViewGet<
     : std::true_type {};
 
 template <typename View, typename T, typename = void>
+struct HasViewCurrentGet : std::false_type {};
+
+template <typename View, typename T>
+struct HasViewCurrentGet<View, T, std::void_t<decltype(std::declval<View&>().template get<T>())>>
+    : std::true_type {};
+
+template <typename View, typename T, typename = void>
 struct HasViewWrite : std::false_type {};
 
 template <typename View, typename T>
@@ -117,6 +124,13 @@ struct HasViewWrite<
     View,
     T,
     std::void_t<decltype(std::declval<View&>().template write<T>(std::declval<ecs::Entity>()))>>
+    : std::true_type {};
+
+template <typename View, typename T, typename = void>
+struct HasViewCurrentWrite : std::false_type {};
+
+template <typename View, typename T>
+struct HasViewCurrentWrite<View, T, std::void_t<decltype(std::declval<View&>().template write<T>())>>
     : std::true_type {};
 
 template <typename View, typename T, typename = void>
@@ -130,6 +144,13 @@ struct HasViewTryGet<
     : std::true_type {};
 
 template <typename View, typename T, typename = void>
+struct HasViewCurrentTryGet : std::false_type {};
+
+template <typename View, typename T>
+struct HasViewCurrentTryGet<View, T, std::void_t<decltype(std::declval<View&>().template try_get<T>())>>
+    : std::true_type {};
+
+template <typename View, typename T, typename = void>
 struct HasViewContains : std::false_type {};
 
 template <typename View, typename T>
@@ -137,6 +158,13 @@ struct HasViewContains<
     View,
     T,
     std::void_t<decltype(std::declval<View&>().template contains<T>(std::declval<ecs::Entity>()))>>
+    : std::true_type {};
+
+template <typename View, typename T, typename = void>
+struct HasViewCurrentContains : std::false_type {};
+
+template <typename View, typename T>
+struct HasViewCurrentContains<View, T, std::void_t<decltype(std::declval<View&>().template contains<T>())>>
     : std::true_type {};
 
 template <typename View, typename T, typename = void>
@@ -869,11 +897,16 @@ TEST_CASE("views expose gated get and write access for listed components") {
     static_assert(!HasViewWrite<View, const Velocity>::value, "const write query is not writable");
     static_assert(HasViewWrite<View, Velocity>::value, "mutable component can be written through the view");
     static_assert(!HasViewWrite<View, Tracker>::value, "absent component cannot be written through the view");
-    static_assert(HasViewGet<AccessView, Position>::value, "iterated component stays readable on access view");
-    static_assert(HasViewWrite<AccessView, Position>::value, "mutable iterated component stays writable on access view");
+    static_assert(!HasViewGet<AccessView, Position>::value, "iterated component is not readable by entity on access view");
+    static_assert(!HasViewWrite<AccessView, Position>::value, "iterated component is not writable by entity on access view");
+    static_assert(HasViewCurrentGet<AccessView, Position>::value, "iterated component stays readable on active entity");
+    static_assert(HasViewCurrentWrite<AccessView, Position>::value, "mutable iterated component stays writable on active entity");
+    static_assert(HasViewCurrentContains<AccessView, Position>::value, "iterated component can be checked on active entity");
+    static_assert(HasViewCurrentTryGet<AccessView, Position>::value, "iterated component can be read optionally on active entity");
     static_assert(HasViewGet<AccessView, Velocity>::value, "access component can be read");
     static_assert(!HasViewWrite<AccessView, Velocity>::value, "const access component cannot be written");
     static_assert(HasViewWrite<AccessView, Health>::value, "mutable access component can be written");
+    static_assert(!HasViewCurrentGet<AccessView, Health>::value, "access component is not active-entity access");
     static_assert(!HasViewGet<AccessView, Tracker>::value, "absent component cannot be read through access view");
     static_assert(HasViewGet<ExplicitWriteView, Position>::value, "overlapped iterated component can be read");
     static_assert(HasViewWrite<ExplicitWriteView, Position>::value, "mutable access overlap can be written explicitly");
@@ -1436,9 +1469,9 @@ TEST_CASE("jobs can filter iterated entities by typed tags") {
         .without_tags<const Disabled>()
         .max_threads(4)
         .min_entities_per_thread(1)
-        .each([](auto& view, ecs::Entity entity, Position& position) {
+        .each([](auto& view, ecs::Entity, Position& position) {
             position.x += 10;
-            view.template write<Health>(entity).value += 1;
+            view.template write<Health>().value += 1;
         });
     registry.job<const Position>(1)
         .without_tags<const Disabled>()
@@ -1621,6 +1654,41 @@ TEST_CASE("orchestrator includes access view components in job conflicts") {
     REQUIRE(schedule.stages[1].jobs == std::vector<ecs::Entity>{velocity_reader, position_reader});
 }
 
+TEST_CASE("orchestrator includes optional components in job conflicts") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Health>("Health");
+
+    const ecs::Entity health_optional_writer = registry.job<const Position>(0).optional<Health>().each(
+        [](auto&, ecs::Entity, const Position&) {});
+    const ecs::Entity health_reader = registry.job<const Health>(1).each([](ecs::Entity, const Health&) {});
+    const ecs::Entity health_optional_reader = registry.job<const Position>(2).optional<const Health>().each(
+        [](auto&, ecs::Entity, const Position&) {});
+
+    const ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
+
+    REQUIRE(schedule.stages.size() == 2);
+    REQUIRE(schedule.stages[0].jobs == std::vector<ecs::Entity>{health_optional_writer});
+    REQUIRE(schedule.stages[1].jobs == std::vector<ecs::Entity>{health_reader, health_optional_reader});
+}
+
+TEST_CASE("orchestrator includes typed tag filters in job conflicts") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Disabled>("Disabled");
+
+    const ecs::Entity tag_writer = registry.job<const Position>(0).structural<Disabled>().each(
+        [](auto&, ecs::Entity, const Position&) {});
+    const ecs::Entity tag_filtered_reader = registry.job<const Position>(1).without_tags<const Disabled>().each(
+        [](ecs::Entity, const Position&) {});
+
+    const ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
+
+    REQUIRE(schedule.stages.size() == 2);
+    REQUIRE(schedule.stages[0].jobs == std::vector<ecs::Entity>{tag_writer});
+    REQUIRE(schedule.stages[1].jobs == std::vector<ecs::Entity>{tag_filtered_reader});
+}
+
 TEST_CASE("jobs are persistent and use access views") {
     ecs::Registry registry;
     registry.register_component<Position>("Position");
@@ -1656,13 +1724,12 @@ TEST_CASE("job optional components do not filter and are limited to current enti
     int calls = 0;
     int health_sum = 0;
     registry.job<Position>(0).optional<Health>().each(
-        [&](auto& view, ecs::Entity entity, Position&) {
+        [&](auto& view, ecs::Entity, Position&) {
             ++calls;
-            if (const Health* health = view.template try_get<Health>(entity)) {
+            if (const Health* health = view.template try_get<Health>()) {
                 health_sum += health->value;
             }
-            const ecs::Entity other = entity == with_health ? without_health : with_health;
-            REQUIRE_THROWS_AS(view.template try_get<Health>(other), std::logic_error);
+            static_assert(!HasViewTryGet<decltype(view), Health>::value);
         });
 
     registry.run_jobs();
@@ -1685,9 +1752,9 @@ TEST_CASE("optional jobs can be threaded but access other entities jobs are sing
     }
 
     registry.job<Position>(0).optional<Health>().max_threads(2).min_entities_per_thread(1).each(
-        [](auto& view, ecs::Entity entity, Position& position) {
-            if (view.template contains<Health>(entity)) {
-                position.x += view.template write<Health>(entity).value;
+        [](auto& view, ecs::Entity, Position& position) {
+            if (view.template contains<Health>()) {
+                position.x += view.template write<Health>().value;
             }
         });
     registry.job<Position>(1).access_other_entities<Health>().each([](auto&, ecs::Entity, Position&) {});
