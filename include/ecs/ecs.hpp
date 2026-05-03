@@ -26,6 +26,14 @@
 #include <utility>
 #include <vector>
 
+#ifndef ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#ifdef NDEBUG
+#define ECS_RUNTIME_REGISTRY_ACCESS_CHECKING 0
+#else
+#define ECS_RUNTIME_REGISTRY_ACCESS_CHECKING 1
+#endif
+#endif
+
 namespace ecs {
 
 template <typename T>
@@ -107,6 +115,67 @@ struct contains_mutable_component<T, First, Rest...>
               std::is_same<component_query_t<T>, component_query_t<First>>::value,
           std::true_type,
           contains_mutable_component<T, Rest...>>::type {};
+
+template <typename Requested, typename Available>
+struct component_access_allowed_pair
+    : std::integral_constant<
+          bool,
+          std::is_same<component_query_t<Requested>, component_query_t<Available>>::value &&
+              (std::is_const<typename std::remove_reference<Requested>::type>::value ||
+               !std::is_const<typename std::remove_reference<Available>::type>::value)> {};
+
+template <typename Requested, typename... AvailableComponents>
+struct contains_accessible_component
+    : std::integral_constant<bool, (component_access_allowed_pair<Requested, AvailableComponents>::value || ...)> {};
+
+template <typename AvailableList>
+struct requested_components_allowed;
+
+template <typename... AvailableComponents>
+struct requested_components_allowed<type_list<AvailableComponents...>> {
+    template <typename... RequestedComponents>
+    struct with
+        : std::integral_constant<
+              bool,
+              (contains_accessible_component<RequestedComponents, AvailableComponents...>::value && ...)> {};
+};
+
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+inline thread_local std::size_t registry_access_forbidden_depth = 0;
+inline thread_local std::size_t registry_access_allowed_depth = 0;
+
+class RegistryAccessForbiddenScope {
+public:
+    RegistryAccessForbiddenScope() {
+        ++registry_access_forbidden_depth;
+    }
+
+    RegistryAccessForbiddenScope(const RegistryAccessForbiddenScope&) = delete;
+    RegistryAccessForbiddenScope& operator=(const RegistryAccessForbiddenScope&) = delete;
+
+    ~RegistryAccessForbiddenScope() {
+        --registry_access_forbidden_depth;
+    }
+};
+
+class RegistryAccessAllowedScope {
+public:
+    RegistryAccessAllowedScope() {
+        ++registry_access_allowed_depth;
+    }
+
+    RegistryAccessAllowedScope(const RegistryAccessAllowedScope&) = delete;
+    RegistryAccessAllowedScope& operator=(const RegistryAccessAllowedScope&) = delete;
+
+    ~RegistryAccessAllowedScope() {
+        --registry_access_allowed_depth;
+    }
+};
+
+inline bool registry_access_forbidden() {
+    return registry_access_forbidden_depth != 0 && registry_access_allowed_depth == 0;
+}
+#endif
 
 template <typename... Left>
 struct disjoint_from;
@@ -221,6 +290,34 @@ private:
     JobSchedule schedule_;
 };
 
+namespace detail {
+
+template <typename Callback, typename View, typename... Args>
+void invoke_job_view_callback(Callback& callback, View& view, Entity entity, Args&&... args) {
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+    RegistryAccessForbiddenScope scope;
+#endif
+    if constexpr (std::is_invocable<Callback&, View&, Entity, Args...>::value) {
+        callback(view, entity, std::forward<Args>(args)...);
+    } else {
+        callback(entity, std::forward<Args>(args)...);
+    }
+}
+
+template <typename Callback, typename Context, typename... Args>
+void invoke_job_context_callback(Callback& callback, Context& context, Entity entity, Args&&... args) {
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+    RegistryAccessForbiddenScope scope;
+#endif
+    if constexpr (std::is_invocable<Callback&, Context&, Entity, Args...>::value) {
+        callback(context, entity, std::forward<Args>(args)...);
+    } else {
+        callback(entity, std::forward<Args>(args)...);
+    }
+}
+
+}  // namespace detail
+
 enum class PrimitiveType {
     Bool,
     I32,
@@ -246,28 +343,34 @@ public:
     template <typename... Components>
     class View;
 
-    template <typename IterList, typename... AccessComponents>
+    template <typename IterList, typename AccessList, typename OptionalList>
     class AccessView;
 
-    template <typename IterList, typename AccessList, typename WithList, typename WithoutList>
+    template <typename IterList, typename AccessList, typename OptionalList, typename WithList, typename WithoutList>
     class TagFilteredView;
 
     template <typename... Components>
     class JobView;
 
-    template <typename IterList, typename... AccessComponents>
+    template <typename IterList, typename AccessList, typename OptionalList>
     class JobAccessView;
 
-    template <typename IterList, typename AccessList, typename WithList, typename WithoutList>
+    template <typename IterList, typename AccessList, typename OptionalList, typename WithList, typename WithoutList>
     class JobTagFilteredView;
 
     template <typename IterList, typename StructuralList>
     class JobStructuralView;
 
-    template <typename IterList, typename AccessList, typename StructuralList>
+    template <typename IterList, typename AccessList, typename OptionalList, typename StructuralList>
     class JobStructuralAccessView;
 
-    template <typename IterList, typename AccessList, typename WithList, typename WithoutList, typename StructuralList>
+    template <
+        typename IterList,
+        typename AccessList,
+        typename OptionalList,
+        typename WithList,
+        typename WithoutList,
+        typename StructuralList>
     class JobTagFilteredStructuralView;
 
     template <typename ViewType, typename... StructuralComponents>
@@ -288,6 +391,7 @@ public:
     ~Registry() = default;
 
     Entity create() {
+        require_runtime_registry_access_allowed("create");
         if (free_head_ != invalid_index) {
             const std::uint32_t index = free_head_;
             const std::uint64_t slot = entities_[index];
@@ -308,6 +412,7 @@ public:
     }
 
     bool destroy(Entity entity) {
+        require_runtime_registry_access_allowed("destroy");
         if (!alive(entity)) {
             return false;
         }
@@ -346,6 +451,7 @@ public:
 
     template <typename T>
     Entity register_component(std::string name = {}) {
+        require_runtime_registry_access_allowed("register_component");
         static_assert(
             !is_singleton_component<T>::value || std::is_default_constructible<T>::value,
             "ecs singleton components must be default constructible");
@@ -389,12 +495,14 @@ public:
     }
 
     Entity register_component(ComponentDesc desc) {
+        require_runtime_registry_access_allowed("register_component");
         ComponentLifecycle lifecycle;
         lifecycle.trivially_copyable = true;
         return register_component_impl(std::move(desc), lifecycle, true, false, false, npos_type_id);
     }
 
     Entity register_tag(std::string name = {}) {
+        require_runtime_registry_access_allowed("register_tag");
         ComponentDesc desc;
         desc.name = std::move(name);
         desc.size = 0;
@@ -407,6 +515,7 @@ public:
 
     template <typename T>
     Entity component() const {
+        require_runtime_registry_access_allowed("component");
         return registered_component<T>();
     }
 
@@ -419,16 +528,19 @@ public:
     }
 
     const ComponentInfo* component_info(Entity component) const {
+        require_runtime_registry_access_allowed("component_info");
         const ComponentRecord* record = find_component_record(component);
         return record != nullptr ? &record->info : nullptr;
     }
 
     const std::vector<ComponentField>* component_fields(Entity component) const {
+        require_runtime_registry_access_allowed("component_fields");
         const ComponentRecord* record = find_component_record(component);
         return record != nullptr ? &record->fields : nullptr;
     }
 
     bool set_component_fields(Entity component, std::vector<ComponentField> fields) {
+        require_runtime_registry_access_allowed("set_component_fields");
         ComponentRecord* record = find_component_record(component);
         if (record == nullptr) {
             return false;
@@ -439,6 +551,7 @@ public:
     }
 
     bool add_component_field(Entity component, ComponentField field) {
+        require_runtime_registry_access_allowed("add_component_field");
         ComponentRecord* record = find_component_record(component);
         if (record == nullptr) {
             return false;
@@ -453,6 +566,7 @@ public:
         typename std::enable_if<!is_singleton_component<T>::value && !detail::is_tag_query<T>::value, int>::type = 0,
         typename... Args>
     T* add(Entity entity, Args&&... args) {
+        require_runtime_registry_access_allowed("add");
         const Entity component = registered_component<T>();
         if (!alive(entity)) {
             return nullptr;
@@ -467,11 +581,13 @@ public:
 
     template <typename T, typename std::enable_if<detail::is_tag_query<T>::value, int>::type = 0>
     bool add(Entity entity) {
+        require_runtime_registry_access_allowed("add");
         const Entity component = registered_component<T>();
         return add_tag(entity, component);
     }
 
     bool add_tag(Entity entity, Entity tag) {
+        require_runtime_registry_access_allowed("add_tag");
         const ComponentRecord& record = require_component_record(tag);
         if (!record.info.tag) {
             throw std::logic_error("ecs component entity is not a tag");
@@ -486,10 +602,12 @@ public:
     }
 
     bool remove_tag(Entity entity, Entity tag) {
+        require_runtime_registry_access_allowed("remove_tag");
         return remove(entity, tag);
     }
 
     void* add(Entity entity, Entity component, const void* value = nullptr) {
+        require_runtime_registry_access_allowed("add");
         const ComponentRecord& record = require_component_record(component);
         if (record.info.tag) {
             throw std::logic_error("ecs tags cannot be added as writable components");
@@ -507,6 +625,7 @@ public:
     }
 
     void* ensure(Entity entity, Entity component) {
+        require_runtime_registry_access_allowed("ensure");
         const ComponentRecord& record = require_component_record(component);
         if (record.info.tag) {
             throw std::logic_error("ecs tags cannot be ensured as writable components");
@@ -525,11 +644,13 @@ public:
 
     template <typename T, typename std::enable_if<!is_singleton_component<T>::value, int>::type = 0>
     bool remove(Entity entity) {
+        require_runtime_registry_access_allowed("remove");
         const Entity component = registered_component<T>();
         return remove(entity, component);
     }
 
     bool remove(Entity entity, Entity component) {
+        require_runtime_registry_access_allowed("remove");
         const ComponentRecord& record = require_component_record(component);
         if (record.singleton) {
             return false;
@@ -554,6 +675,7 @@ public:
         typename T,
         typename std::enable_if<!detail::is_tag_query<T>::value && !is_singleton_component<T>::value, int>::type = 0>
     bool contains(Entity entity) const {
+        require_runtime_registry_access_allowed("contains");
         registered_component<T>();
         if (!alive(entity)) {
             return false;
@@ -567,6 +689,7 @@ public:
         typename T,
         typename std::enable_if<!detail::is_tag_query<T>::value && !is_singleton_component<T>::value, int>::type = 0>
     const T* try_get(Entity entity) const {
+        require_runtime_registry_access_allowed("try_get");
         registered_component<T>();
         if (!alive(entity)) {
             return nullptr;
@@ -578,6 +701,7 @@ public:
 
     template <typename T, typename std::enable_if<!detail::is_tag_query<T>::value, int>::type = 0>
     const T& get(Entity entity) const {
+        require_runtime_registry_access_allowed("get");
         registered_component<T>();
         std::uint32_t index = entity_index(entity);
         if constexpr (is_singleton_component<T>::value) {
@@ -590,6 +714,7 @@ public:
 
     template <typename T, typename std::enable_if<is_singleton_component<T>::value, int>::type = 0>
     const T& get() const {
+        require_runtime_registry_access_allowed("get");
         registered_component<T>();
         const TypeErasedStorage* storage = typed_storage<T>();
         assert(storage != nullptr);
@@ -597,6 +722,7 @@ public:
     }
 
     const void* get(Entity entity, Entity component) const {
+        require_runtime_registry_access_allowed("get");
         const ComponentRecord& record = require_component_record(component);
         if (record.info.tag) {
             throw std::logic_error("ecs tags cannot be read as components");
@@ -614,6 +740,7 @@ public:
 
     template <typename T, typename std::enable_if<!detail::is_tag_query<T>::value, int>::type = 0>
     T& write(Entity entity) {
+        require_runtime_registry_access_allowed("write");
         registered_component<T>();
         std::uint32_t index = entity_index(entity);
         if constexpr (is_singleton_component<T>::value) {
@@ -626,6 +753,7 @@ public:
 
     template <typename T, typename std::enable_if<is_singleton_component<T>::value, int>::type = 0>
     T& write() {
+        require_runtime_registry_access_allowed("write");
         registered_component<T>();
         TypeErasedStorage* storage = typed_storage<T>();
         assert(storage != nullptr);
@@ -633,6 +761,7 @@ public:
     }
 
     void* write(Entity entity, Entity component) {
+        require_runtime_registry_access_allowed("write");
         const ComponentRecord& record = require_component_record(component);
         if (record.info.tag) {
             throw std::logic_error("ecs tags cannot be written");
@@ -650,11 +779,13 @@ public:
 
     template <typename T, typename std::enable_if<detail::is_tag_query<T>::value, int>::type = 0>
     bool has(Entity entity) const {
+        require_runtime_registry_access_allowed("has");
         const Entity component = registered_component<T>();
         return has(entity, component);
     }
 
     bool has(Entity entity, Entity component) const {
+        require_runtime_registry_access_allowed("has");
         const ComponentRecord& record = require_component_record(component);
         if (!record.info.tag) {
             throw std::logic_error("ecs component entity is not a tag");
@@ -669,6 +800,7 @@ public:
 
     template <typename T>
     bool clear_dirty(Entity entity) {
+        require_runtime_registry_access_allowed("clear_dirty");
         const Entity component = registered_component<T>();
         if constexpr (is_singleton_component<T>::value) {
             return clear_dirty(singleton_entity_, component);
@@ -678,11 +810,13 @@ public:
 
     template <typename T, typename std::enable_if<is_singleton_component<T>::value, int>::type = 0>
     bool clear_dirty() {
+        require_runtime_registry_access_allowed("clear_dirty");
         const Entity component = registered_component<T>();
         return clear_dirty(singleton_entity_, component);
     }
 
     bool clear_dirty(Entity entity, Entity component) {
+        require_runtime_registry_access_allowed("clear_dirty");
         const ComponentRecord& record = require_component_record(component);
         if (record.singleton) {
             entity = singleton_entity_;
@@ -697,6 +831,7 @@ public:
 
     template <typename T>
     bool is_dirty(Entity entity) const {
+        require_runtime_registry_access_allowed("is_dirty");
         const Entity component = registered_component<T>();
         if constexpr (is_singleton_component<T>::value) {
             return is_dirty(singleton_entity_, component);
@@ -706,11 +841,13 @@ public:
 
     template <typename T, typename std::enable_if<is_singleton_component<T>::value, int>::type = 0>
     bool is_dirty() const {
+        require_runtime_registry_access_allowed("is_dirty");
         const Entity component = registered_component<T>();
         return is_dirty(singleton_entity_, component);
     }
 
     bool is_dirty(Entity entity, Entity component) const {
+        require_runtime_registry_access_allowed("is_dirty");
         const ComponentRecord& record = require_component_record(component);
         if (record.singleton) {
             entity = singleton_entity_;
@@ -725,11 +862,13 @@ public:
 
     template <typename T>
     void clear_all_dirty() {
+        require_runtime_registry_access_allowed("clear_all_dirty");
         const Entity component = registered_component<T>();
         clear_all_dirty(component);
     }
 
     void clear_all_dirty(Entity component) {
+        require_runtime_registry_access_allowed("clear_all_dirty");
         require_component_record(component);
         if (auto* found = find_storage(component)) {
             found->clear_all_dirty();
@@ -738,12 +877,14 @@ public:
 
     template <typename T, typename Fn>
     void each_dirty(Fn&& fn) const {
+        require_runtime_registry_access_allowed("each_dirty");
         const Entity component = registered_component<T>();
         each_dirty(component, std::forward<Fn>(fn));
     }
 
     template <typename Fn>
     void each_dirty(Entity component, Fn&& fn) const {
+        require_runtime_registry_access_allowed("each_dirty");
         const ComponentRecord& record = require_component_record(component);
         Entity singleton = Entity{};
         if (record.singleton) {
@@ -763,12 +904,14 @@ public:
 
     template <typename T, typename Fn>
     void each_removed(Fn&& fn) const {
+        require_runtime_registry_access_allowed("each_removed");
         const Entity component = registered_component<T>();
         each_removed(component, std::forward<Fn>(fn));
     }
 
     template <typename Fn>
     void each_removed(Entity component, Fn&& fn) const {
+        require_runtime_registry_access_allowed("each_removed");
         const ComponentRecord& record = require_component_record(component);
         if (record.singleton) {
             return;
@@ -792,6 +935,7 @@ public:
     JobView<Components...> job(int order);
 
     void set_job_thread_executor(JobThreadExecutor executor) {
+        require_runtime_registry_access_allowed("set_job_thread_executor");
         job_thread_executor_ = std::move(executor);
     }
 
@@ -810,6 +954,7 @@ public:
     void restore(const DeltaSnapshot& snapshot);
 
     std::string debug_print(Entity entity, Entity component) const {
+        require_runtime_registry_access_allowed("debug_print");
         const ComponentRecord& record = require_component_record(component);
         if (record.info.tag) {
             return has(entity, component) ? record.name + "{}" : "<missing>";
@@ -847,6 +992,20 @@ public:
 private:
     static constexpr std::size_t npos_type_id = std::numeric_limits<std::size_t>::max();
     static constexpr std::size_t default_min_entities_per_thread = 1024;
+
+    void require_runtime_registry_access_allowed(const char* operation) const {
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+        if (detail::registry_access_forbidden()) {
+            std::string message = "ecs Registry::";
+            message += operation;
+            message += " cannot be used inside an ecs job callback; use the callback view/context and declare";
+            message += " required components on the job with job<...>(), access<...>(), or structural<...>()";
+            throw std::logic_error(message);
+        }
+#else
+        (void)operation;
+#endif
+    }
 
     enum class PrimitiveKind {
         None,
@@ -1185,7 +1344,7 @@ private:
         }
 
         void clear_all_dirty() {
-            std::fill(dirty_.begin(), dirty_.end(), 0);
+            std::fill(dirty_.begin(), dirty_.end(), std::uint8_t{0});
             std::fill(tombstones_.begin(), tombstones_.end(), no_tombstone);
             tombstone_indices_.clear();
             dirty_count_ = 0;
@@ -2695,6 +2854,7 @@ private:
 };
 
 inline Registry::Snapshot Registry::snapshot() const {
+    require_runtime_registry_access_allowed("snapshot");
     Snapshot result;
     const std::vector<bool> excluded = make_snapshot_exclusion_mask();
     result.entities_ = make_snapshot_entities(excluded);
@@ -2724,6 +2884,7 @@ inline Registry::Snapshot Registry::snapshot() const {
 }
 
 inline Registry::DeltaSnapshot Registry::delta_snapshot(const Snapshot& baseline) const {
+    require_runtime_registry_access_allowed("delta_snapshot");
     DeltaSnapshot result;
     const std::vector<bool> excluded = make_snapshot_exclusion_mask();
     if ((excluded.empty() && entities_ == baseline.entities_) ||
@@ -2760,6 +2921,7 @@ inline Registry::DeltaSnapshot Registry::delta_snapshot(const Snapshot& baseline
 }
 
 inline Registry::DeltaSnapshot Registry::delta_snapshot(const DeltaSnapshot& baseline) const {
+    require_runtime_registry_access_allowed("delta_snapshot");
     DeltaSnapshot result;
     const std::vector<bool> excluded = make_snapshot_exclusion_mask();
     if (baseline.has_entities_ &&
@@ -2797,6 +2959,7 @@ inline Registry::DeltaSnapshot Registry::delta_snapshot(const DeltaSnapshot& bas
 }
 
 inline void Registry::restore(const Snapshot& snapshot) {
+    require_runtime_registry_access_allowed("restore");
     std::unordered_map<std::uint32_t, std::unique_ptr<TypeErasedStorage>> storages;
     storages.reserve(snapshot.storages_.size());
     for (const auto& storage : snapshot.storages_) {
@@ -2830,6 +2993,7 @@ inline void Registry::restore(const Snapshot& snapshot) {
 }
 
 inline void Registry::restore(const DeltaSnapshot& snapshot) {
+    require_runtime_registry_access_allowed("restore");
     if (state_token_ != snapshot.baseline_token_) {
         throw std::logic_error("ecs delta snapshot baseline does not match registry state");
     }
@@ -2985,60 +3149,160 @@ public:
     }
 
     template <typename... AccessComponents>
-    AccessView<detail::type_list<Components...>, AccessComponents...> access() const {
-        return AccessView<detail::type_list<Components...>, AccessComponents...>(*registry_, storages_);
+    AccessView<detail::type_list<Components...>, detail::type_list<AccessComponents...>, detail::type_list<>> access() const {
+        return AccessView<detail::type_list<Components...>, detail::type_list<AccessComponents...>, detail::type_list<>>(
+            *registry_,
+            storages_);
+    }
+
+    template <typename... OptionalComponents>
+    AccessView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<OptionalComponents...>> optional()
+        const {
+        return AccessView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<OptionalComponents...>>(
+            *registry_,
+            storages_);
     }
 
     template <typename... Tags>
-    TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<Tags...>, detail::type_list<>>
+    TagFilteredView<
+        detail::type_list<Components...>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<Tags...>,
+        detail::type_list<>>
     with_tags() const {
         return TagFilteredView<
             detail::type_list<Components...>,
             detail::type_list<>,
+            detail::type_list<>,
             detail::type_list<Tags...>,
-            detail::type_list<>>(*registry_, storages_, std::array<TypeErasedStorage*, 0>{});
+            detail::type_list<>>(
+            *registry_,
+            storages_,
+            std::array<TypeErasedStorage*, 0>{},
+            std::array<TypeErasedStorage*, 0>{});
     }
 
-    TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
+    TagFilteredView<
+        detail::type_list<Components...>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<>>
     with_tags(std::initializer_list<Entity> tags) const {
-        TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
-            view(*registry_, storages_, std::array<TypeErasedStorage*, 0>{});
+        TagFilteredView<
+            detail::type_list<Components...>,
+            detail::type_list<>,
+            detail::type_list<>,
+            detail::type_list<>,
+            detail::type_list<>>
+            view(
+                *registry_,
+                storages_,
+                std::array<TypeErasedStorage*, 0>{},
+                std::array<TypeErasedStorage*, 0>{});
         view.add_runtime_with_tags(tags, false);
         return view;
     }
 
-    TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
+    TagFilteredView<
+        detail::type_list<Components...>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<>>
     with_mutable_tags(std::initializer_list<Entity> tags) const {
-        TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
-            view(*registry_, storages_, std::array<TypeErasedStorage*, 0>{});
+        TagFilteredView<
+            detail::type_list<Components...>,
+            detail::type_list<>,
+            detail::type_list<>,
+            detail::type_list<>,
+            detail::type_list<>>
+            view(
+                *registry_,
+                storages_,
+                std::array<TypeErasedStorage*, 0>{},
+                std::array<TypeErasedStorage*, 0>{});
         view.add_runtime_with_tags(tags, true);
         return view;
     }
 
     template <typename... Tags>
-    TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<Tags...>>
+    TagFilteredView<
+        detail::type_list<Components...>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<Tags...>>
     without_tags() const {
         return TagFilteredView<
             detail::type_list<Components...>,
             detail::type_list<>,
             detail::type_list<>,
-            detail::type_list<Tags...>>(*registry_, storages_, std::array<TypeErasedStorage*, 0>{});
+            detail::type_list<>,
+            detail::type_list<Tags...>>(
+            *registry_,
+            storages_,
+            std::array<TypeErasedStorage*, 0>{},
+            std::array<TypeErasedStorage*, 0>{});
     }
 
-    TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
+    TagFilteredView<
+        detail::type_list<Components...>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<>>
     without_tags(std::initializer_list<Entity> tags) const {
-        TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
-            view(*registry_, storages_, std::array<TypeErasedStorage*, 0>{});
+        TagFilteredView<
+            detail::type_list<Components...>,
+            detail::type_list<>,
+            detail::type_list<>,
+            detail::type_list<>,
+            detail::type_list<>>
+            view(
+                *registry_,
+                storages_,
+                std::array<TypeErasedStorage*, 0>{},
+                std::array<TypeErasedStorage*, 0>{});
         view.add_runtime_without_tags(tags, false);
         return view;
     }
 
-    TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
+    TagFilteredView<
+        detail::type_list<Components...>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<>>
     without_mutable_tags(std::initializer_list<Entity> tags) const {
-        TagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<>>
-            view(*registry_, storages_, std::array<TypeErasedStorage*, 0>{});
+        TagFilteredView<
+            detail::type_list<Components...>,
+            detail::type_list<>,
+            detail::type_list<>,
+            detail::type_list<>,
+            detail::type_list<>>
+            view(
+                *registry_,
+                storages_,
+                std::array<TypeErasedStorage*, 0>{},
+                std::array<TypeErasedStorage*, 0>{});
         view.add_runtime_without_tags(tags, true);
         return view;
+    }
+
+    template <typename... ViewComponents>
+    typename std::enable_if<
+        detail::requested_components_allowed<detail::type_list<Components...>>::template with<ViewComponents...>::
+            value,
+        View<ViewComponents...>>::type
+    view() const {
+        return View<ViewComponents...>(*registry_);
+    }
+
+    View& job_callback_scope() {
+        job_callback_scope_ = true;
+        return *this;
     }
 
     template <
@@ -3050,8 +3314,9 @@ public:
         if (!registry_->alive(entity)) {
             return false;
         }
+        const std::uint32_t index = entity_index(entity);
         const TypeErasedStorage* storage = storage_for_type<T>();
-        return storage != nullptr && storage->contains_index(entity_index(entity));
+        return storage != nullptr && storage->contains_index(index);
     }
 
     template <
@@ -3207,6 +3472,18 @@ private:
 
     template <typename Fn>
     void call_each(Fn& callback, Entity entity, std::uint32_t index) {
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+        if (job_callback_scope_) {
+            detail::RegistryAccessForbiddenScope scope;
+            call_each_unchecked(callback, entity, index);
+            return;
+        }
+#endif
+        call_each_unchecked(callback, entity, index);
+    }
+
+    template <typename Fn>
+    void call_each_unchecked(Fn& callback, Entity entity, std::uint32_t index) {
         if constexpr (std::is_invocable<Fn&, View&, Entity, component_ref_t<Components>...>::value) {
             callback(*this, entity, component_ref<Components>(index)...);
         } else {
@@ -3230,23 +3507,36 @@ private:
     Registry* registry_;
     std::array<TypeErasedStorage*, component_count> storages_;
     GroupRecord* group_ = nullptr;
+    bool job_callback_scope_ = false;
 };
 
-template <typename... IterComponents, typename... AccessComponents>
-class Registry::AccessView<detail::type_list<IterComponents...>, AccessComponents...> {
+template <typename... IterComponents, typename... AccessComponents, typename... OptionalComponents>
+class Registry::AccessView<
+    detail::type_list<IterComponents...>,
+    detail::type_list<AccessComponents...>,
+    detail::type_list<OptionalComponents...>> {
     static_assert(sizeof...(IterComponents) > 0, "ecs views require at least one component");
     static_assert(detail::unique_components<IterComponents...>::value, "ecs views cannot repeat component types");
     static_assert(detail::unique_components<AccessComponents...>::value, "ecs access components cannot repeat types");
+    static_assert(detail::unique_components<OptionalComponents...>::value, "ecs optional components cannot repeat types");
+    static_assert(
+        detail::disjoint_from<detail::type_list<AccessComponents...>>::template with<OptionalComponents...>::value,
+        "ecs access and optional components cannot repeat types");
     static_assert(
         detail::access_components_allowed<detail::type_list<IterComponents...>>::template with<AccessComponents...>::
             value,
         "ecs access components can only repeat iterated const components as mutable access components");
+    static_assert(
+        detail::access_components_allowed<detail::type_list<IterComponents...>>::template with<OptionalComponents...>::
+            value,
+        "ecs optional components can only repeat iterated const components as mutable optional components");
 
 public:
     AccessView(Registry& registry, std::array<TypeErasedStorage*, sizeof...(IterComponents)> iter_storages)
         : registry_(&registry),
           iter_storages_(iter_storages),
           access_storages_{{resolve_storage<AccessComponents>(registry)...}},
+          optional_storages_{{resolve_storage<OptionalComponents>(registry)...}},
           group_(registry.best_group_for_view<IterComponents...>()) {}
 
     template <typename Fn>
@@ -3305,32 +3595,52 @@ public:
         }
     }
 
+    template <typename... MoreOptionalComponents>
+    auto optional() const
+        -> AccessView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            typename detail::type_list_concat<
+                detail::type_list<OptionalComponents...>,
+                detail::type_list<MoreOptionalComponents...>>::type> {
+        using NextOptional = typename detail::type_list_concat<
+            detail::type_list<OptionalComponents...>,
+            detail::type_list<MoreOptionalComponents...>>::type;
+        return AccessView<detail::type_list<IterComponents...>, detail::type_list<AccessComponents...>, NextOptional>(
+            *registry_,
+            iter_storages_);
+    }
+
     template <typename... Tags>
     TagFilteredView<
         detail::type_list<IterComponents...>,
         detail::type_list<AccessComponents...>,
+        detail::type_list<OptionalComponents...>,
         detail::type_list<Tags...>,
         detail::type_list<>>
     with_tags() const {
         return TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<Tags...>,
-            detail::type_list<>>(*registry_, iter_storages_, access_storages_);
+            detail::type_list<>>(*registry_, iter_storages_, access_storages_, optional_storages_);
     }
 
     TagFilteredView<
         detail::type_list<IterComponents...>,
         detail::type_list<AccessComponents...>,
+        detail::type_list<OptionalComponents...>,
         detail::type_list<>,
         detail::type_list<>>
     with_tags(std::initializer_list<Entity> tags) const {
         TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<>,
             detail::type_list<>>
-            view(*registry_, iter_storages_, access_storages_);
+            view(*registry_, iter_storages_, access_storages_, optional_storages_);
         view.add_runtime_with_tags(tags, false);
         return view;
     }
@@ -3338,15 +3648,17 @@ public:
     TagFilteredView<
         detail::type_list<IterComponents...>,
         detail::type_list<AccessComponents...>,
+        detail::type_list<OptionalComponents...>,
         detail::type_list<>,
         detail::type_list<>>
     with_mutable_tags(std::initializer_list<Entity> tags) const {
         TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<>,
             detail::type_list<>>
-            view(*registry_, iter_storages_, access_storages_);
+            view(*registry_, iter_storages_, access_storages_, optional_storages_);
         view.add_runtime_with_tags(tags, true);
         return view;
     }
@@ -3355,28 +3667,32 @@ public:
     TagFilteredView<
         detail::type_list<IterComponents...>,
         detail::type_list<AccessComponents...>,
+        detail::type_list<OptionalComponents...>,
         detail::type_list<>,
         detail::type_list<Tags...>>
     without_tags() const {
         return TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<>,
-            detail::type_list<Tags...>>(*registry_, iter_storages_, access_storages_);
+            detail::type_list<Tags...>>(*registry_, iter_storages_, access_storages_, optional_storages_);
     }
 
     TagFilteredView<
         detail::type_list<IterComponents...>,
         detail::type_list<AccessComponents...>,
+        detail::type_list<OptionalComponents...>,
         detail::type_list<>,
         detail::type_list<>>
     without_tags(std::initializer_list<Entity> tags) const {
         TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<>,
             detail::type_list<>>
-            view(*registry_, iter_storages_, access_storages_);
+            view(*registry_, iter_storages_, access_storages_, optional_storages_);
         view.add_runtime_without_tags(tags, false);
         return view;
     }
@@ -3384,23 +3700,39 @@ public:
     TagFilteredView<
         detail::type_list<IterComponents...>,
         detail::type_list<AccessComponents...>,
+        detail::type_list<OptionalComponents...>,
         detail::type_list<>,
         detail::type_list<>>
     without_mutable_tags(std::initializer_list<Entity> tags) const {
         TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<>,
             detail::type_list<>>
-            view(*registry_, iter_storages_, access_storages_);
+            view(*registry_, iter_storages_, access_storages_, optional_storages_);
         view.add_runtime_without_tags(tags, true);
         return view;
+    }
+
+    template <typename... ViewComponents>
+    typename std::enable_if<
+        detail::requested_components_allowed<detail::type_list<IterComponents..., AccessComponents...>>::
+            template with<ViewComponents...>::value,
+        View<ViewComponents...>>::type
+    view() const {
+        return View<ViewComponents...>(*registry_);
+    }
+
+    AccessView& job_callback_scope() {
+        job_callback_scope_ = true;
+        return *this;
     }
 
     template <
         typename T,
         typename std::enable_if<
-            detail::contains_component<T, IterComponents..., AccessComponents...>::value &&
+            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value &&
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     bool contains(Entity entity) const {
@@ -3414,28 +3746,33 @@ public:
     template <
         typename T,
         typename std::enable_if<
-            detail::contains_component<T, IterComponents..., AccessComponents...>::value &&
+            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value &&
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     const detail::component_query_t<T>* try_get(Entity entity) const {
         if (!registry_->alive(entity)) {
             return nullptr;
         }
+        const std::uint32_t index = entity_index(entity);
+        require_optional_entity<T>(index);
         const TypeErasedStorage* storage = storage_for_type<T>();
         return storage != nullptr
-            ? static_cast<const detail::component_query_t<T>*>(storage->get(entity_index(entity)))
+            ? static_cast<const detail::component_query_t<T>*>(storage->get(index))
             : nullptr;
     }
 
     template <
         typename T,
-        typename std::enable_if<detail::contains_component<T, IterComponents..., AccessComponents...>::value, int>::
+        typename std::enable_if<
+            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
+            int>::
             type = 0>
     const detail::component_query_t<T>& get(Entity entity) const {
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
             index = entity_index(registry_->singleton_entity_);
         }
+        require_optional_entity<T>(index);
 
         const TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
@@ -3461,13 +3798,14 @@ public:
         typename T,
         typename std::enable_if<
             !std::is_const<typename std::remove_reference<T>::type>::value &&
-                detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
+                detail::contains_mutable_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
             int>::type = 0>
     detail::component_query_t<T>& write(Entity entity) {
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
             index = entity_index(registry_->singleton_entity_);
         }
+        require_optional_entity<T>(index);
 
         TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
@@ -3554,11 +3892,16 @@ private:
             constexpr std::size_t position = component_position<T, IterComponents...>();
             return iter_storages_[position];
         } else {
-            static_assert(
-                detail::contains_component<T, AccessComponents...>::value,
-                "component is not part of this ecs view");
-            constexpr std::size_t position = component_position<T, AccessComponents...>();
-            return access_storages_[position];
+            if constexpr (detail::contains_component<T, AccessComponents...>::value) {
+                constexpr std::size_t position = component_position<T, AccessComponents...>();
+                return access_storages_[position];
+            } else {
+                static_assert(
+                    detail::contains_component<T, OptionalComponents...>::value,
+                    "component is not part of this ecs view");
+                constexpr std::size_t position = component_position<T, OptionalComponents...>();
+                return optional_storages_[position];
+            }
         }
     }
 
@@ -3568,16 +3911,53 @@ private:
             constexpr std::size_t position = component_position<T, IterComponents...>();
             return iter_storages_[position];
         } else {
-            static_assert(
-                detail::contains_component<T, AccessComponents...>::value,
-                "component is not part of this ecs view");
-            constexpr std::size_t position = component_position<T, AccessComponents...>();
-            return access_storages_[position];
+            if constexpr (detail::contains_component<T, AccessComponents...>::value) {
+                constexpr std::size_t position = component_position<T, AccessComponents...>();
+                return access_storages_[position];
+            } else {
+                static_assert(
+                    detail::contains_component<T, OptionalComponents...>::value,
+                    "component is not part of this ecs view");
+                constexpr std::size_t position = component_position<T, OptionalComponents...>();
+                return optional_storages_[position];
+            }
+        }
+    }
+
+    template <typename T>
+    void require_optional_entity(std::uint32_t index) const {
+        if constexpr (detail::contains_component<T, OptionalComponents...>::value &&
+                      !detail::contains_component<T, IterComponents..., AccessComponents...>::value &&
+                      !detail::is_singleton_query<T>::value) {
+            if (active_callback_index_ != invalid_index && active_callback_index_ != index) {
+                throw std::logic_error("ecs optional job access is limited to the entity currently being iterated");
+            }
         }
     }
 
     template <typename Fn>
     void call_each(Fn& callback, Entity entity, std::uint32_t index) {
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+        if (job_callback_scope_) {
+            detail::RegistryAccessForbiddenScope scope;
+            call_each_unchecked(callback, entity, index);
+            return;
+        }
+#endif
+        call_each_unchecked(callback, entity, index);
+    }
+
+    template <typename Fn>
+    void call_each_unchecked(Fn& callback, Entity entity, std::uint32_t index) {
+        const std::uint32_t previous_active_callback_index = active_callback_index_;
+        active_callback_index_ = index;
+        struct ActiveIndexRestore {
+            std::uint32_t& target;
+            std::uint32_t previous;
+            ~ActiveIndexRestore() {
+                target = previous;
+            }
+        } restore{active_callback_index_, previous_active_callback_index};
         if constexpr (std::is_invocable<Fn&, AccessView&, Entity, component_ref_t<IterComponents>...>::value) {
             callback(*this, entity, component_ref<IterComponents>(index)...);
         } else {
@@ -3601,22 +3981,28 @@ private:
     Registry* registry_;
     std::array<TypeErasedStorage*, sizeof...(IterComponents)> iter_storages_;
     std::array<TypeErasedStorage*, sizeof...(AccessComponents)> access_storages_;
+    std::array<TypeErasedStorage*, sizeof...(OptionalComponents)> optional_storages_;
     GroupRecord* group_ = nullptr;
+    std::uint32_t active_callback_index_ = invalid_index;
+    bool job_callback_scope_ = false;
 };
 
 template <
     typename... IterComponents,
     typename... AccessComponents,
+    typename... OptionalComponents,
     typename... WithTags,
     typename... WithoutTags>
 class Registry::TagFilteredView<
     detail::type_list<IterComponents...>,
     detail::type_list<AccessComponents...>,
+    detail::type_list<OptionalComponents...>,
     detail::type_list<WithTags...>,
     detail::type_list<WithoutTags...>> {
     static_assert(sizeof...(IterComponents) > 0, "ecs views require at least one component");
     static_assert((!detail::is_tag_query<IterComponents>::value && ...), "ecs tags must be view filters");
     static_assert((!detail::is_tag_query<AccessComponents>::value && ...), "ecs tags cannot be access components");
+    static_assert((!detail::is_tag_query<OptionalComponents>::value && ...), "ecs tags cannot be optional components");
     static_assert((detail::is_tag_query<WithTags>::value && ...), "ecs with_tags types must be empty tags");
     static_assert((detail::is_tag_query<WithoutTags>::value && ...), "ecs without_tags types must be empty tags");
 
@@ -3624,10 +4010,12 @@ public:
     TagFilteredView(
         Registry& registry,
         std::array<TypeErasedStorage*, sizeof...(IterComponents)> iter_storages,
-        std::array<TypeErasedStorage*, sizeof...(AccessComponents)> access_storages)
+        std::array<TypeErasedStorage*, sizeof...(AccessComponents)> access_storages,
+        std::array<TypeErasedStorage*, sizeof...(OptionalComponents)> optional_storages)
         : registry_(&registry),
           iter_storages_(iter_storages),
           access_storages_(access_storages),
+          optional_storages_(optional_storages),
           with_tag_storages_{{resolve_tag_storage<WithTags>(registry)...}},
           without_tag_storages_{{resolve_tag_storage<WithoutTags>(registry)...}} {}
 
@@ -3644,6 +4032,7 @@ public:
         -> TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             typename detail::type_list_concat<detail::type_list<WithTags...>, detail::type_list<Tags...>>::type,
             detail::type_list<WithoutTags...>> {
         using NextWith =
@@ -3651,9 +4040,10 @@ public:
         TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             NextWith,
             detail::type_list<WithoutTags...>>
-            view(*registry_, iter_storages_, access_storages_);
+            view(*registry_, iter_storages_, access_storages_, optional_storages_);
         copy_runtime_filters_to(view);
         return view;
     }
@@ -3662,6 +4052,7 @@ public:
         -> TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             detail::type_list<WithoutTags...>> {
         auto view = *this;
@@ -3673,6 +4064,7 @@ public:
         -> TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             detail::type_list<WithoutTags...>> {
         auto view = *this;
@@ -3685,6 +4077,7 @@ public:
         -> TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             typename detail::type_list_concat<detail::type_list<WithoutTags...>, detail::type_list<Tags...>>::type> {
         using NextWithout =
@@ -3692,9 +4085,10 @@ public:
         TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             NextWithout>
-            view(*registry_, iter_storages_, access_storages_);
+            view(*registry_, iter_storages_, access_storages_, optional_storages_);
         copy_runtime_filters_to(view);
         return view;
     }
@@ -3703,6 +4097,7 @@ public:
         -> TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             detail::type_list<WithoutTags...>> {
         auto view = *this;
@@ -3714,6 +4109,7 @@ public:
         -> TagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             detail::type_list<WithoutTags...>> {
         auto view = *this;
@@ -3776,42 +4172,49 @@ public:
     template <
         typename T,
         typename std::enable_if<
-            detail::contains_component<T, IterComponents..., AccessComponents...>::value &&
+            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value &&
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     bool contains(Entity entity) const {
         if (!registry_->alive(entity)) {
             return false;
         }
+        const std::uint32_t index = entity_index(entity);
+        require_optional_entity<T>(index);
         const TypeErasedStorage* storage = storage_for_type<T>();
-        return storage != nullptr && storage->contains_index(entity_index(entity));
+        return storage != nullptr && storage->contains_index(index);
     }
 
     template <
         typename T,
         typename std::enable_if<
-            detail::contains_component<T, IterComponents..., AccessComponents...>::value &&
+            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value &&
                 !detail::is_singleton_query<T>::value,
             int>::type = 0>
     const detail::component_query_t<T>* try_get(Entity entity) const {
         if (!registry_->alive(entity)) {
             return nullptr;
         }
+        const std::uint32_t index = entity_index(entity);
+        require_optional_entity<T>(index);
         const TypeErasedStorage* storage = storage_for_type<T>();
         return storage != nullptr
-            ? static_cast<const detail::component_query_t<T>*>(storage->get(entity_index(entity)))
+            ? static_cast<const detail::component_query_t<T>*>(storage->get(index))
             : nullptr;
     }
 
     template <
         typename T,
-        typename std::enable_if<detail::contains_component<T, IterComponents..., AccessComponents...>::value, int>::
+        typename std::enable_if<
+            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
+            int>::
             type = 0>
     const detail::component_query_t<T>& get(Entity entity) const {
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
             index = entity_index(registry_->singleton_entity_);
         }
+        require_optional_entity<T>(index);
 
         const TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
@@ -3837,13 +4240,14 @@ public:
         typename T,
         typename std::enable_if<
             !std::is_const<typename std::remove_reference<T>::type>::value &&
-                detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
+                detail::contains_mutable_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
             int>::type = 0>
     detail::component_query_t<T>& write(Entity entity) {
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
             index = entity_index(registry_->singleton_entity_);
         }
+        require_optional_entity<T>(index);
 
         TypeErasedStorage* storage = storage_for_type<T>();
         assert(storage != nullptr);
@@ -3872,10 +4276,16 @@ public:
             detail::is_tag_query<T>::value && detail::contains_component<T, WithTags..., WithoutTags...>::value,
             int>::type = 0>
     bool has_tag(Entity entity) const {
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+        detail::RegistryAccessAllowedScope scope;
+#endif
         return registry_->template has<detail::component_query_t<T>>(entity);
     }
 
     bool has_tag(Entity entity, Entity tag) const {
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+        detail::RegistryAccessAllowedScope scope;
+#endif
         return registry_->has(entity, tag);
     }
 
@@ -3885,11 +4295,17 @@ public:
             detail::is_tag_query<T>::value && detail::contains_mutable_component<T, WithTags..., WithoutTags...>::value,
             int>::type = 0>
     bool add_tag(Entity entity) {
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+        detail::RegistryAccessAllowedScope scope;
+#endif
         return registry_->template add<detail::component_query_t<T>>(entity);
     }
 
     bool add_tag(Entity entity, Entity tag) {
         require_mutable_runtime_tag(tag);
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+        detail::RegistryAccessAllowedScope scope;
+#endif
         const bool added = registry_->add_tag(entity, tag);
         refresh_runtime_tag_storages();
         return added;
@@ -3901,16 +4317,40 @@ public:
             detail::is_tag_query<T>::value && detail::contains_mutable_component<T, WithTags..., WithoutTags...>::value,
             int>::type = 0>
     bool remove_tag(Entity entity) {
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+        detail::RegistryAccessAllowedScope scope;
+#endif
         return registry_->template remove<detail::component_query_t<T>>(entity);
     }
 
     bool remove_tag(Entity entity, Entity tag) {
         require_mutable_runtime_tag(tag);
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+        detail::RegistryAccessAllowedScope scope;
+#endif
         return registry_->remove_tag(entity, tag);
     }
 
+    template <typename... ViewComponents>
+    typename std::enable_if<
+        detail::requested_components_allowed<detail::type_list<IterComponents..., AccessComponents...>>::
+            template with<ViewComponents...>::value,
+        decltype(std::declval<View<ViewComponents...>>()
+                     .template with_tags<WithTags...>()
+                     .template without_tags<WithoutTags...>())>::type
+    view() const {
+        return View<ViewComponents...>(*registry_)
+            .template with_tags<WithTags...>()
+            .template without_tags<WithoutTags...>();
+    }
+
+    TagFilteredView& job_callback_scope() {
+        job_callback_scope_ = true;
+        return *this;
+    }
+
 private:
-    template <typename IterList, typename AccessList, typename WithList, typename WithoutList>
+    template <typename IterList, typename AccessList, typename OptionalList, typename WithList, typename WithoutList>
     friend class Registry::TagFilteredView;
 
     template <typename T>
@@ -4051,11 +4491,16 @@ private:
             constexpr std::size_t position = component_position<T, IterComponents...>();
             return iter_storages_[position];
         } else {
-            static_assert(
-                detail::contains_component<T, AccessComponents...>::value,
-                "component is not part of this ecs view");
-            constexpr std::size_t position = component_position<T, AccessComponents...>();
-            return access_storages_[position];
+            if constexpr (detail::contains_component<T, AccessComponents...>::value) {
+                constexpr std::size_t position = component_position<T, AccessComponents...>();
+                return access_storages_[position];
+            } else {
+                static_assert(
+                    detail::contains_component<T, OptionalComponents...>::value,
+                    "component is not part of this ecs view");
+                constexpr std::size_t position = component_position<T, OptionalComponents...>();
+                return optional_storages_[position];
+            }
         }
     }
 
@@ -4065,16 +4510,53 @@ private:
             constexpr std::size_t position = component_position<T, IterComponents...>();
             return iter_storages_[position];
         } else {
-            static_assert(
-                detail::contains_component<T, AccessComponents...>::value,
-                "component is not part of this ecs view");
-            constexpr std::size_t position = component_position<T, AccessComponents...>();
-            return access_storages_[position];
+            if constexpr (detail::contains_component<T, AccessComponents...>::value) {
+                constexpr std::size_t position = component_position<T, AccessComponents...>();
+                return access_storages_[position];
+            } else {
+                static_assert(
+                    detail::contains_component<T, OptionalComponents...>::value,
+                    "component is not part of this ecs view");
+                constexpr std::size_t position = component_position<T, OptionalComponents...>();
+                return optional_storages_[position];
+            }
+        }
+    }
+
+    template <typename T>
+    void require_optional_entity(std::uint32_t index) const {
+        if constexpr (detail::contains_component<T, OptionalComponents...>::value &&
+                      !detail::contains_component<T, IterComponents..., AccessComponents...>::value &&
+                      !detail::is_singleton_query<T>::value) {
+            if (active_callback_index_ != invalid_index && active_callback_index_ != index) {
+                throw std::logic_error("ecs optional job access is limited to the entity currently being iterated");
+            }
         }
     }
 
     template <typename Fn>
     void call_each(Fn& callback, Entity entity, std::uint32_t index) {
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+        if (job_callback_scope_) {
+            detail::RegistryAccessForbiddenScope scope;
+            call_each_unchecked(callback, entity, index);
+            return;
+        }
+#endif
+        call_each_unchecked(callback, entity, index);
+    }
+
+    template <typename Fn>
+    void call_each_unchecked(Fn& callback, Entity entity, std::uint32_t index) {
+        const std::uint32_t previous_active_callback_index = active_callback_index_;
+        active_callback_index_ = index;
+        struct ActiveIndexRestore {
+            std::uint32_t& target;
+            std::uint32_t previous;
+            ~ActiveIndexRestore() {
+                target = previous;
+            }
+        } restore{active_callback_index_, previous_active_callback_index};
         if constexpr (std::is_invocable<Fn&, TagFilteredView&, Entity, component_ref_t<IterComponents>...>::value) {
             callback(*this, entity, component_ref<IterComponents>(index)...);
         } else {
@@ -4106,6 +4588,7 @@ private:
     Registry* registry_;
     std::array<TypeErasedStorage*, sizeof...(IterComponents)> iter_storages_;
     std::array<TypeErasedStorage*, sizeof...(AccessComponents)> access_storages_;
+    std::array<TypeErasedStorage*, sizeof...(OptionalComponents)> optional_storages_;
     std::array<TypeErasedStorage*, sizeof...(WithTags)> with_tag_storages_;
     std::array<TypeErasedStorage*, sizeof...(WithoutTags)> without_tag_storages_;
     std::vector<Entity> runtime_with_tags_;
@@ -4113,6 +4596,8 @@ private:
     std::vector<TypeErasedStorage*> runtime_with_tag_storages_;
     std::vector<TypeErasedStorage*> runtime_without_tag_storages_;
     std::vector<Entity> mutable_runtime_tags_;
+    std::uint32_t active_callback_index_ = invalid_index;
+    bool job_callback_scope_ = false;
 };
 
 template <typename ViewType, typename... StructuralComponents>
@@ -4124,6 +4609,20 @@ public:
     template <typename T>
     const detail::component_query_t<T>& get(Entity entity) const {
         return view_->template get<T>(entity);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<!detail::is_singleton_query<T>::value, int>::type = 0>
+    bool contains(Entity entity) const {
+        return view_->template contains<T>(entity);
+    }
+
+    template <
+        typename T,
+        typename std::enable_if<!detail::is_singleton_query<T>::value, int>::type = 0>
+    const detail::component_query_t<T>* try_get(Entity entity) const {
+        return view_->template try_get<T>(entity);
     }
 
     template <
@@ -4145,6 +4644,11 @@ public:
         return view_->template write<T>();
     }
 
+    template <typename... ViewComponents>
+    auto view() const {
+        return view_->template view<ViewComponents...>();
+    }
+
     template <
         typename T,
         typename... Args,
@@ -4152,6 +4656,9 @@ public:
             !detail::is_tag_query<T>::value && detail::contains_component<T, StructuralComponents...>::value,
             int>::type = 0>
     detail::component_query_t<T>* add(Entity entity, Args&&... args) {
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+        detail::RegistryAccessAllowedScope scope;
+#endif
         return registry_->template add<detail::component_query_t<T>>(entity, std::forward<Args>(args)...);
     }
 
@@ -4161,6 +4668,9 @@ public:
             detail::is_tag_query<T>::value && detail::contains_component<T, StructuralComponents...>::value,
             int>::type = 0>
     bool add(Entity entity) {
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+        detail::RegistryAccessAllowedScope scope;
+#endif
         return registry_->template add<detail::component_query_t<T>>(entity);
     }
 
@@ -4168,6 +4678,9 @@ public:
         typename T,
         typename std::enable_if<detail::contains_component<T, StructuralComponents...>::value, int>::type = 0>
     bool remove(Entity entity) {
+#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+        detail::RegistryAccessAllowedScope scope;
+#endif
         return registry_->template remove<detail::component_query_t<T>>(entity);
     }
 
@@ -4179,11 +4692,13 @@ private:
 template <
     typename... IterComponents,
     typename... AccessComponents,
+    typename... OptionalComponents,
     typename... WithTags,
     typename... WithoutTags>
 class Registry::JobTagFilteredView<
     detail::type_list<IterComponents...>,
     detail::type_list<AccessComponents...>,
+    detail::type_list<OptionalComponents...>,
     detail::type_list<WithTags...>,
     detail::type_list<WithoutTags...>> {
 public:
@@ -4191,6 +4706,7 @@ public:
         : registry_(&registry), order_(order), threading_(threading) {}
 
     JobTagFilteredView& max_threads(std::size_t count) {
+        static_assert(sizeof...(AccessComponents) == 0, "ecs access_other_entities jobs must be single threaded");
         threading_.max_threads = std::max<std::size_t>(count, 1);
         threading_.single_thread = false;
         return *this;
@@ -4213,10 +4729,11 @@ public:
         auto callback = std::make_shared<Callback>(std::forward<Fn>(fn));
         return registry_->add_job(
             order_,
-            registry_->template make_job_access_metadata<IterComponents..., AccessComponents...>(),
+            registry_
+                ->template make_job_access_metadata<IterComponents..., AccessComponents..., OptionalComponents...>(),
             [callback](Registry& registry) mutable {
                 auto view = make_view(registry);
-                view.each(*callback);
+                view.job_callback_scope().each(*callback);
             },
             [](Registry& registry) {
                 auto view = make_view(registry);
@@ -4225,7 +4742,7 @@ public:
             [callback](Registry& registry, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end)
                 mutable {
                     auto view = make_view(registry);
-                    view.each_index_range(*callback, indices, begin, end);
+                    view.job_callback_scope().each_index_range(*callback, indices, begin, end);
                 },
             threading_,
             false);
@@ -4236,6 +4753,7 @@ public:
         -> JobTagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             typename detail::type_list_concat<detail::type_list<WithTags...>, detail::type_list<Tags...>>::type,
             detail::type_list<WithoutTags...>> {
         using NextWith =
@@ -4243,6 +4761,7 @@ public:
         return JobTagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             NextWith,
             detail::type_list<WithoutTags...>>(*registry_, order_, threading_);
     }
@@ -4252,6 +4771,7 @@ public:
         -> JobTagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             typename detail::type_list_concat<detail::type_list<WithoutTags...>, detail::type_list<Tags...>>::type> {
         using NextWithout =
@@ -4259,25 +4779,55 @@ public:
         return JobTagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             NextWithout>(*registry_, order_, threading_);
     }
 
     template <typename... MoreAccessComponents>
-    auto access() const
+    auto access_other_entities() const
         -> JobTagFilteredView<
             detail::type_list<IterComponents...>,
             typename detail::type_list_concat<
                 detail::type_list<AccessComponents...>,
                 detail::type_list<MoreAccessComponents...>>::type,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             detail::type_list<WithoutTags...>> {
+        if (!threading_.single_thread || threading_.max_threads > 1) {
+            throw std::logic_error("ecs access_other_entities jobs must be single threaded");
+        }
         using NextAccess = typename detail::type_list_concat<
             detail::type_list<AccessComponents...>,
             detail::type_list<MoreAccessComponents...>>::type;
+        JobThreadingOptions threading = threading_;
+        threading.single_thread = true;
+        threading.max_threads = 1;
         return JobTagFilteredView<
             detail::type_list<IterComponents...>,
             NextAccess,
+            detail::type_list<OptionalComponents...>,
+            detail::type_list<WithTags...>,
+            detail::type_list<WithoutTags...>>(*registry_, order_, threading);
+    }
+
+    template <typename... MoreOptionalComponents>
+    auto optional() const
+        -> JobTagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            typename detail::type_list_concat<
+                detail::type_list<OptionalComponents...>,
+                detail::type_list<MoreOptionalComponents...>>::type,
+            detail::type_list<WithTags...>,
+            detail::type_list<WithoutTags...>> {
+        using NextOptional = typename detail::type_list_concat<
+            detail::type_list<OptionalComponents...>,
+            detail::type_list<MoreOptionalComponents...>>::type;
+        return JobTagFilteredView<
+            detail::type_list<IterComponents...>,
+            detail::type_list<AccessComponents...>,
+            NextOptional,
             detail::type_list<WithTags...>,
             detail::type_list<WithoutTags...>>(*registry_, order_, threading_);
     }
@@ -4286,6 +4836,7 @@ public:
     JobTagFilteredStructuralView<
         detail::type_list<IterComponents...>,
         detail::type_list<AccessComponents...>,
+        detail::type_list<OptionalComponents...>,
         detail::type_list<WithTags...>,
         detail::type_list<WithoutTags...>,
         detail::type_list<StructuralComponents...>>
@@ -4296,6 +4847,7 @@ public:
         return JobTagFilteredStructuralView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<WithTags...>,
             detail::type_list<WithoutTags...>,
             detail::type_list<StructuralComponents...>>(*registry_, order_, threading_);
@@ -4303,8 +4855,9 @@ public:
 
     template <
         typename T,
-        typename std::enable_if<detail::contains_component<T, IterComponents..., AccessComponents...>::value, int>::
-            type = 0>
+        typename std::enable_if<
+            detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
+            int>::type = 0>
     const detail::component_query_t<T>& get(Entity entity) const {
         auto view = make_view(*registry_);
         return view.template get<T>(entity);
@@ -4314,7 +4867,7 @@ public:
         typename T,
         typename std::enable_if<
             detail::is_singleton_query<T>::value &&
-                detail::contains_component<T, IterComponents..., AccessComponents...>::value,
+                detail::contains_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
             int>::type = 0>
     const detail::component_query_t<T>& get() const {
         auto view = make_view(*registry_);
@@ -4325,7 +4878,7 @@ public:
         typename T,
         typename std::enable_if<
             !std::is_const<typename std::remove_reference<T>::type>::value &&
-                detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
+                detail::contains_mutable_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
             int>::type = 0>
     detail::component_query_t<T>& write(Entity entity) {
         auto view = make_view(*registry_);
@@ -4335,9 +4888,9 @@ public:
     template <
         typename T,
         typename std::enable_if<
-            detail::is_singleton_query<T>::value &&
+                detail::is_singleton_query<T>::value &&
                 !std::is_const<typename std::remove_reference<T>::type>::value &&
-                detail::contains_mutable_component<T, IterComponents..., AccessComponents...>::value,
+                detail::contains_mutable_component<T, IterComponents..., AccessComponents..., OptionalComponents...>::value,
             int>::type = 0>
     detail::component_query_t<T>& write() {
         auto view = make_view(*registry_);
@@ -4346,8 +4899,16 @@ public:
 
 private:
     static auto make_view(Registry& registry) {
-        if constexpr (sizeof...(AccessComponents) == 0) {
+        static_assert(
+            sizeof...(AccessComponents) == 0 || sizeof...(OptionalComponents) == 0,
+            "ecs jobs cannot combine access_other_entities and optional components");
+        if constexpr (sizeof...(AccessComponents) == 0 && sizeof...(OptionalComponents) == 0) {
             return registry.template view<IterComponents...>()
+                .template with_tags<WithTags...>()
+                .template without_tags<WithoutTags...>();
+        } else if constexpr (sizeof...(AccessComponents) == 0) {
+            return registry.template view<IterComponents...>()
+                .template optional<OptionalComponents...>()
                 .template with_tags<WithTags...>()
                 .template without_tags<WithoutTags...>();
         } else {
@@ -4372,6 +4933,7 @@ template <
 class Registry::JobTagFilteredStructuralView<
     detail::type_list<IterComponents...>,
     detail::type_list<AccessComponents...>,
+    detail::type_list<>,
     detail::type_list<WithTags...>,
     detail::type_list<WithoutTags...>,
     detail::type_list<StructuralComponents...>> {
@@ -4396,11 +4958,7 @@ public:
                     using ActiveView = typename std::remove_reference<decltype(active_view)>::type;
                     using Context = JobStructuralContext<ActiveView, StructuralComponents...>;
                     Context context(registry, active_view);
-                    if constexpr (std::is_invocable<Callback&, Context&, Entity, decltype(components)...>::value) {
-                        (*callback)(context, entity, components...);
-                    } else {
-                        (*callback)(entity, components...);
-                    }
+                    detail::invoke_job_context_callback(*callback, context, entity, components...);
                 };
                 view.each(adapter);
             },
@@ -4415,11 +4973,7 @@ public:
                         using ActiveView = typename std::remove_reference<decltype(active_view)>::type;
                         using Context = JobStructuralContext<ActiveView, StructuralComponents...>;
                         Context context(registry, active_view);
-                        if constexpr (std::is_invocable<Callback&, Context&, Entity, decltype(components)...>::value) {
-                            (*callback)(context, entity, components...);
-                        } else {
-                            (*callback)(entity, components...);
-                        }
+                        detail::invoke_job_context_callback(*callback, context, entity, components...);
                     };
                     view.each_index_range(adapter, indices, begin, end);
                 },
@@ -4479,42 +5033,80 @@ public:
             order_,
             registry_->template make_job_access_metadata<Components...>(),
             [callback](Registry& registry) mutable {
-                registry.template view<Components...>().each(*callback);
+                auto view = registry.template view<Components...>();
+                view.job_callback_scope().each(*callback);
             },
             [](Registry& registry) {
                 return registry.template view<Components...>().matching_indices();
             },
             [callback](Registry& registry, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end)
                 mutable {
-                    registry.template view<Components...>().each_index_range(*callback, indices, begin, end);
+                    auto view = registry.template view<Components...>();
+                    view.job_callback_scope().each_index_range(*callback, indices, begin, end);
                 },
             threading_,
             false);
     }
 
     template <typename... AccessComponents>
-    JobAccessView<detail::type_list<Components...>, AccessComponents...> access() const {
-        return JobAccessView<detail::type_list<Components...>, AccessComponents...>(
+    JobAccessView<detail::type_list<Components...>, detail::type_list<AccessComponents...>, detail::type_list<>>
+    access_other_entities() const {
+        if (!threading_.single_thread || threading_.max_threads > 1) {
+            throw std::logic_error("ecs access_other_entities jobs must be single threaded");
+        }
+        JobThreadingOptions threading = threading_;
+        threading.single_thread = true;
+        threading.max_threads = 1;
+        return JobAccessView<
+            detail::type_list<Components...>,
+            detail::type_list<AccessComponents...>,
+            detail::type_list<>>(
             *registry_,
             order_,
-            view_.template access<AccessComponents...>());
+            view_.template access<AccessComponents...>(),
+            threading);
+    }
+
+    template <typename... OptionalComponents>
+    JobAccessView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<OptionalComponents...>>
+    optional() const {
+        return JobAccessView<
+            detail::type_list<Components...>,
+            detail::type_list<>,
+            detail::type_list<OptionalComponents...>>(
+            *registry_,
+            order_,
+            view_.template optional<OptionalComponents...>(),
+            threading_);
     }
 
     template <typename... Tags>
-    JobTagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<Tags...>, detail::type_list<>>
+    JobTagFilteredView<
+        detail::type_list<Components...>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<Tags...>,
+        detail::type_list<>>
     with_tags() const {
         return JobTagFilteredView<
             detail::type_list<Components...>,
+            detail::type_list<>,
             detail::type_list<>,
             detail::type_list<Tags...>,
             detail::type_list<>>(*registry_, order_, threading_);
     }
 
     template <typename... Tags>
-    JobTagFilteredView<detail::type_list<Components...>, detail::type_list<>, detail::type_list<>, detail::type_list<Tags...>>
+    JobTagFilteredView<
+        detail::type_list<Components...>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<>,
+        detail::type_list<Tags...>>
     without_tags() const {
         return JobTagFilteredView<
             detail::type_list<Components...>,
+            detail::type_list<>,
             detail::type_list<>,
             detail::type_list<>,
             detail::type_list<Tags...>>(*registry_, order_, threading_);
@@ -4571,16 +5163,26 @@ private:
     JobThreadingOptions threading_;
 };
 
-template <typename... IterComponents, typename... AccessComponents>
-class Registry::JobAccessView<detail::type_list<IterComponents...>, AccessComponents...> {
+template <typename... IterComponents, typename... AccessComponents, typename... OptionalComponents>
+class Registry::JobAccessView<
+    detail::type_list<IterComponents...>,
+    detail::type_list<AccessComponents...>,
+    detail::type_list<OptionalComponents...>> {
 public:
+    using ActiveView = AccessView<
+        detail::type_list<IterComponents...>,
+        detail::type_list<AccessComponents...>,
+        detail::type_list<OptionalComponents...>>;
+
     JobAccessView(
         Registry& registry,
         int order,
-        AccessView<detail::type_list<IterComponents...>, AccessComponents...> view)
-        : registry_(&registry), order_(order), view_(std::move(view)) {}
+        ActiveView view,
+        JobThreadingOptions threading)
+        : registry_(&registry), order_(order), view_(std::move(view)), threading_(threading) {}
 
     JobAccessView& max_threads(std::size_t count) {
+        static_assert(sizeof...(AccessComponents) == 0, "ecs access_other_entities jobs must be single threaded");
         threading_.max_threads = std::max<std::size_t>(count, 1);
         threading_.single_thread = false;
         return *this;
@@ -4601,22 +5203,19 @@ public:
     Entity each(Fn&& fn) {
         using Callback = typename std::decay<Fn>::type;
         auto callback = std::make_shared<Callback>(std::forward<Fn>(fn));
+        auto view = view_;
         return registry_->add_job(
             order_,
-            registry_->template make_job_access_metadata<IterComponents..., AccessComponents...>(),
-            [callback](Registry& registry) mutable {
-                registry.template view<IterComponents...>().template access<AccessComponents...>().each(*callback);
+            registry_->template make_job_access_metadata<IterComponents..., AccessComponents..., OptionalComponents...>(),
+            [view, callback](Registry&) mutable {
+                view.job_callback_scope().each(*callback);
             },
-            [](Registry& registry) {
-                return registry.template view<IterComponents...>()
-                    .template access<AccessComponents...>()
-                    .matching_indices();
+            [view](Registry&) mutable {
+                return view.matching_indices();
             },
-            [callback](Registry& registry, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end)
+            [view, callback](Registry&, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end)
                 mutable {
-                    registry.template view<IterComponents...>()
-                        .template access<AccessComponents...>()
-                        .each_index_range(*callback, indices, begin, end);
+                    view.job_callback_scope().each_index_range(*callback, indices, begin, end);
                 },
             threading_,
             false);
@@ -4626,6 +5225,7 @@ public:
     JobStructuralAccessView<
         detail::type_list<IterComponents...>,
         detail::type_list<AccessComponents...>,
+        detail::type_list<OptionalComponents...>,
         detail::type_list<StructuralComponents...>>
     structural() const {
         static_assert(
@@ -4634,6 +5234,7 @@ public:
         return JobStructuralAccessView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<StructuralComponents...>>(*registry_, order_, threading_);
     }
 
@@ -4641,12 +5242,14 @@ public:
     JobTagFilteredView<
         detail::type_list<IterComponents...>,
         detail::type_list<AccessComponents...>,
+        detail::type_list<OptionalComponents...>,
         detail::type_list<Tags...>,
         detail::type_list<>>
     with_tags() const {
         return JobTagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<Tags...>,
             detail::type_list<>>(*registry_, order_, threading_);
     }
@@ -4655,12 +5258,14 @@ public:
     JobTagFilteredView<
         detail::type_list<IterComponents...>,
         detail::type_list<AccessComponents...>,
+        detail::type_list<OptionalComponents...>,
         detail::type_list<>,
         detail::type_list<Tags...>>
     without_tags() const {
         return JobTagFilteredView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
+            detail::type_list<OptionalComponents...>,
             detail::type_list<>,
             detail::type_list<Tags...>>(*registry_, order_, threading_);
     }
@@ -4707,7 +5312,10 @@ public:
 private:
     Registry* registry_;
     int order_ = 0;
-    AccessView<detail::type_list<IterComponents...>, AccessComponents...> view_;
+    AccessView<
+        detail::type_list<IterComponents...>,
+        detail::type_list<AccessComponents...>,
+        detail::type_list<OptionalComponents...>> view_;
     JobThreadingOptions threading_;
 };
 
@@ -4734,11 +5342,7 @@ public:
                     using ActiveView = typename std::remove_reference<decltype(active_view)>::type;
                     using Context = JobStructuralContext<ActiveView, StructuralComponents...>;
                     Context context(registry, active_view);
-                    if constexpr (std::is_invocable<Callback&, Context&, Entity, decltype(components)...>::value) {
-                        (*callback)(context, entity, components...);
-                    } else {
-                        (*callback)(entity, components...);
-                    }
+                    detail::invoke_job_context_callback(*callback, context, entity, components...);
                 };
                 view.each(adapter);
             },
@@ -4752,11 +5356,7 @@ public:
                         using ActiveView = typename std::remove_reference<decltype(active_view)>::type;
                         using Context = JobStructuralContext<ActiveView, StructuralComponents...>;
                         Context context(registry, active_view);
-                        if constexpr (std::is_invocable<Callback&, Context&, Entity, decltype(components)...>::value) {
-                            (*callback)(context, entity, components...);
-                        } else {
-                            (*callback)(entity, components...);
-                        }
+                        detail::invoke_job_context_callback(*callback, context, entity, components...);
                     };
                     view.each_index_range(adapter, indices, begin, end);
                 },
@@ -4770,10 +5370,11 @@ private:
     JobThreadingOptions threading_;
 };
 
-template <typename... IterComponents, typename... AccessComponents, typename... StructuralComponents>
+template <typename... IterComponents, typename... AccessComponents, typename... OptionalComponents, typename... StructuralComponents>
 class Registry::JobStructuralAccessView<
     detail::type_list<IterComponents...>,
     detail::type_list<AccessComponents...>,
+    detail::type_list<OptionalComponents...>,
     detail::type_list<StructuralComponents...>> {
 public:
     JobStructuralAccessView(Registry& registry, int order, JobThreadingOptions threading)
@@ -4784,7 +5385,7 @@ public:
         using Callback = typename std::decay<Fn>::type;
         auto callback = std::make_shared<Callback>(std::forward<Fn>(fn));
         JobAccessMetadata metadata =
-            registry_->template make_job_access_metadata<IterComponents..., AccessComponents...>();
+            registry_->template make_job_access_metadata<IterComponents..., AccessComponents..., OptionalComponents...>();
         registry_->template append_job_structural_metadata<StructuralComponents...>(metadata);
         threading_.single_thread = true;
         threading_.max_threads = 1;
@@ -4797,11 +5398,7 @@ public:
                     using ActiveView = typename std::remove_reference<decltype(active_view)>::type;
                     using Context = JobStructuralContext<ActiveView, StructuralComponents...>;
                     Context context(registry, active_view);
-                    if constexpr (std::is_invocable<Callback&, Context&, Entity, decltype(components)...>::value) {
-                        (*callback)(context, entity, components...);
-                    } else {
-                        (*callback)(entity, components...);
-                    }
+                    detail::invoke_job_context_callback(*callback, context, entity, components...);
                 };
                 view.each(adapter);
             },
@@ -4817,11 +5414,7 @@ public:
                         using ActiveView = typename std::remove_reference<decltype(active_view)>::type;
                         using Context = JobStructuralContext<ActiveView, StructuralComponents...>;
                         Context context(registry, active_view);
-                        if constexpr (std::is_invocable<Callback&, Context&, Entity, decltype(components)...>::value) {
-                            (*callback)(context, entity, components...);
-                        } else {
-                            (*callback)(entity, components...);
-                        }
+                        detail::invoke_job_context_callback(*callback, context, entity, components...);
                     };
                     view.each_index_range(adapter, indices, begin, end);
                 },
@@ -4837,11 +5430,13 @@ private:
 
 template <typename... Components>
 Registry::View<Components...> Registry::view() {
+    require_runtime_registry_access_allowed("view");
     return View<Components...>(*this);
 }
 
 template <typename... Components>
 Registry::JobView<Components...> Registry::job(int order) {
+    require_runtime_registry_access_allowed("job");
     return JobView<Components...>(*this, order);
 }
 
@@ -5205,10 +5800,12 @@ inline void JobGraph::tick_for_entities(
 }
 
 inline JobGraph Registry::compile_job_graph(const std::vector<Entity>& jobs) const {
+    require_runtime_registry_access_allowed("compile_job_graph");
     return JobGraph(Orchestrator(*this).schedule_for_jobs(jobs));
 }
 
 inline JobGraph Registry::compile_all_jobs_graph() const {
+    require_runtime_registry_access_allowed("compile_all_jobs_graph");
     return JobGraph(Orchestrator(*this).schedule());
 }
 
@@ -5221,15 +5818,18 @@ inline const JobGraph& Registry::cached_all_jobs_graph() const {
 }
 
 inline void Registry::run_jobs(RunJobsOptions options) {
+    require_runtime_registry_access_allowed("run_jobs");
     cached_all_jobs_graph().tick(*this, options);
 }
 
 inline void Registry::run_jobs_for_entities(const std::vector<Entity>& entities, RunJobsOptions options) {
+    require_runtime_registry_access_allowed("run_jobs_for_entities");
     cached_all_jobs_graph().tick_for_entities(*this, entities, options);
 }
 
 template <typename... Owned>
 void Registry::declare_owned_group() {
+    require_runtime_registry_access_allowed("declare_owned_group");
     static_assert(sizeof...(Owned) > 0, "ecs owned groups require at least one component");
     static_assert(detail::unique_components<Owned...>::value, "ecs owned groups cannot repeat component types");
     static_assert((!detail::is_singleton_query<Owned>::value && ...), "ecs owned groups cannot own singleton components");

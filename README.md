@@ -160,14 +160,28 @@ ecs::Entity move_job = registry.job<const Position, Velocity>(10).each(
 registry.run_jobs();
 ```
 
-Job views support the same access pattern as ordinary views:
+Job views can declare optional access for components on the entity currently being iterated. Optional
+components do not filter iteration:
 
 ```cpp
 registry.job<const Position>(20)
-    .access<Velocity>()
+    .optional<Velocity>()
     .each([](auto& active_view, ecs::Entity entity, const Position& position) {
         if (active_view.template contains<Velocity>(entity)) {
             active_view.template write<Velocity>(entity).dx += position.x;
+        }
+    });
+```
+
+Use `.access_other_entities<T...>()` only when the job needs to read or write those components on entities
+other than the one currently being iterated. Jobs with other-entity access are always single-threaded:
+
+```cpp
+registry.job<const Target>(30)
+    .access_other_entities<Health>()
+    .each([](auto& active_view, ecs::Entity, const Target& target) {
+        if (active_view.template contains<Health>(target.entity)) {
+            --active_view.template write<Health>(target.entity).value;
         }
     });
 ```
