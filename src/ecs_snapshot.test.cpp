@@ -2,6 +2,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
 #include <cstring>
 
 namespace {
@@ -52,6 +53,51 @@ struct UnreadPositionTraits : CountingPositionTraits {
         return true;
     }
 };
+
+struct OverAlignedPersistentComponent {
+    int value = 0;
+};
+
+struct OverAlignedPersistentTraits {
+    struct alignas(256) Quantized {
+        std::int32_t value = 0;
+    };
+
+    static bool all_aligned;
+
+    static bool is_aligned(const Quantized* value) {
+        if (value == nullptr) {
+            return true;
+        }
+        return (reinterpret_cast<std::uintptr_t>(value) % alignof(Quantized)) == 0U;
+    }
+
+    static Quantized quantize(const OverAlignedPersistentComponent& value) {
+        Quantized quantized{};
+        quantized.value = static_cast<std::int32_t>(value.value);
+        return quantized;
+    }
+
+    static OverAlignedPersistentComponent dequantize(const Quantized& value) {
+        all_aligned = all_aligned && is_aligned(&value);
+        return OverAlignedPersistentComponent{static_cast<int>(value.value)};
+    }
+
+    static void serialize(const Quantized* previous, const Quantized& current, ecs::BitBuffer& out) {
+        all_aligned = all_aligned && is_aligned(previous) && is_aligned(&current);
+        const std::int32_t delta = previous == nullptr ? current.value : current.value - previous->value;
+        out.push_bits(delta, 32U);
+    }
+
+    static bool deserialize(ecs::BitBuffer& in, const Quantized* previous, Quantized& out) {
+        all_aligned = all_aligned && is_aligned(previous) && is_aligned(&out);
+        const auto delta = static_cast<std::int32_t>(in.read_bits(32U));
+        out.value = previous == nullptr ? delta : previous->value + delta;
+        return true;
+    }
+};
+
+bool OverAlignedPersistentTraits::all_aligned = true;
 
 struct NativeRebindPosition {
     int x = 0;
@@ -538,6 +584,41 @@ TEST_CASE("persistent delta snapshots handle values and tombstones separately fr
     REQUIRE_FALSE(replay.alive(destroyed));
     REQUIRE(CountingPositionTraits::serialize_calls == 1);
     REQUIRE(CountingPositionTraits::deserialize_calls == 1);
+}
+
+TEST_CASE("persistent snapshot codecs pass aligned quantized values to traits") {
+    ecs::SnapshotPersistenceCodecs codecs;
+    ecs::Registry source;
+    codecs.register_component<OverAlignedPersistentComponent, OverAlignedPersistentTraits>(source, "OverAligned");
+
+    const ecs::Entity entity = source.create();
+    REQUIRE(source.add<OverAlignedPersistentComponent>(entity, OverAlignedPersistentComponent{7}) != nullptr);
+
+    OverAlignedPersistentTraits::all_aligned = true;
+    std::stringstream full_stream(std::ios::in | std::ios::out | std::ios::binary);
+    ecs::write_persistent_snapshot(full_stream, source.create_snapshot(), codecs);
+
+    ecs::Registry schema;
+    codecs.register_component<OverAlignedPersistentComponent, OverAlignedPersistentTraits>(schema, "OverAligned");
+    ecs::Registry::Snapshot loaded = ecs::read_persistent_snapshot(full_stream, schema, codecs);
+    ecs::Registry restored;
+    restored.restore_snapshot(loaded);
+
+    REQUIRE(restored.get<OverAlignedPersistentComponent>(entity).value == 7);
+    REQUIRE(OverAlignedPersistentTraits::all_aligned);
+
+    source.clear_all_dirty<OverAlignedPersistentComponent>();
+    const auto baseline = source.create_snapshot();
+    source.write<OverAlignedPersistentComponent>(entity).value = 11;
+
+    OverAlignedPersistentTraits::all_aligned = true;
+    std::stringstream delta_stream(std::ios::in | std::ios::out | std::ios::binary);
+    ecs::write_persistent_delta_snapshot(delta_stream, source.create_delta_snapshot(baseline), baseline, codecs);
+    ecs::Registry::DeltaSnapshot delta = ecs::read_persistent_delta_snapshot(delta_stream, restored, baseline, codecs);
+    restored.restore_delta_snapshot(delta);
+
+    REQUIRE(restored.get<OverAlignedPersistentComponent>(entity).value == 11);
+    REQUIRE(OverAlignedPersistentTraits::all_aligned);
 }
 
 TEST_CASE("persistent delta tombstones do not call component codecs") {

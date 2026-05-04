@@ -2345,20 +2345,32 @@ public:
             return copy_to_bytes(quantized);
         };
         codec.serialize = [](const std::vector<unsigned char>* baseline, const std::vector<unsigned char>& current, BitBuffer& out) {
-            const Quantized* previous = baseline == nullptr ? nullptr : bytes_as<Quantized>(*baseline);
-            Traits::serialize(previous, *bytes_as<Quantized>(current), out);
+            const Quantized current_value = bytes_to_value<Quantized>(current);
+            if (baseline == nullptr) {
+                Traits::serialize(nullptr, current_value, out);
+                return;
+            }
+            const Quantized previous_value = bytes_to_value<Quantized>(*baseline);
+            Traits::serialize(&previous_value, current_value, out);
         };
         codec.deserialize = [](BitBuffer& in, const std::vector<unsigned char>* baseline, std::vector<unsigned char>& out) {
-            const Quantized* previous = baseline == nullptr ? nullptr : bytes_as<Quantized>(*baseline);
             Quantized quantized{};
-            if (!Traits::deserialize(in, previous, quantized)) {
-                return false;
+            if (baseline == nullptr) {
+                if (!Traits::deserialize(in, nullptr, quantized)) {
+                    return false;
+                }
+            } else {
+                const Quantized previous_value = bytes_to_value<Quantized>(*baseline);
+                if (!Traits::deserialize(in, &previous_value, quantized)) {
+                    return false;
+                }
             }
             out = copy_to_bytes(quantized);
             return true;
         };
         codec.emplace = [](Registry::TypeErasedStorage& storage, std::uint32_t index, const std::vector<unsigned char>& quantized) {
-            const T value = Traits::dequantize(*bytes_as<Quantized>(quantized));
+            const Quantized quantized_value = bytes_to_value<Quantized>(quantized);
+            const T value = Traits::dequantize(quantized_value);
             storage.emplace_or_replace_copy(index, &value);
         };
 
@@ -2401,6 +2413,9 @@ private:
 
     template <typename T>
     static std::vector<unsigned char> copy_to_bytes(const T& value) {
+        static_assert(
+            std::is_trivially_copyable<T>::value,
+            "persistent snapshot byte copies require a trivially copyable value");
         std::vector<unsigned char> bytes(sizeof(T));
         if (!bytes.empty()) {
             std::memcpy(bytes.data(), &value, sizeof(T));
@@ -2409,11 +2424,18 @@ private:
     }
 
     template <typename T>
-    static const T* bytes_as(const std::vector<unsigned char>& bytes) {
+    static T bytes_to_value(const std::vector<unsigned char>& bytes) {
+        static_assert(
+            std::is_trivially_copyable<T>::value,
+            "persistent snapshot byte copies require a trivially copyable value");
         if (bytes.size() != sizeof(T)) {
             throw std::runtime_error("persistent snapshot quantized payload has invalid size");
         }
-        return reinterpret_cast<const T*>(bytes.data());
+        T value{};
+        if (!bytes.empty()) {
+            std::memcpy(&value, bytes.data(), sizeof(T));
+        }
+        return value;
     }
 
     std::unordered_map<std::string, Codec> codecs_;
