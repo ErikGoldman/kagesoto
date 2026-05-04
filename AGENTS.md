@@ -1,6 +1,6 @@
 # Benchmarking Guide
 
-Use this repo's benchmark target for performance work. The older `scripts/bench/*.sh` helpers are not present in this checkout; `benchmark.sh` currently delegates to that missing path, so do not rely on it unless the script tree is restored.
+Use this repo's benchmark target for performance work. The older `scripts/bench/*.sh` helpers are not present in this checkout, so do not rely on them unless the script tree is restored.
 
 ## Rules
 
@@ -56,5 +56,6 @@ build-bench/benchmarks/basic_operations_benchmark \
 
 ## Job Orchestrator Notes
 
-- The orchestrator is schedule-output only for now; do not wire it into `run_jobs()` unless explicitly requested.
+- `run_jobs()` is wired through the orchestrator-generated `JobGraph`; `RunJobsOptions::force_single_threaded`
+  keeps execution inline/serial but still uses the scheduled graph.
 - Registered jobs are represented by entities for schedule identity. These job entities are identity-only in the current design and are not a job-removal/lifecycle API.

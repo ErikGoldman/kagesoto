@@ -4,7 +4,6 @@ add_executable(ecs_example
 
 target_link_libraries(ecs_example PRIVATE ecs::ecs)
 
-include(FetchContent)
 find_package(X11 QUIET)
 find_package(OpenGL QUIET)
 
@@ -30,6 +29,8 @@ endif()
 
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
+
+include(FetchContent)
 
 FetchContent_Declare(
     raylib

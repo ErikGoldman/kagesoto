@@ -685,7 +685,7 @@ void BM_Snapshot(benchmark::State& state) {
     registry.clear_all_dirty<C7>();
 
     for (auto _ : state) {
-        auto snapshot = registry.snapshot();
+        auto snapshot = registry.create_snapshot();
         benchmark::DoNotOptimize(&snapshot);
     }
 
@@ -706,7 +706,7 @@ void BM_DeltaSnapshotDirtyValues(benchmark::State& state) {
     registry.clear_all_dirty<C5>();
     registry.clear_all_dirty<C6>();
     registry.clear_all_dirty<C7>();
-    auto baseline = registry.snapshot();
+    auto baseline = registry.create_snapshot();
 
     for (std::size_t i = 0; i < entities.size(); i += 16) {
         registry.write<C0>(entities[i]).value += 1;
@@ -714,7 +714,7 @@ void BM_DeltaSnapshotDirtyValues(benchmark::State& state) {
     }
 
     for (auto _ : state) {
-        auto snapshot = registry.delta_snapshot(baseline);
+        auto snapshot = registry.create_delta_snapshot(baseline);
         benchmark::DoNotOptimize(&snapshot);
     }
 
@@ -729,7 +729,7 @@ void BM_DeltaSnapshotStructuralChanges(benchmark::State& state) {
     add_first_n_components(registry, entities, 2);
     registry.clear_all_dirty<C0>();
     registry.clear_all_dirty<C1>();
-    auto baseline = registry.snapshot();
+    auto baseline = registry.create_snapshot();
 
     for (std::size_t i = 0; i < entities.size(); i += 32) {
         registry.remove<C1>(entities[i]);
@@ -739,7 +739,7 @@ void BM_DeltaSnapshotStructuralChanges(benchmark::State& state) {
     }
 
     for (auto _ : state) {
-        auto snapshot = registry.delta_snapshot(baseline);
+        auto snapshot = registry.create_delta_snapshot(baseline);
         benchmark::DoNotOptimize(&snapshot);
     }
 
@@ -753,10 +753,10 @@ void BM_SnapshotRestore(benchmark::State& state) {
     const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 8);
     registry.declare_owned_group<C0, C1, C2, C3, C4, C5, C6, C7>();
-    auto snapshot = registry.snapshot();
+    auto snapshot = registry.create_snapshot();
 
     for (auto _ : state) {
-        registry.restore(snapshot);
+        registry.restore_snapshot(snapshot);
         benchmark::DoNotOptimize(&registry);
     }
 
@@ -777,24 +777,24 @@ void BM_DeltaSnapshotRestoreDirtyValues(benchmark::State& state) {
     source.clear_all_dirty<C5>();
     source.clear_all_dirty<C6>();
     source.clear_all_dirty<C7>();
-    auto baseline = source.snapshot();
+    auto baseline = source.create_snapshot();
 
     for (std::size_t i = 0; i < entities.size(); i += 16) {
         source.write<C0>(entities[i]).value += 1;
         source.write<C1>(entities[i]).value += 1;
     }
-    auto delta = source.delta_snapshot(baseline);
+    auto delta = source.create_delta_snapshot(baseline);
 
     ecs::Registry replay;
     register_first_n_components(replay, 8);
-    replay.restore(baseline);
+    replay.restore_snapshot(baseline);
 
     for (auto _ : state) {
-        replay.restore(delta);
+        replay.restore_delta_snapshot(delta);
         benchmark::DoNotOptimize(&replay);
 
         state.PauseTiming();
-        replay.restore(baseline);
+        replay.restore_snapshot(baseline);
         state.ResumeTiming();
     }
 
@@ -810,7 +810,7 @@ void BM_DeltaSnapshotRestoreStructuralChanges(benchmark::State& state) {
     source.declare_owned_group<C0, C1>();
     source.clear_all_dirty<C0>();
     source.clear_all_dirty<C1>();
-    auto baseline = source.snapshot();
+    auto baseline = source.create_snapshot();
 
     for (std::size_t i = 0; i < entities.size(); i += 32) {
         source.remove<C1>(entities[i]);
@@ -818,19 +818,19 @@ void BM_DeltaSnapshotRestoreStructuralChanges(benchmark::State& state) {
     for (std::size_t i = 16; i < entities.size(); i += 32) {
         source.destroy(entities[i]);
     }
-    auto delta = source.delta_snapshot(baseline);
+    auto delta = source.create_delta_snapshot(baseline);
 
     ecs::Registry replay;
     register_first_n_components(replay, 2);
     replay.declare_owned_group<C0, C1>();
-    replay.restore(baseline);
+    replay.restore_snapshot(baseline);
 
     for (auto _ : state) {
-        replay.restore(delta);
+        replay.restore_delta_snapshot(delta);
         benchmark::DoNotOptimize(&replay);
 
         state.PauseTiming();
-        replay.restore(baseline);
+        replay.restore_snapshot(baseline);
         state.ResumeTiming();
     }
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ecs/bit_buffer.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -40,6 +42,9 @@ namespace ecs {
 
 template <typename T>
 struct is_singleton_component : std::false_type {};
+
+class SnapshotPersistenceCodecs;
+class PersistentSnapshotAccess;
 
 namespace detail {
 
@@ -229,6 +234,14 @@ constexpr bool operator!=(Entity lhs, Entity rhs) noexcept {
     return !(lhs == rhs);
 }
 
+enum class EntityKind {
+    Invalid,
+    User,
+    Component,
+    Job,
+    System
+};
+
 struct ComponentInfo {
     std::size_t size = 0;
     std::size_t alignment = 1;
@@ -267,6 +280,37 @@ struct RunJobsOptions {
 struct SnapshotIoOptions {
     std::vector<Entity> include_components;
     std::vector<Entity> exclude_components;
+};
+
+template <typename T>
+struct SnapshotComponentTraits {
+    using Quantized = T;
+
+    static Quantized quantize(const T& value) {
+        static_assert(
+            std::is_trivially_copyable<T>::value,
+            "default SnapshotComponentTraits require a trivially copyable component");
+        return value;
+    }
+
+    static T dequantize(const Quantized& value) {
+        return value;
+    }
+
+    static void serialize(const Quantized* /*baseline*/, const Quantized& current, BitBuffer& out) {
+        static_assert(
+            std::is_trivially_copyable<Quantized>::value,
+            "default SnapshotComponentTraits serialization requires a trivially copyable quantized state");
+        out.push_bytes(reinterpret_cast<const char*>(&current), sizeof(Quantized));
+    }
+
+    static bool deserialize(BitBuffer& in, const Quantized* /*baseline*/, Quantized& out) {
+        static_assert(
+            std::is_trivially_copyable<Quantized>::value,
+            "default SnapshotComponentTraits deserialization requires a trivially copyable quantized state");
+        in.read_bytes(reinterpret_cast<char*>(&out), sizeof(Quantized));
+        return true;
+    }
 };
 
 struct JobThreadTask {
@@ -399,23 +443,23 @@ public:
 
     Entity create() {
         require_runtime_registry_access_allowed("create");
-        if (free_head_ != invalid_index) {
-            const std::uint32_t index = free_head_;
-            const std::uint64_t slot = entities_[index];
+        if (entity_store_.free_head != invalid_index) {
+            const std::uint32_t index = entity_store_.free_head;
+            const std::uint64_t slot = entity_store_.slots[index];
             const std::uint32_t version = slot_version(slot);
 
-            free_head_ = slot_index(slot);
-            entities_[index] = pack(index, version);
-            return Entity{entities_[index]};
+            entity_store_.free_head = slot_index(slot);
+            entity_store_.slots[index] = pack(index, version);
+            return Entity{entity_store_.slots[index]};
         }
 
-        if (entities_.size() >= invalid_index) {
+        if (entity_store_.slots.size() >= invalid_index) {
             throw std::length_error("ecs entity index space exhausted");
         }
 
-        const std::uint32_t index = static_cast<std::uint32_t>(entities_.size());
-        entities_.push_back(pack(index, 1));
-        return Entity{entities_.back()};
+        const std::uint32_t index = static_cast<std::uint32_t>(entity_store_.slots.size());
+        entity_store_.slots.push_back(pack(index, 1));
+        return Entity{entity_store_.slots.back()};
     }
 
     bool destroy(Entity entity) {
@@ -425,7 +469,7 @@ public:
         }
 
         const std::uint32_t index = entity_index(entity);
-        for (auto& storage : storages_) {
+        for (auto& storage : storage_registry_.storages) {
             if (storage.second->contains_index(index)) {
                 remove_from_groups_before_component_removal(index, storage.first);
                 storage.second->remove_index_for_destroy(index);
@@ -439,8 +483,8 @@ public:
             next_version = 1;
         }
 
-        entities_[index] = pack(free_head_, next_version);
-        free_head_ = index;
+        entity_store_.slots[index] = pack(entity_store_.free_head, next_version);
+        entity_store_.free_head = index;
         return true;
     }
 
@@ -448,12 +492,38 @@ public:
         const std::uint32_t index = entity_index(entity);
         const std::uint32_t version = entity_version(entity);
 
-        if (version == 0 || index >= entities_.size()) {
+        if (version == 0 || index >= entity_store_.slots.size()) {
             return false;
         }
 
-        const std::uint64_t slot = entities_[index];
+        const std::uint64_t slot = entity_store_.slots[index];
         return slot_index(slot) == index && slot_version(slot) == version;
+    }
+
+    EntityKind entity_kind(Entity entity) const {
+        require_runtime_registry_access_allowed("entity_kind");
+        if (!alive(entity)) {
+            return EntityKind::Invalid;
+        }
+
+        const std::uint32_t index = entity_index(entity);
+        if (component_catalog_.records.find(index) != component_catalog_.records.end()) {
+            return EntityKind::Component;
+        }
+        if (job_registry_.index_by_entity.find(entity.value) != job_registry_.index_by_entity.end()) {
+            return EntityKind::Job;
+        }
+        const TypeErasedStorage* system_storage =
+            component_catalog_.system_tag ? find_storage(component_catalog_.system_tag) : nullptr;
+        if (system_storage != nullptr && system_storage->contains_index(index)) {
+            return EntityKind::System;
+        }
+        return EntityKind::User;
+    }
+
+    bool is_user_entity(Entity entity) const {
+        require_runtime_registry_access_allowed("is_user_entity");
+        return entity_kind(entity) == EntityKind::User;
     }
 
     template <typename T>
@@ -464,8 +534,8 @@ public:
             "ecs singleton components must be default constructible");
 
         const std::size_t id = type_id<T>();
-        if (id < typed_components_.size() && typed_components_[id]) {
-            return typed_components_[id];
+        if (id < component_catalog_.typed_components.size() && component_catalog_.typed_components[id]) {
+            return component_catalog_.typed_components[id];
         }
 
         if (name.empty()) {
@@ -494,7 +564,7 @@ public:
             id);
 
         ensure_typed_capacity(id);
-        typed_components_[id] = component;
+        component_catalog_.typed_components[id] = component;
         if constexpr (is_singleton_component<T>::value) {
             storage_for(component).template emplace_or_replace<T>(entity_index(singleton_entity()));
         }
@@ -527,11 +597,11 @@ public:
     }
 
     Entity primitive_type(PrimitiveType type) const {
-        return primitive_types_[static_cast<std::size_t>(type)];
+        return component_catalog_.primitive_types[static_cast<std::size_t>(type)];
     }
 
     Entity system_tag() const {
-        return system_tag_;
+        return component_catalog_.system_tag;
     }
 
     const ComponentInfo* component_info(Entity component) const {
@@ -712,7 +782,7 @@ public:
         registered_component<T>();
         std::uint32_t index = entity_index(entity);
         if constexpr (is_singleton_component<T>::value) {
-            index = entity_index(singleton_entity_);
+            index = entity_index(component_catalog_.singleton_entity);
         }
         const TypeErasedStorage* storage = typed_storage<T>();
         assert(storage != nullptr);
@@ -725,7 +795,7 @@ public:
         registered_component<T>();
         const TypeErasedStorage* storage = typed_storage<T>();
         assert(storage != nullptr);
-        return *static_cast<const T*>(storage->get_unchecked(entity_index(singleton_entity_)));
+        return *static_cast<const T*>(storage->get_unchecked(entity_index(component_catalog_.singleton_entity)));
     }
 
     const void* get(Entity entity, Entity component) const {
@@ -735,7 +805,7 @@ public:
             throw std::logic_error("ecs tags cannot be read as components");
         }
         if (record.singleton) {
-            entity = singleton_entity_;
+            entity = component_catalog_.singleton_entity;
         }
         if (!alive(entity)) {
             return nullptr;
@@ -751,7 +821,7 @@ public:
         registered_component<T>();
         std::uint32_t index = entity_index(entity);
         if constexpr (is_singleton_component<T>::value) {
-            index = entity_index(singleton_entity_);
+            index = entity_index(component_catalog_.singleton_entity);
         }
         TypeErasedStorage* storage = typed_storage<T>();
         assert(storage != nullptr);
@@ -764,7 +834,7 @@ public:
         registered_component<T>();
         TypeErasedStorage* storage = typed_storage<T>();
         assert(storage != nullptr);
-        return *static_cast<T*>(storage->write_unchecked(entity_index(singleton_entity_)));
+        return *static_cast<T*>(storage->write_unchecked(entity_index(component_catalog_.singleton_entity)));
     }
 
     void* write(Entity entity, Entity component) {
@@ -774,7 +844,7 @@ public:
             throw std::logic_error("ecs tags cannot be written");
         }
         if (record.singleton) {
-            entity = singleton_entity_;
+            entity = component_catalog_.singleton_entity;
         }
         if (!alive(entity)) {
             return nullptr;
@@ -810,7 +880,7 @@ public:
         require_runtime_registry_access_allowed("clear_dirty");
         const Entity component = registered_component<T>();
         if constexpr (is_singleton_component<T>::value) {
-            return clear_dirty(singleton_entity_, component);
+            return clear_dirty(component_catalog_.singleton_entity, component);
         }
         return clear_dirty(entity, component);
     }
@@ -819,14 +889,14 @@ public:
     bool clear_dirty() {
         require_runtime_registry_access_allowed("clear_dirty");
         const Entity component = registered_component<T>();
-        return clear_dirty(singleton_entity_, component);
+        return clear_dirty(component_catalog_.singleton_entity, component);
     }
 
     bool clear_dirty(Entity entity, Entity component) {
         require_runtime_registry_access_allowed("clear_dirty");
         const ComponentRecord& record = require_component_record(component);
         if (record.singleton) {
-            entity = singleton_entity_;
+            entity = component_catalog_.singleton_entity;
         }
         if (!alive(entity)) {
             return false;
@@ -841,7 +911,7 @@ public:
         require_runtime_registry_access_allowed("is_dirty");
         const Entity component = registered_component<T>();
         if constexpr (is_singleton_component<T>::value) {
-            return is_dirty(singleton_entity_, component);
+            return is_dirty(component_catalog_.singleton_entity, component);
         }
         return is_dirty(entity, component);
     }
@@ -850,14 +920,14 @@ public:
     bool is_dirty() const {
         require_runtime_registry_access_allowed("is_dirty");
         const Entity component = registered_component<T>();
-        return is_dirty(singleton_entity_, component);
+        return is_dirty(component_catalog_.singleton_entity, component);
     }
 
     bool is_dirty(Entity entity, Entity component) const {
         require_runtime_registry_access_allowed("is_dirty");
         const ComponentRecord& record = require_component_record(component);
         if (record.singleton) {
-            entity = singleton_entity_;
+            entity = component_catalog_.singleton_entity;
         }
         if (!alive(entity)) {
             return false;
@@ -895,7 +965,7 @@ public:
         const ComponentRecord& record = require_component_record(component);
         Entity singleton = Entity{};
         if (record.singleton) {
-            singleton = singleton_entity_;
+            singleton = component_catalog_.singleton_entity;
         }
 
         const auto* found = find_storage(component);
@@ -905,7 +975,7 @@ public:
 
         Fn& callback = fn;
         found->each_dirty([&](std::uint32_t index, const void* value) {
-            callback(record.singleton ? singleton : Entity{entities_[index]}, value);
+            callback(record.singleton ? singleton : Entity{entity_store_.slots[index]}, value);
         });
     }
 
@@ -943,7 +1013,7 @@ public:
 
     void set_job_thread_executor(JobThreadExecutor executor) {
         require_runtime_registry_access_allowed("set_job_thread_executor");
-        job_thread_executor_ = std::move(executor);
+        job_registry_.thread_executor = std::move(executor);
     }
 
     void run_jobs(RunJobsOptions options = {});
@@ -954,11 +1024,11 @@ public:
     template <typename... Owned>
     void declare_owned_group();
 
-    Snapshot snapshot() const;
-    DeltaSnapshot delta_snapshot(const Snapshot& baseline) const;
-    DeltaSnapshot delta_snapshot(const DeltaSnapshot& baseline) const;
-    void restore(const Snapshot& snapshot);
-    void restore(const DeltaSnapshot& snapshot);
+    Snapshot create_snapshot() const;
+    DeltaSnapshot create_delta_snapshot(const Snapshot& baseline) const;
+    DeltaSnapshot create_delta_snapshot(const DeltaSnapshot& baseline) const;
+    void restore_snapshot(const Snapshot& snapshot);
+    void restore_delta_snapshot(const DeltaSnapshot& snapshot);
 
     std::string debug_print(Entity entity, Entity component) const {
         require_runtime_registry_access_allowed("debug_print");
@@ -997,6 +1067,8 @@ public:
     }
 
 private:
+    friend class SnapshotPersistenceCodecs;
+    friend class PersistentSnapshotAccess;
     static constexpr std::size_t npos_type_id = std::numeric_limits<std::size_t>::max();
     static constexpr std::size_t default_min_entities_per_thread = 1024;
 
@@ -1051,88 +1123,12 @@ private:
     public:
         static constexpr std::uint32_t npos = std::numeric_limits<std::uint32_t>::max();
 
-        explicit TypeErasedStorage(const ComponentRecord& record)
-            : info_(record.info), lifecycle_(record.lifecycle) {}
-
-        TypeErasedStorage(const TypeErasedStorage& other)
-            : dense_indices_(other.dense_indices_),
-              sparse_(other.sparse_),
-              dirty_(other.dirty_),
-              tombstones_(other.tombstone_count_ == 0 ? std::vector<unsigned char>{} : other.tombstones_),
-              tombstone_indices_(other.tombstone_count_ == 0 ? std::vector<std::uint32_t>{} : other.tombstone_indices_),
-              dirty_count_(other.dirty_count_),
-              tombstone_count_(other.tombstone_count_),
-              compact_lookup_(other.compact_lookup_),
-              info_(other.info_),
-              lifecycle_(other.lifecycle_) {
-            copy_from(other);
-        }
-
-        TypeErasedStorage& operator=(const TypeErasedStorage& other) {
-            if (this != &other) {
-                TypeErasedStorage copy(other);
-                *this = std::move(copy);
-            }
-
-            return *this;
-        }
-
-        TypeErasedStorage(TypeErasedStorage&& other) noexcept
-            : dense_indices_(std::move(other.dense_indices_)),
-              sparse_(std::move(other.sparse_)),
-              dirty_(std::move(other.dirty_)),
-              tombstones_(std::move(other.tombstones_)),
-              tombstone_indices_(std::move(other.tombstone_indices_)),
-              data_(other.data_),
-              size_(other.size_),
-              capacity_(other.capacity_),
-              dirty_count_(other.dirty_count_),
-              tombstone_count_(other.tombstone_count_),
-              compact_lookup_(other.compact_lookup_),
-              info_(other.info_),
-              lifecycle_(other.lifecycle_),
-              swap_scratch_(std::move(other.swap_scratch_)) {
-            other.data_ = nullptr;
-            other.size_ = 0;
-            other.capacity_ = 0;
-            other.dirty_count_ = 0;
-            other.tombstone_count_ = 0;
-            other.compact_lookup_ = false;
-        }
-
-        TypeErasedStorage& operator=(TypeErasedStorage&& other) noexcept {
-            if (this != &other) {
-                clear();
-                deallocate(data_, info_.alignment);
-                dense_indices_ = std::move(other.dense_indices_);
-                sparse_ = std::move(other.sparse_);
-                dirty_ = std::move(other.dirty_);
-                tombstones_ = std::move(other.tombstones_);
-                tombstone_indices_ = std::move(other.tombstone_indices_);
-                data_ = other.data_;
-                size_ = other.size_;
-                capacity_ = other.capacity_;
-                dirty_count_ = other.dirty_count_;
-                tombstone_count_ = other.tombstone_count_;
-                compact_lookup_ = other.compact_lookup_;
-                info_ = other.info_;
-                lifecycle_ = other.lifecycle_;
-                swap_scratch_ = std::move(other.swap_scratch_);
-                other.data_ = nullptr;
-                other.size_ = 0;
-                other.capacity_ = 0;
-                other.dirty_count_ = 0;
-                other.tombstone_count_ = 0;
-                other.compact_lookup_ = false;
-            }
-
-            return *this;
-        }
-
-        ~TypeErasedStorage() {
-            clear();
-            deallocate(data_, info_.alignment);
-        }
+        explicit TypeErasedStorage(const ComponentRecord& record);
+        TypeErasedStorage(const TypeErasedStorage& other);
+        TypeErasedStorage& operator=(const TypeErasedStorage& other);
+        TypeErasedStorage(TypeErasedStorage&& other) noexcept;
+        TypeErasedStorage& operator=(TypeErasedStorage&& other) noexcept;
+        ~TypeErasedStorage();
 
         template <typename T, typename... Args>
         T* emplace_or_replace(std::uint32_t index, Args&&... args) {
@@ -1172,211 +1168,27 @@ private:
             return static_cast<T*>(target);
         }
 
-        void emplace_or_replace_tag(std::uint32_t index) {
-            if (!info_.tag) {
-                throw std::logic_error("ecs component storage is not a tag");
-            }
-
-            if (contains(index)) {
-                mark_dirty_dense(sparse_[index]);
-                return;
-            }
-
-            ensure_sparse(index);
-            clear_tombstone(index);
-
-            const std::uint32_t dense = static_cast<std::uint32_t>(size_);
-            dense_indices_.push_back(index);
-            dirty_.push_back(1);
-            ++dirty_count_;
-            sparse_[index] = dense;
-            ++size_;
-        }
-
-        void* emplace_or_replace_bytes(std::uint32_t index, const void* value) {
-            if (info_.tag) {
-                throw std::logic_error("ecs tags do not store component values");
-            }
-            if (!info_.trivially_copyable) {
-                throw std::logic_error("runtime byte add requires a trivially copyable component");
-            }
-
-            if (void* existing = get(index)) {
-                mark_dirty_dense(sparse_[index]);
-                assign_bytes(existing, value);
-                return existing;
-            }
-
-            ensure_sparse(index);
-            clear_tombstone(index);
-            ensure_capacity(size_ + 1);
-
-            const std::uint32_t dense = static_cast<std::uint32_t>(size_);
-            dense_indices_.push_back(index);
-            dirty_.push_back(1);
-            ++dirty_count_;
-            sparse_[index] = dense;
-            void* target = data_ + size_ * info_.size;
-            assign_bytes(target, value);
-            ++size_;
-            return target;
-        }
-
-        void emplace_or_replace_copy(std::uint32_t index, const void* value) {
-            if (info_.tag) {
-                emplace_or_replace_tag(index);
-                return;
-            }
-            if (void* existing = get(index)) {
-                mark_dirty_dense(sparse_[index]);
-                replace_copy(existing, value);
-                return;
-            }
-
-            ensure_sparse(index);
-            clear_tombstone(index);
-            ensure_capacity(size_ + 1);
-
-            const std::uint32_t dense = static_cast<std::uint32_t>(size_);
-            dense_indices_.push_back(index);
-            dirty_.push_back(1);
-            ++dirty_count_;
-            sparse_[index] = dense;
-            construct_copy(data_ + size_ * info_.size, value);
-            ++size_;
-        }
-
-        void* ensure(std::uint32_t index) {
-            if (info_.tag) {
-                throw std::logic_error("ecs tags do not store component values");
-            }
-            if (void* existing = write(index)) {
-                return existing;
-            }
-
-            return emplace_or_replace_bytes(index, nullptr);
-        }
-
-        bool remove(std::uint32_t index) {
-            if (!contains(index)) {
-                return false;
-            }
-
-            erase_at(sparse_[index]);
-            mark_tombstone(index, tombstone_dirty);
-            return true;
-        }
-
-        void remove_index(std::uint32_t index) {
-            (void)remove(index);
-        }
-
-        void remove_index_for_destroy(std::uint32_t index) {
-            if (!contains(index)) {
-                return;
-            }
-
-            erase_at(sparse_[index]);
-            mark_tombstone(index, tombstone_dirty | tombstone_destroy_entity);
-        }
-
-        void* get(std::uint32_t index) {
-            if (!contains(index)) {
-                return nullptr;
-            }
-            if (info_.tag) {
-                return nullptr;
-            }
-
-            return data_ + sparse_[index] * info_.size;
-        }
-
-        const void* get(std::uint32_t index) const {
-            if (!contains(index)) {
-                return nullptr;
-            }
-            if (info_.tag) {
-                return nullptr;
-            }
-
-            return data_ + sparse_[index] * info_.size;
-        }
-
-        void* write(std::uint32_t index) {
-            if (!contains(index)) {
-                return nullptr;
-            }
-
-            const std::uint32_t dense = sparse_[index];
-            mark_dirty_dense(dense);
-            if (info_.tag) {
-                return nullptr;
-            }
-            return data_ + dense * info_.size;
-        }
-
-        const void* get_unchecked(std::uint32_t index) const {
-            assert(!info_.tag);
-            assert(contains(index));
-            return data_ + sparse_[index] * info_.size;
-        }
-
-        void* write_unchecked(std::uint32_t index) {
-            assert(!info_.tag);
-            assert(contains(index));
-            const std::uint32_t dense = sparse_[index];
-            mark_dirty_dense(dense);
-            return data_ + dense * info_.size;
-        }
-
-        bool clear_dirty(std::uint32_t index) {
-            if (!contains(index)) {
-                if (has_tombstone(index)) {
-                    clear_tombstone(index);
-                    return true;
-                }
-                return false;
-            }
-
-            clear_dirty_dense(sparse_[index]);
-            return true;
-        }
-
-        bool is_dirty(std::uint32_t index) const {
-            if (!contains(index)) {
-                return has_tombstone(index);
-            }
-
-            return dirty_[sparse_[index]] != 0;
-        }
-
-        void clear_all_dirty() {
-            std::fill(dirty_.begin(), dirty_.end(), std::uint8_t{0});
-            std::fill(tombstones_.begin(), tombstones_.end(), no_tombstone);
-            tombstone_indices_.clear();
-            dirty_count_ = 0;
-            tombstone_count_ = 0;
-        }
-
-        std::size_t dense_size() const noexcept {
-            return size_;
-        }
-
-        std::uint32_t dense_index_at(std::size_t dense) const {
-            return dense_indices_[dense];
-        }
-
-        std::uint32_t dense_position(std::uint32_t index) const {
-            return contains(index) ? sparse_[index] : npos;
-        }
-
-        bool contains_index(std::uint32_t index) const {
-            return contains(index);
-        }
-
-        bool has_dirty_entries() const {
-            return dirty_count_ != 0 || tombstone_count_ != 0;
-        }
+        void emplace_or_replace_tag(std::uint32_t index);
+        void* emplace_or_replace_bytes(std::uint32_t index, const void* value);
+        void emplace_or_replace_copy(std::uint32_t index, const void* value);
+        void* ensure(std::uint32_t index);
+        bool remove(std::uint32_t index);
+        void remove_index(std::uint32_t index);
+        void remove_index_for_destroy(std::uint32_t index);
+        void* get(std::uint32_t index);
+        const void* get(std::uint32_t index) const;
+        void* write(std::uint32_t index);
+        const void* get_unchecked(std::uint32_t index) const;
+        void* write_unchecked(std::uint32_t index);
+        bool clear_dirty(std::uint32_t index);
+        bool is_dirty(std::uint32_t index) const;
+        void clear_all_dirty();
+        void mark_dirty(std::uint32_t index);
+        std::size_t dense_size() const noexcept;
+        std::uint32_t dense_index_at(std::size_t dense) const;
+        std::uint32_t dense_position(std::uint32_t index) const;
+        bool contains_index(std::uint32_t index) const;
+        bool has_dirty_entries() const;
 
         template <typename Fn>
         void each_dirty(Fn&& fn) const {
@@ -1404,143 +1216,53 @@ private:
             }
         }
 
-        bool has_destroy_tombstone(std::uint32_t index) const {
-            return has_tombstone(index) && (tombstones_[index] & tombstone_destroy_entity) != 0;
-        }
+        bool has_destroy_tombstone(std::uint32_t index) const;
+        std::size_t tombstone_size() const noexcept;
+        std::size_t tombstone_entry_count() const noexcept;
+        std::uint32_t tombstone_index_at(std::size_t position) const;
+        unsigned char tombstone_flags_at(std::size_t position) const;
+        bool has_dirty_tombstone_at(std::uint32_t index) const;
+        bool has_dirty_tombstone_at_position(std::size_t position) const;
+        bool has_destroy_tombstone_at_position(std::size_t position) const;
+        const void* get_dense(std::size_t dense) const;
+        void swap_dense(std::uint32_t lhs, std::uint32_t rhs);
+        void move_index_to_dense(std::uint32_t index, std::uint32_t dense);
+        void* write_unchecked_without_dirty(std::uint32_t index);
 
-        std::size_t tombstone_size() const noexcept {
-            return tombstone_count_ == 0 ? 0 : tombstones_.size();
-        }
+        struct DeferredDirtyWrite {
+            TypeErasedStorage* storage = nullptr;
+            std::uint32_t index = 0;
+        };
 
-        std::size_t tombstone_entry_count() const noexcept {
-            return tombstone_indices_.size();
-        }
+        using DeferredDirtyWrites = std::vector<DeferredDirtyWrite>;
 
-        std::uint32_t tombstone_index_at(std::size_t position) const {
-            return tombstone_indices_[position];
-        }
+        class DeferredDirtyScope {
+        public:
+            DeferredDirtyScope(DeferredDirtyWrites& writes, bool defer_range_dirty);
+            DeferredDirtyScope(const DeferredDirtyScope&) = delete;
+            DeferredDirtyScope& operator=(const DeferredDirtyScope&) = delete;
+            ~DeferredDirtyScope();
 
-        unsigned char tombstone_flags_at(std::size_t position) const {
-            if (compact_lookup_) {
-                return tombstones_[position];
-            }
-            return tombstones_[tombstone_indices_[position]];
-        }
+        private:
+            DeferredDirtyWrites* previous_writes_ = nullptr;
+            bool previous_defer_range_dirty_ = false;
+        };
 
-        bool has_dirty_tombstone_at(std::uint32_t index) const {
-            return has_tombstone(index);
-        }
-
-        bool has_dirty_tombstone_at_position(std::size_t position) const {
-            return (tombstone_flags_at(position) & tombstone_dirty) != 0;
-        }
-
-        bool has_destroy_tombstone_at_position(std::size_t position) const {
-            return (tombstone_flags_at(position) & tombstone_destroy_entity) != 0;
-        }
-
-        const void* get_dense(std::size_t dense) const {
-            if (info_.tag) {
-                return nullptr;
-            }
-            return data_ + dense * info_.size;
-        }
-
-        void swap_dense(std::uint32_t lhs, std::uint32_t rhs) {
-            if (lhs == rhs) {
-                return;
-            }
-            if (lhs >= size_ || rhs >= size_) {
-                throw std::out_of_range("ecs dense storage swap index is out of range");
-            }
-
-            if (!info_.tag) {
-                unsigned char* lhs_value = data_ + lhs * info_.size;
-                unsigned char* rhs_value = data_ + rhs * info_.size;
-
-                if (info_.trivially_copyable) {
-                    std::array<unsigned char, 256> stack_temp;
-                    unsigned char* temp = stack_temp.data();
-                    if (info_.size > stack_temp.size()) {
-                        swap_scratch_.resize(info_.size);
-                        temp = swap_scratch_.data();
-                    }
-                    std::memcpy(temp, lhs_value, info_.size);
-                    std::memcpy(lhs_value, rhs_value, info_.size);
-                    std::memcpy(rhs_value, temp, info_.size);
-                } else {
-                    unsigned char* temp = allocate(1, info_);
-                    try {
-                        lifecycle_.move_construct(temp, lhs_value);
-                        lifecycle_.destroy(lhs_value);
-                        lifecycle_.move_construct(lhs_value, rhs_value);
-                        lifecycle_.destroy(rhs_value);
-                        lifecycle_.move_construct(rhs_value, temp);
-                        lifecycle_.destroy(temp);
-                    } catch (...) {
-                        deallocate(temp, info_.alignment);
-                        throw;
-                    }
-                    deallocate(temp, info_.alignment);
-                }
-            }
-
-            const std::uint32_t lhs_index = dense_indices_[lhs];
-            const std::uint32_t rhs_index = dense_indices_[rhs];
-            dense_indices_[lhs] = rhs_index;
-            dense_indices_[rhs] = lhs_index;
-            sparse_[lhs_index] = rhs;
-            sparse_[rhs_index] = lhs;
-            const unsigned char lhs_dirty = dirty_[lhs];
-            dirty_[lhs] = dirty_[rhs];
-            dirty_[rhs] = lhs_dirty;
-        }
-
-        void move_index_to_dense(std::uint32_t index, std::uint32_t dense) {
-            const std::uint32_t current = dense_position(index);
-            if (current == npos) {
-                return;
-            }
-            swap_dense(current, dense);
-        }
-
-        std::unique_ptr<TypeErasedStorage> clone() const {
-            return std::make_unique<TypeErasedStorage>(*this);
-        }
-
-        std::unique_ptr<TypeErasedStorage> clone_for_restore() const {
-            auto copy = clone();
-            copy->rebuild_lookup();
-            return copy;
-        }
-
-        std::unique_ptr<TypeErasedStorage> clone_dirty() const {
-            auto copy = std::make_unique<TypeErasedStorage>(*this);
-            for (std::size_t dense = copy->size_; dense > 0; --dense) {
-                const std::uint32_t position = static_cast<std::uint32_t>(dense - 1);
-                if (copy->dirty_[position] == 0) {
-                    copy->erase_at(position);
-                }
-            }
-            return copy;
-        }
-
-        std::unique_ptr<TypeErasedStorage> clone_excluding(const std::vector<bool>& excluded) const {
-            return clone_compact_filtered(excluded, false);
-        }
-
-        std::unique_ptr<TypeErasedStorage> clone_dirty_excluding(const std::vector<bool>& excluded) const {
-            return clone_compact_filtered(excluded, true);
-        }
+        static bool range_dirty_deferred() noexcept;
+        std::unique_ptr<TypeErasedStorage> clone() const;
+        std::unique_ptr<TypeErasedStorage> clone_for_restore() const;
+        std::unique_ptr<TypeErasedStorage> clone_dirty() const;
+        std::unique_ptr<TypeErasedStorage> clone_excluding(const std::vector<bool>& excluded) const;
+        std::unique_ptr<TypeErasedStorage> clone_dirty_excluding(const std::vector<bool>& excluded) const;
 
         friend void write_storage(std::ostream& out, const Registry::TypeErasedStorage& storage);
         friend std::unique_ptr<Registry::TypeErasedStorage> read_storage(
             std::istream& in,
             const Registry::ComponentRecord& record);
+        friend class PersistentSnapshotAccess;
 
     private:
-        TypeErasedStorage(ComponentInfo info, ComponentLifecycle lifecycle)
-            : info_(info), lifecycle_(lifecycle) {}
+        TypeErasedStorage(ComponentInfo info, ComponentLifecycle lifecycle);
 
         template <typename T>
         void validate_type() const {
@@ -1549,408 +1271,32 @@ private:
             }
         }
 
-        static unsigned char* allocate(std::size_t capacity, const ComponentInfo& info) {
-            if (capacity == 0 || info.tag) {
-                return nullptr;
-            }
-
-            return static_cast<unsigned char*>(
-                ::operator new(info.size * capacity, std::align_val_t{info.alignment}));
-        }
-
-        static void deallocate(unsigned char* data, std::size_t alignment) noexcept {
-            if (data != nullptr) {
-                ::operator delete(data, std::align_val_t{alignment});
-            }
-        }
-
-        void assign_bytes(void* target, const void* value) {
-            if (info_.tag) {
-                throw std::logic_error("ecs tags do not store component values");
-            }
-            if (value != nullptr) {
-                std::memcpy(target, value, info_.size);
-            } else {
-                std::memset(target, 0, info_.size);
-            }
-        }
-
-        void construct_copy(void* target, const void* value) {
-            if (info_.tag) {
-                return;
-            }
-            if (info_.trivially_copyable) {
-                std::memcpy(target, value, info_.size);
-                return;
-            }
-            if (lifecycle_.copy_construct == nullptr) {
-                throw std::logic_error("ecs component storage is not copyable");
-            }
-            lifecycle_.copy_construct(target, value);
-        }
-
-        void replace_copy(void* target, const void* value) {
-            if (info_.tag) {
-                return;
-            }
-            if (info_.trivially_copyable) {
-                std::memcpy(target, value, info_.size);
-                return;
-            }
-            if (lifecycle_.copy_construct == nullptr) {
-                throw std::logic_error("ecs component storage is not copyable");
-            }
-            unsigned char* replacement = allocate(1, info_);
-            bool replacement_constructed = false;
-            try {
-                lifecycle_.copy_construct(replacement, value);
-                replacement_constructed = true;
-                lifecycle_.destroy(target);
-                lifecycle_.move_construct(target, replacement);
-                lifecycle_.destroy(replacement);
-                replacement_constructed = false;
-            } catch (...) {
-                if (replacement_constructed) {
-                    lifecycle_.destroy(replacement);
-                }
-                deallocate(replacement, info_.alignment);
-                throw;
-            }
-            deallocate(replacement, info_.alignment);
-        }
-
-        void ensure_sparse(std::uint32_t index) {
-            if (index >= sparse_.size()) {
-                sparse_.resize(static_cast<std::size_t>(index) + 1, npos);
-            }
-            if (index >= tombstones_.size()) {
-                tombstones_.resize(static_cast<std::size_t>(index) + 1, no_tombstone);
-            }
-        }
-
-        bool contains(std::uint32_t index) const {
-            if (index >= sparse_.size()) {
-                return false;
-            }
-
-            const std::uint32_t dense = sparse_[index];
-            return dense != npos && dense < size_ && dense_indices_[dense] == index;
-        }
-
-        void ensure_capacity(std::size_t required) {
-            if (info_.tag) {
-                capacity_ = std::max(capacity_, required);
-                return;
-            }
-            if (required <= capacity_) {
-                return;
-            }
-
-            const std::size_t next_capacity = std::max<std::size_t>(required, capacity_ == 0 ? 8 : capacity_ * 2);
-            unsigned char* next = allocate(next_capacity, info_);
-
-            if (info_.trivially_copyable) {
-                if (size_ != 0) {
-                    std::memcpy(next, data_, info_.size * size_);
-                }
-            } else {
-                std::size_t constructed = 0;
-                try {
-                    for (; constructed < size_; ++constructed) {
-                        lifecycle_.move_construct(
-                            next + constructed * info_.size,
-                            data_ + constructed * info_.size);
-                    }
-                } catch (...) {
-                    for (std::size_t i = 0; i < constructed; ++i) {
-                        lifecycle_.destroy(next + i * info_.size);
-                    }
-                    deallocate(next, info_.alignment);
-                    throw;
-                }
-
-                for (std::size_t i = 0; i < size_; ++i) {
-                    lifecycle_.destroy(data_ + i * info_.size);
-                }
-            }
-
-            deallocate(data_, info_.alignment);
-            data_ = next;
-            capacity_ = next_capacity;
-        }
-
-        void erase_at(std::uint32_t dense) {
-            const std::uint32_t removed_index = dense_indices_[dense];
-            const std::uint32_t last_dense = static_cast<std::uint32_t>(size_ - 1);
-            clear_dirty_dense(dense);
-
-            if (dense != last_dense) {
-                const std::uint32_t moved_index = dense_indices_[last_dense];
-
-                if (!info_.tag) {
-                    unsigned char* target = data_ + dense * info_.size;
-                    unsigned char* last = data_ + last_dense * info_.size;
-                    if (info_.trivially_copyable) {
-                        std::memcpy(target, last, info_.size);
-                    } else {
-                        lifecycle_.destroy(target);
-                        lifecycle_.move_construct(target, last);
-                        lifecycle_.destroy(last);
-                    }
-                }
-
-                dense_indices_[dense] = moved_index;
-                dirty_[dense] = dirty_[last_dense];
-                sparse_[moved_index] = dense;
-            } else if (!info_.tag && !info_.trivially_copyable) {
-                unsigned char* target = data_ + dense * info_.size;
-                lifecycle_.destroy(target);
-            }
-
-            sparse_[removed_index] = npos;
-            dense_indices_.pop_back();
-            dirty_.pop_back();
-            --size_;
-        }
-
-        void clear() noexcept {
-            if (!info_.tag && !info_.trivially_copyable) {
-                for (std::size_t i = 0; i < size_; ++i) {
-                    lifecycle_.destroy(data_ + i * info_.size);
-                }
-            }
-
-            size_ = 0;
-            dense_indices_.clear();
-            dirty_.clear();
-            std::fill(sparse_.begin(), sparse_.end(), npos);
-            std::fill(tombstones_.begin(), tombstones_.end(), no_tombstone);
-            tombstone_indices_.clear();
-            dirty_count_ = 0;
-            tombstone_count_ = 0;
-        }
-
-        void mark_tombstone(std::uint32_t index, unsigned char flags) {
-            ensure_sparse(index);
-            if (tombstones_[index] == no_tombstone && flags != no_tombstone) {
-                ++tombstone_count_;
-                tombstone_indices_.push_back(index);
-            } else if (tombstones_[index] != no_tombstone && flags == no_tombstone) {
-                --tombstone_count_;
-                erase_tombstone_index(index);
-            }
-            tombstones_[index] = flags;
-        }
-
-        void clear_tombstone(std::uint32_t index) {
-            if (index < tombstones_.size() && tombstones_[index] != no_tombstone) {
-                tombstones_[index] = no_tombstone;
-                erase_tombstone_index(index);
-                --tombstone_count_;
-            }
-        }
-
-        bool has_tombstone(std::uint32_t index) const {
-            return index < tombstones_.size() && tombstones_[index] != no_tombstone;
-        }
-
-        void mark_dirty_dense(std::uint32_t dense) {
-            if (dirty_[dense] == 0) {
-                ++dirty_count_;
-                dirty_[dense] = 1;
-            }
-        }
-
-        void clear_dirty_dense(std::uint32_t dense) {
-            if (dirty_[dense] != 0) {
-                dirty_[dense] = 0;
-                --dirty_count_;
-            }
-        }
-
-        void erase_tombstone_index(std::uint32_t index) {
-            const auto found = std::find(tombstone_indices_.begin(), tombstone_indices_.end(), index);
-            if (found != tombstone_indices_.end()) {
-                tombstone_indices_.erase(found);
-            }
-        }
-
+        static unsigned char* allocate(std::size_t capacity, const ComponentInfo& info);
+        static void deallocate(unsigned char* data, std::size_t alignment) noexcept;
+        void assign_bytes(void* target, const void* value);
+        void construct_copy(void* target, const void* value);
+        void replace_copy(void* target, const void* value);
+        void ensure_sparse(std::uint32_t index);
+        bool contains(std::uint32_t index) const;
+        void ensure_capacity(std::size_t required);
+        void erase_at(std::uint32_t dense);
+        void clear() noexcept;
+        void mark_tombstone(std::uint32_t index, unsigned char flags);
+        void clear_tombstone(std::uint32_t index);
+        bool has_tombstone(std::uint32_t index) const;
+        void mark_dirty_dense(std::uint32_t dense);
+        void clear_dirty_dense(std::uint32_t dense);
+        void mark_dirty_or_defer(std::uint32_t index, std::uint32_t dense);
+        void erase_tombstone_index(std::uint32_t index);
         std::unique_ptr<TypeErasedStorage> clone_compact_filtered(
             const std::vector<bool>& excluded,
-            bool dirty_only) const {
-            auto copy = std::unique_ptr<TypeErasedStorage>(new TypeErasedStorage(info_, lifecycle_));
-            copy->compact_lookup_ = true;
-
-            if (!dirty_only && !has_excluded_storage_entries(excluded)) {
-                copy->dense_indices_ = dense_indices_;
-                copy->dirty_ = dirty_;
-                copy->capacity_ = size_;
-                copy->dirty_count_ = dirty_count_;
-                if (info_.tag) {
-                    copy->size_ = size_;
-                } else if (copy->capacity_ != 0) {
-                    copy->data_ = allocate(copy->capacity_, info_);
-                    if (info_.trivially_copyable) {
-                        std::memcpy(copy->data_, data_, info_.size * size_);
-                        copy->size_ = size_;
-                    } else {
-                        if (lifecycle_.copy_construct == nullptr) {
-                            throw std::logic_error("ecs component storage is not copyable");
-                        }
-                        for (; copy->size_ < size_; ++copy->size_) {
-                            lifecycle_.copy_construct(
-                                copy->data_ + copy->size_ * info_.size,
-                                data_ + copy->size_ * info_.size);
-                        }
-                    }
-                }
-                copy_compact_tombstones_excluding(*copy, excluded);
-                return copy;
-            }
-
-            const std::size_t capacity_hint = dirty_only ? dirty_count_ : size_;
-            copy->dense_indices_.reserve(capacity_hint);
-            copy->dirty_.reserve(capacity_hint);
-            if (!info_.tag && capacity_hint != 0) {
-                copy->capacity_ = capacity_hint;
-                copy->data_ = allocate(copy->capacity_, info_);
-            }
-
-            for (std::size_t dense = 0; dense < size_; ++dense) {
-                const std::uint32_t index = dense_indices_[dense];
-                if ((index < excluded.size() && excluded[index]) || (dirty_only && dirty_[dense] == 0)) {
-                    continue;
-                }
-
-                if (!info_.tag) {
-                    const void* source = data_ + dense * info_.size;
-                    void* target = copy->data_ + copy->size_ * info_.size;
-                    copy->construct_copy(target, source);
-                }
-
-                copy->dense_indices_.push_back(index);
-                copy->dirty_.push_back(dirty_[dense]);
-                if (dirty_[dense] != 0) {
-                    ++copy->dirty_count_;
-                }
-                ++copy->size_;
-            }
-
-            copy_compact_tombstones_excluding(*copy, excluded);
-            return copy;
-        }
-
-        bool has_excluded_storage_entries(const std::vector<bool>& excluded) const {
-            if (excluded.empty()) {
-                return false;
-            }
-            for (std::uint32_t index : dense_indices_) {
-                if (index < excluded.size() && excluded[index]) {
-                    return true;
-                }
-            }
-            for (std::uint32_t index : tombstone_indices_) {
-                if (index < excluded.size() && excluded[index]) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
+            bool dirty_only) const;
+        bool has_excluded_storage_entries(const std::vector<bool>& excluded) const;
         void copy_compact_tombstones_excluding(
             TypeErasedStorage& copy,
-            const std::vector<bool>& excluded) const {
-            if (tombstone_count_ == 0) {
-                return;
-            }
-
-            copy.tombstone_indices_.reserve(tombstone_indices_.size());
-            copy.tombstones_.reserve(tombstone_indices_.size());
-            for (std::uint32_t index : tombstone_indices_) {
-                if (index < excluded.size() && excluded[index]) {
-                    continue;
-                }
-                const unsigned char flags = tombstones_[index];
-                if (flags == no_tombstone) {
-                    continue;
-                }
-                copy.tombstone_indices_.push_back(index);
-                copy.tombstones_.push_back(flags);
-                ++copy.tombstone_count_;
-            }
-        }
-
-        void rebuild_lookup() {
-            std::size_t lookup_size = 0;
-            for (std::uint32_t index : dense_indices_) {
-                lookup_size = std::max(lookup_size, static_cast<std::size_t>(index) + 1);
-            }
-            for (std::uint32_t index : tombstone_indices_) {
-                lookup_size = std::max(lookup_size, static_cast<std::size_t>(index) + 1);
-            }
-
-            sparse_.assign(lookup_size, npos);
-            for (std::size_t dense = 0; dense < dense_indices_.size(); ++dense) {
-                sparse_[dense_indices_[dense]] = static_cast<std::uint32_t>(dense);
-            }
-
-            std::vector<unsigned char> rebuilt_tombstones(lookup_size, no_tombstone);
-            if (compact_lookup_) {
-                for (std::size_t position = 0; position < tombstone_indices_.size(); ++position) {
-                    rebuilt_tombstones[tombstone_indices_[position]] = tombstones_[position];
-                }
-            } else {
-                for (std::uint32_t index : tombstone_indices_) {
-                    if (index < tombstones_.size()) {
-                        rebuilt_tombstones[index] = tombstones_[index];
-                    }
-                }
-            }
-            tombstones_ = std::move(rebuilt_tombstones);
-            compact_lookup_ = false;
-        }
-
-        void copy_from(const TypeErasedStorage& other) {
-            size_ = other.size_;
-            capacity_ = other.capacity_;
-            if (capacity_ == 0 || info_.tag) {
-                return;
-            }
-
-            data_ = allocate(capacity_, info_);
-            if (info_.trivially_copyable) {
-                if (size_ != 0) {
-                    std::memcpy(data_, other.data_, info_.size * size_);
-                }
-                return;
-            }
-
-            if (lifecycle_.copy_construct == nullptr) {
-                deallocate(data_, info_.alignment);
-                data_ = nullptr;
-                size_ = 0;
-                capacity_ = 0;
-                throw std::logic_error("ecs component storage is not copyable");
-            }
-
-            std::size_t constructed = 0;
-            try {
-                for (; constructed < size_; ++constructed) {
-                    lifecycle_.copy_construct(
-                        data_ + constructed * info_.size,
-                        other.data_ + constructed * info_.size);
-                }
-            } catch (...) {
-                for (std::size_t i = 0; i < constructed; ++i) {
-                    lifecycle_.destroy(data_ + i * info_.size);
-                }
-                deallocate(data_, info_.alignment);
-                data_ = nullptr;
-                size_ = 0;
-                capacity_ = 0;
-                throw;
-            }
-        }
+            const std::vector<bool>& excluded) const;
+        void rebuild_lookup();
+        void copy_from(const TypeErasedStorage& other);
 
         std::vector<std::uint32_t> dense_indices_;
         std::vector<std::uint32_t> sparse_;
@@ -1966,6 +1312,9 @@ private:
         ComponentInfo info_;
         ComponentLifecycle lifecycle_;
         std::vector<unsigned char> swap_scratch_;
+
+        static thread_local DeferredDirtyWrites* deferred_dirty_writes_;
+        static thread_local bool defer_range_dirty_;
 
         static constexpr unsigned char no_tombstone = 0;
         static constexpr unsigned char tombstone_dirty = 1U;
@@ -2015,6 +1364,26 @@ private:
         std::vector<Entity>& typed_components,
         std::vector<std::unique_ptr<Registry::GroupRecord>>& groups,
         std::unordered_map<std::uint32_t, std::unique_ptr<Registry::TypeErasedStorage>>& storages);
+    friend void write_persistent_snapshot(
+        std::ostream& out,
+        const Registry::Snapshot& snapshot,
+        const SnapshotPersistenceCodecs& codecs,
+        const SnapshotIoOptions& options);
+    friend Registry::Snapshot read_persistent_snapshot(
+        std::istream& in,
+        const Registry& schema,
+        const SnapshotPersistenceCodecs& codecs);
+    friend void write_persistent_delta_snapshot(
+        std::ostream& out,
+        const Registry::DeltaSnapshot& snapshot,
+        const Registry::Snapshot& baseline,
+        const SnapshotPersistenceCodecs& codecs,
+        const SnapshotIoOptions& options);
+    friend Registry::DeltaSnapshot read_persistent_delta_snapshot(
+        std::istream& in,
+        const Registry& schema,
+        const Registry::Snapshot& baseline,
+        const SnapshotPersistenceCodecs& codecs);
 
     struct JobRecord {
         Entity entity;
@@ -2028,6 +1397,7 @@ private:
         std::function<void(Registry&)> run;
         std::function<std::vector<std::uint32_t>(Registry&)> collect_indices;
         std::function<void(Registry&, const std::vector<std::uint32_t>&, std::size_t, std::size_t)> run_range;
+        std::vector<std::uint32_t> range_dirty_writes;
         std::size_t max_threads = 1;
         std::size_t min_entities_per_thread = default_min_entities_per_thread;
         bool single_thread = true;
@@ -2108,6 +1478,14 @@ private:
     }
 
     template <typename... Components>
+    std::vector<std::uint32_t> make_job_range_dirty_writes() const {
+        JobAccessMetadata metadata;
+        (append_job_access_component<Components>(metadata), ...);
+        canonicalize_job_metadata(metadata);
+        return std::move(metadata.writes);
+    }
+
+    template <typename... Components>
     void append_job_filter_metadata(JobAccessMetadata& metadata) const {
         (append_job_filter_component<Components>(metadata), ...);
         canonicalize_job_metadata(metadata);
@@ -2134,20 +1512,29 @@ private:
         std::function<void(Registry&)> run,
         std::function<std::vector<std::uint32_t>(Registry&)> collect_indices,
         std::function<void(Registry&, const std::vector<std::uint32_t>&, std::size_t, std::size_t)> run_range,
+        std::vector<std::uint32_t> range_dirty_writes,
         JobThreadingOptions threading,
         bool structural) {
         canonicalize_job_metadata(metadata);
+        for (std::uint32_t component : metadata.writes) {
+            const auto found = component_catalog_.records.find(component);
+            if (found != component_catalog_.records.end() && found->second.singleton) {
+                threading.single_thread = true;
+                threading.max_threads = 1;
+                break;
+            }
+        }
         const Entity entity = create();
         add_system_tag(entity);
-        job_schedule_cache_valid_ = false;
-        job_graph_cache_valid_ = false;
-        ordered_job_indices_cache_valid_ = false;
-        const std::size_t job_index = jobs_.size();
-        job_index_by_entity_[entity.value] = job_index;
-        jobs_.push_back(JobRecord{
+        job_registry_.schedule_cache_valid = false;
+        job_registry_.graph_cache_valid = false;
+        job_registry_.ordered_indices_cache_valid = false;
+        const std::size_t job_index = job_registry_.jobs.size();
+        job_registry_.index_by_entity[entity.value] = job_index;
+        job_registry_.jobs.push_back(JobRecord{
             entity,
             order,
-            next_job_sequence_++,
+            job_registry_.next_sequence++,
             std::move(metadata.reads),
             std::move(metadata.writes),
             metadata.read_mask,
@@ -2156,6 +1543,7 @@ private:
             std::move(run),
             std::move(collect_indices),
             std::move(run_range),
+            std::move(range_dirty_writes),
             std::max<std::size_t>(threading.max_threads, 1),
             std::max<std::size_t>(threading.min_entities_per_thread, 1),
             threading.single_thread,
@@ -2191,7 +1579,7 @@ private:
         key.erase(std::unique(key.begin(), key.end()), key.end());
 
         GroupRecord* best = nullptr;
-        for (const auto& group : groups_) {
+        for (const auto& group : group_index_.groups) {
             if (!includes_all(key, group->owned)) {
                 continue;
             }
@@ -2204,146 +1592,21 @@ private:
         return best;
     }
 
-    static bool includes_all(const std::vector<std::uint32_t>& lhs, const std::vector<std::uint32_t>& rhs) {
-        return std::includes(lhs.begin(), lhs.end(), rhs.begin(), rhs.end());
-    }
+    static bool includes_all(const std::vector<std::uint32_t>& lhs, const std::vector<std::uint32_t>& rhs);
 
-    GroupRecord& group_for_key(const std::vector<std::uint32_t>& key) {
-        for (const auto& group : groups_) {
-            if (group->owned == key) {
-                return *group;
-            }
-        }
-
-        validate_group_key(key);
-        auto group = std::make_unique<GroupRecord>();
-        group->owned = key;
-        groups_.push_back(std::move(group));
-        bump_view_topology_token();
-        GroupRecord& created = *groups_.back();
-        build_group(created);
-        register_group_ownership(created);
-        return created;
-    }
-
-    void validate_group_key(const std::vector<std::uint32_t>& key) const {
-        for (std::uint32_t component : key) {
-            auto found = owned_component_groups_.find(component);
-            if (found != owned_component_groups_.end() && found->second->owned != key) {
-                throw std::logic_error("ecs owned components cannot be shared by distinct owned groups");
-            }
-        }
-    }
-
-    void register_group_ownership(GroupRecord& group) {
-        for (std::uint32_t component : group.owned) {
-            owned_component_groups_[component] = &group;
-        }
-    }
-
-    void rebuild_group_ownership() {
-        owned_component_groups_.clear();
-        for (const auto& group : groups_) {
-            register_group_ownership(*group);
-        }
-    }
-
-    void build_group(GroupRecord& group) {
-        group.size = 0;
-        TypeErasedStorage* driver = smallest_storage(group);
-        if (driver == nullptr) {
-            return;
-        }
-
-        const std::size_t dense_size = driver->dense_size();
-        for (std::size_t dense = 0; dense < dense_size; ++dense) {
-            const std::uint32_t index = driver->dense_index_at(dense);
-            if (group_contains_all(group, index)) {
-                enter_group(group, index);
-            }
-        }
-    }
-
-    TypeErasedStorage* smallest_storage(const GroupRecord& group) {
-        TypeErasedStorage* driver = nullptr;
-        for (std::uint32_t component : group.owned) {
-            TypeErasedStorage* storage = find_storage(Entity{entities_[component]});
-            if (storage == nullptr) {
-                return nullptr;
-            }
-            if (driver == nullptr || storage->dense_size() < driver->dense_size()) {
-                driver = storage;
-            }
-        }
-        return driver;
-    }
-
-    bool group_contains_all(const GroupRecord& group, std::uint32_t index) const {
-        for (std::uint32_t component : group.owned) {
-            const TypeErasedStorage* storage = find_storage(Entity{entities_[component]});
-            if (storage == nullptr || !storage->contains_index(index)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    bool group_contains_component(const GroupRecord& group, std::uint32_t component) const {
-        return std::binary_search(group.owned.begin(), group.owned.end(), component);
-    }
-
-    bool group_contains_index(const GroupRecord& group, std::uint32_t index) const {
-        if (group.owned.empty() || group.size == 0) {
-            return false;
-        }
-        const TypeErasedStorage* storage = find_storage(Entity{entities_[group.owned.front()]});
-        if (storage == nullptr) {
-            return false;
-        }
-        const std::uint32_t dense = storage->dense_position(index);
-        return dense != TypeErasedStorage::npos && dense < group.size;
-    }
-
-    void enter_group(GroupRecord& group, std::uint32_t index) {
-        if (group_contains_index(group, index)) {
-            return;
-        }
-        const std::uint32_t target = static_cast<std::uint32_t>(group.size);
-        for (std::uint32_t component : group.owned) {
-            storage_for(Entity{entities_[component]}).move_index_to_dense(index, target);
-        }
-        ++group.size;
-    }
-
-    void leave_group(GroupRecord& group, std::uint32_t index) {
-        if (!group_contains_index(group, index)) {
-            return;
-        }
-        --group.size;
-        const std::uint32_t target = static_cast<std::uint32_t>(group.size);
-        for (std::uint32_t component : group.owned) {
-            storage_for(Entity{entities_[component]}).move_index_to_dense(index, target);
-        }
-    }
-
-    void refresh_group_after_add(std::uint32_t index, std::uint32_t component) {
-        auto found = owned_component_groups_.find(component);
-        if (found == owned_component_groups_.end()) {
-            return;
-        }
-        GroupRecord& group = *found->second;
-        if (group_contains_all(group, index)) {
-            enter_group(group, index);
-        }
-    }
-
-    void remove_from_groups_before_component_removal(std::uint32_t index, std::uint32_t component) {
-        auto found = owned_component_groups_.find(component);
-        if (found == owned_component_groups_.end()) {
-            return;
-        }
-        leave_group(*found->second, index);
-    }
+    GroupRecord& group_for_key(const std::vector<std::uint32_t>& key);
+    void validate_group_key(const std::vector<std::uint32_t>& key) const;
+    void register_group_ownership(GroupRecord& group);
+    void rebuild_group_ownership();
+    void build_group(GroupRecord& group);
+    TypeErasedStorage* smallest_storage(const GroupRecord& group);
+    bool group_contains_all(const GroupRecord& group, std::uint32_t index) const;
+    bool group_contains_component(const GroupRecord& group, std::uint32_t component) const;
+    bool group_contains_index(const GroupRecord& group, std::uint32_t index) const;
+    void enter_group(GroupRecord& group, std::uint32_t index);
+    void leave_group(GroupRecord& group, std::uint32_t index);
+    void refresh_group_after_add(std::uint32_t index, std::uint32_t component);
+    void remove_from_groups_before_component_removal(std::uint32_t index, std::uint32_t component);
 
     static constexpr std::uint64_t pack(std::uint32_t index, std::uint32_t version) noexcept {
         return (static_cast<std::uint64_t>(version) << 32U) | index;
@@ -2389,27 +1652,27 @@ private:
     }
 
     void ensure_typed_capacity(std::size_t id) {
-        if (id >= typed_components_.size()) {
-            typed_components_.resize(id + 1);
-            typed_storages_.resize(id + 1);
+        if (id >= component_catalog_.typed_components.size()) {
+            component_catalog_.typed_components.resize(id + 1);
+            storage_registry_.typed_storages.resize(id + 1);
         }
     }
 
     template <typename T>
     Entity registered_component() const {
         const std::size_t id = type_id<T>();
-        if (id >= typed_components_.size() || !typed_components_[id]) {
+        if (id >= component_catalog_.typed_components.size() || !component_catalog_.typed_components[id]) {
             throw std::logic_error("ecs component type is not registered");
         }
 
-        return typed_components_[id];
+        return component_catalog_.typed_components[id];
     }
 
     Entity singleton_entity() {
-        if (!singleton_entity_) {
-            singleton_entity_ = create();
+        if (!component_catalog_.singleton_entity) {
+            component_catalog_.singleton_entity = create();
         }
-        return singleton_entity_;
+        return component_catalog_.singleton_entity;
     }
 
     Entity register_component_impl(
@@ -2427,10 +1690,10 @@ private:
         }
 
         if (!desc.name.empty()) {
-            const auto by_name = component_names_.find(desc.name);
-            if (by_name != component_names_.end()) {
-                const Entity existing = components_.at(by_name->second).entity;
-                ComponentRecord& record = components_.at(by_name->second);
+            const auto by_name = component_catalog_.names.find(desc.name);
+            if (by_name != component_catalog_.names.end()) {
+                const Entity existing = component_catalog_.records.at(by_name->second).entity;
+                ComponentRecord& record = component_catalog_.records.at(by_name->second);
                 if (record.info.size != desc.size ||
                     record.info.alignment != desc.alignment ||
                     record.info.trivially_copyable != trivially_copyable ||
@@ -2440,9 +1703,12 @@ private:
                 }
 
                 if (typed_id != npos_type_id) {
+                    if (record.type_id != npos_type_id && record.type_id != typed_id) {
+                        throw std::logic_error("component name is already registered for a different component type");
+                    }
                     ensure_typed_capacity(typed_id);
-                    typed_components_[typed_id] = existing;
-                    typed_storages_[typed_id] = find_storage(existing);
+                    component_catalog_.typed_components[typed_id] = existing;
+                    storage_registry_.typed_storages[typed_id] = find_storage(existing);
                     record.type_id = typed_id;
                     record.lifecycle = lifecycle;
                 }
@@ -2463,9 +1729,9 @@ private:
 
         const std::uint32_t index = entity_index(component);
         if (!record.name.empty()) {
-            component_names_[record.name] = index;
+            component_catalog_.names[record.name] = index;
         }
-        components_[index] = std::move(record);
+        component_catalog_.records[index] = std::move(record);
         return component;
     }
 
@@ -2474,8 +1740,8 @@ private:
             return nullptr;
         }
 
-        auto found = components_.find(entity_index(component));
-        if (found == components_.end() || found->second.entity != component) {
+        auto found = component_catalog_.records.find(entity_index(component));
+        if (found == component_catalog_.records.end() || found->second.entity != component) {
             return nullptr;
         }
 
@@ -2487,8 +1753,8 @@ private:
             return nullptr;
         }
 
-        auto found = components_.find(entity_index(component));
-        if (found == components_.end() || found->second.entity != component) {
+        auto found = component_catalog_.records.find(entity_index(component));
+        if (found == component_catalog_.records.end() || found->second.entity != component) {
             return nullptr;
         }
 
@@ -2517,59 +1783,59 @@ private:
         const ComponentRecord& record = require_component_record(component);
         const std::uint32_t component_index = entity_index(component);
 
-        auto found = storages_.find(component_index);
-        if (found == storages_.end()) {
-            auto inserted = storages_.emplace(component_index, std::make_unique<TypeErasedStorage>(record));
+        auto found = storage_registry_.storages.find(component_index);
+        if (found == storage_registry_.storages.end()) {
+            auto inserted = storage_registry_.storages.emplace(component_index, std::make_unique<TypeErasedStorage>(record));
             found = inserted.first;
             bump_view_topology_token();
         }
 
         if (record.type_id != npos_type_id) {
             ensure_typed_capacity(record.type_id);
-            typed_storages_[record.type_id] = found->second.get();
+            storage_registry_.typed_storages[record.type_id] = found->second.get();
         }
 
         return *found->second;
     }
 
     void bump_view_topology_token() noexcept {
-        ++view_topology_token_;
-        if (view_topology_token_ == 0) {
-            view_topology_token_ = 1;
+        ++storage_registry_.view_topology_token;
+        if (storage_registry_.view_topology_token == 0) {
+            storage_registry_.view_topology_token = 1;
         }
     }
 
     template <typename T>
     TypeErasedStorage* typed_storage() {
         const std::size_t id = type_id<T>();
-        return id < typed_storages_.size() ? typed_storages_[id] : nullptr;
+        return id < storage_registry_.typed_storages.size() ? storage_registry_.typed_storages[id] : nullptr;
     }
 
     template <typename T>
     const TypeErasedStorage* typed_storage() const {
         const std::size_t id = type_id<T>();
-        return id < typed_storages_.size() ? typed_storages_[id] : nullptr;
+        return id < storage_registry_.typed_storages.size() ? storage_registry_.typed_storages[id] : nullptr;
     }
 
     void rebuild_typed_storages() {
-        typed_storages_.assign(typed_components_.size(), nullptr);
-        for (const auto& component : components_) {
+        storage_registry_.typed_storages.assign(component_catalog_.typed_components.size(), nullptr);
+        for (const auto& component : component_catalog_.records) {
             const ComponentRecord& record = component.second;
-            if (record.type_id != npos_type_id && record.type_id < typed_storages_.size()) {
-                const auto found = storages_.find(component.first);
-                typed_storages_[record.type_id] = found != storages_.end() ? found->second.get() : nullptr;
+            if (record.type_id != npos_type_id && record.type_id < storage_registry_.typed_storages.size()) {
+                const auto found = storage_registry_.storages.find(component.first);
+                storage_registry_.typed_storages[record.type_id] = found != storage_registry_.storages.end() ? found->second.get() : nullptr;
             }
         }
     }
 
     TypeErasedStorage* find_storage(Entity component) {
-        auto found = storages_.find(entity_index(component));
-        return found != storages_.end() ? found->second.get() : nullptr;
+        auto found = storage_registry_.storages.find(entity_index(component));
+        return found != storage_registry_.storages.end() ? found->second.get() : nullptr;
     }
 
     const TypeErasedStorage* find_storage(Entity component) const {
-        auto found = storages_.find(entity_index(component));
-        return found != storages_.end() ? found->second.get() : nullptr;
+        auto found = storage_registry_.storages.find(entity_index(component));
+        return found != storage_registry_.storages.end() ? found->second.get() : nullptr;
     }
 
     void require_tag_component(Entity component) const {
@@ -2586,53 +1852,53 @@ private:
         }
 
         const std::uint32_t component_index = entity_index(component);
-        groups_.erase(
-            std::remove_if(groups_.begin(), groups_.end(), [&](const auto& group) {
+        group_index_.groups.erase(
+            std::remove_if(group_index_.groups.begin(), group_index_.groups.end(), [&](const auto& group) {
                 return group_contains_component(*group, component_index);
             }),
-            groups_.end());
+            group_index_.groups.end());
         rebuild_group_ownership();
-        storages_.erase(component_index);
+        storage_registry_.storages.erase(component_index);
 
         if (!record->name.empty()) {
-            component_names_.erase(record->name);
+            component_catalog_.names.erase(record->name);
         }
 
-        if (record->type_id != npos_type_id && record->type_id < typed_components_.size()) {
-            typed_components_[record->type_id] = Entity{};
-            typed_storages_[record->type_id] = nullptr;
+        if (record->type_id != npos_type_id && record->type_id < component_catalog_.typed_components.size()) {
+            component_catalog_.typed_components[record->type_id] = Entity{};
+            storage_registry_.typed_storages[record->type_id] = nullptr;
         }
 
-        for (std::size_t index = 0; index < typed_components_.size(); ++index) {
-            if (typed_components_[index] == component) {
-                typed_components_[index] = Entity{};
-                typed_storages_[index] = nullptr;
+        for (std::size_t index = 0; index < component_catalog_.typed_components.size(); ++index) {
+            if (component_catalog_.typed_components[index] == component) {
+                component_catalog_.typed_components[index] = Entity{};
+                storage_registry_.typed_storages[index] = nullptr;
             }
         }
 
-        for (Entity& primitive : primitive_types_) {
+        for (Entity& primitive : component_catalog_.primitive_types) {
             if (primitive == component) {
                 primitive = Entity{};
             }
         }
 
-        components_.erase(component_index);
+        component_catalog_.records.erase(component_index);
     }
 
     void register_primitive_types() {
-        primitive_types_[static_cast<std::size_t>(PrimitiveType::Bool)] =
+        component_catalog_.primitive_types[static_cast<std::size_t>(PrimitiveType::Bool)] =
             register_primitive("bool", sizeof(bool), alignof(bool), PrimitiveKind::Bool);
-        primitive_types_[static_cast<std::size_t>(PrimitiveType::I32)] =
+        component_catalog_.primitive_types[static_cast<std::size_t>(PrimitiveType::I32)] =
             register_primitive("i32", sizeof(std::int32_t), alignof(std::int32_t), PrimitiveKind::I32);
-        primitive_types_[static_cast<std::size_t>(PrimitiveType::U32)] =
+        component_catalog_.primitive_types[static_cast<std::size_t>(PrimitiveType::U32)] =
             register_primitive("u32", sizeof(std::uint32_t), alignof(std::uint32_t), PrimitiveKind::U32);
-        primitive_types_[static_cast<std::size_t>(PrimitiveType::I64)] =
+        component_catalog_.primitive_types[static_cast<std::size_t>(PrimitiveType::I64)] =
             register_primitive("i64", sizeof(std::int64_t), alignof(std::int64_t), PrimitiveKind::I64);
-        primitive_types_[static_cast<std::size_t>(PrimitiveType::U64)] =
+        component_catalog_.primitive_types[static_cast<std::size_t>(PrimitiveType::U64)] =
             register_primitive("u64", sizeof(std::uint64_t), alignof(std::uint64_t), PrimitiveKind::U64);
-        primitive_types_[static_cast<std::size_t>(PrimitiveType::F32)] =
+        component_catalog_.primitive_types[static_cast<std::size_t>(PrimitiveType::F32)] =
             register_primitive("f32", sizeof(float), alignof(float), PrimitiveKind::F32);
-        primitive_types_[static_cast<std::size_t>(PrimitiveType::F64)] =
+        component_catalog_.primitive_types[static_cast<std::size_t>(PrimitiveType::F64)] =
             register_primitive("f64", sizeof(double), alignof(double), PrimitiveKind::F64);
     }
 
@@ -2646,7 +1912,7 @@ private:
         lifecycle.trivially_copyable = true;
 
         const Entity type = register_component_impl(std::move(desc), lifecycle, true, false, false, npos_type_id);
-        components_[entity_index(type)].primitive = kind;
+        component_catalog_.records[entity_index(type)].primitive = kind;
         add_system_tag(type);
         return type;
     }
@@ -2660,40 +1926,40 @@ private:
         ComponentLifecycle lifecycle;
         lifecycle.trivially_copyable = true;
 
-        system_tag_ = register_component_impl(std::move(desc), lifecycle, true, false, true, npos_type_id);
-        add_system_tag(system_tag_);
+        component_catalog_.system_tag = register_component_impl(std::move(desc), lifecycle, true, false, true, npos_type_id);
+        add_system_tag(component_catalog_.system_tag);
     }
 
     void add_system_tag(Entity entity) {
-        if (!system_tag_ || !alive(entity)) {
+        if (!component_catalog_.system_tag || !alive(entity)) {
             return;
         }
-        storage_for(system_tag_).emplace_or_replace_tag(entity_index(entity));
+        storage_for(component_catalog_.system_tag).emplace_or_replace_tag(entity_index(entity));
     }
 
     bool is_snapshot_excluded_index(std::uint32_t index) const {
-        if (!system_tag_ || components_.find(index) != components_.end()) {
+        if (!component_catalog_.system_tag || component_catalog_.records.find(index) != component_catalog_.records.end()) {
             return false;
         }
 
-        const TypeErasedStorage* system_storage = find_storage(system_tag_);
+        const TypeErasedStorage* system_storage = find_storage(component_catalog_.system_tag);
         return system_storage != nullptr && system_storage->contains_index(index);
     }
 
     std::vector<bool> make_snapshot_exclusion_mask() const {
         std::vector<bool> excluded;
-        const TypeErasedStorage* system_storage = system_tag_ ? find_storage(system_tag_) : nullptr;
+        const TypeErasedStorage* system_storage = component_catalog_.system_tag ? find_storage(component_catalog_.system_tag) : nullptr;
         if (system_storage == nullptr) {
             return excluded;
         }
 
         for (std::size_t dense = 0; dense < system_storage->dense_size(); ++dense) {
             const std::uint32_t index = system_storage->dense_index_at(dense);
-            if (index >= entities_.size() || components_.find(index) != components_.end()) {
+            if (index >= entity_store_.slots.size() || component_catalog_.records.find(index) != component_catalog_.records.end()) {
                 continue;
             }
             if (excluded.empty()) {
-                excluded.resize(entities_.size(), false);
+                excluded.resize(entity_store_.slots.size(), false);
             }
             excluded[index] = true;
         }
@@ -2701,7 +1967,7 @@ private:
     }
 
     std::vector<std::uint64_t> make_snapshot_entities(const std::vector<bool>& excluded) const {
-        std::vector<std::uint64_t> entities = entities_;
+        std::vector<std::uint64_t> entities = entity_store_.slots;
         if (excluded.empty()) {
             return entities;
         }
@@ -2715,17 +1981,17 @@ private:
 
     std::vector<Entity> current_snapshot_excluded_entities() const {
         std::vector<Entity> entities;
-        const TypeErasedStorage* system_storage = system_tag_ ? find_storage(system_tag_) : nullptr;
+        const TypeErasedStorage* system_storage = component_catalog_.system_tag ? find_storage(component_catalog_.system_tag) : nullptr;
         if (system_storage != nullptr) {
             for (std::size_t dense = 0; dense < system_storage->dense_size(); ++dense) {
                 const std::uint32_t index = system_storage->dense_index_at(dense);
-                if (is_snapshot_excluded_index(index) && index < entities_.size()) {
-                    entities.push_back(Entity{entities_[index]});
+                if (is_snapshot_excluded_index(index) && index < entity_store_.slots.size()) {
+                    entities.push_back(Entity{entity_store_.slots[index]});
                 }
             }
         }
 
-        for (const JobRecord& job : jobs_) {
+        for (const JobRecord& job : job_registry_.jobs) {
             if (alive(job.entity) && std::find(entities.begin(), entities.end(), job.entity) == entities.end()) {
                 entities.push_back(job.entity);
             }
@@ -2766,11 +2032,11 @@ private:
     }
 
     void restore_internal_bookkeeping_tags() {
-        add_system_tag(system_tag_);
-        for (Entity primitive : primitive_types_) {
+        add_system_tag(component_catalog_.system_tag);
+        for (Entity primitive : component_catalog_.primitive_types) {
             add_system_tag(primitive);
         }
-        for (const JobRecord& job : jobs_) {
+        for (const JobRecord& job : job_registry_.jobs) {
             add_system_tag(job.entity);
         }
     }
@@ -2811,34 +2077,41 @@ private:
     }
 
     const std::vector<std::size_t>& ordered_job_indices() const {
-        if (ordered_job_indices_cache_valid_) {
-            return ordered_job_indices_cache_;
+        if (job_registry_.ordered_indices_cache_valid) {
+            return job_registry_.ordered_indices_cache;
         }
 
-        ordered_job_indices_cache_.resize(jobs_.size());
-        std::iota(ordered_job_indices_cache_.begin(), ordered_job_indices_cache_.end(), std::size_t{0});
+        job_registry_.ordered_indices_cache.resize(job_registry_.jobs.size());
+        std::iota(job_registry_.ordered_indices_cache.begin(), job_registry_.ordered_indices_cache.end(), std::size_t{0});
         std::sort(
-            ordered_job_indices_cache_.begin(),
-            ordered_job_indices_cache_.end(),
+            job_registry_.ordered_indices_cache.begin(),
+            job_registry_.ordered_indices_cache.end(),
             [&](std::size_t lhs, std::size_t rhs) {
-                const JobRecord& left = jobs_[lhs];
-                const JobRecord& right = jobs_[rhs];
+                const JobRecord& left = job_registry_.jobs[lhs];
+                const JobRecord& right = job_registry_.jobs[rhs];
                 if (left.order != right.order) {
                     return left.order < right.order;
                 }
                 return left.sequence < right.sequence;
             });
-        ordered_job_indices_cache_valid_ = true;
-        return ordered_job_indices_cache_;
+        job_registry_.ordered_indices_cache_valid = true;
+        return job_registry_.ordered_indices_cache;
     }
 
     std::size_t job_index(Entity job) const {
-        const auto found = job_index_by_entity_.find(job.value);
-        if (found == job_index_by_entity_.end()) {
+        const auto found = job_registry_.index_by_entity.find(job.value);
+        if (found == job_registry_.index_by_entity.end()) {
             throw std::logic_error("ecs job is not registered");
         }
         return found->second;
     }
+
+    void mark_component_dirty_range(
+        const std::vector<std::uint32_t>& components,
+        const std::vector<std::uint32_t>& indices,
+        std::size_t begin,
+        std::size_t end);
+    void merge_deferred_dirty_writes(const TypeErasedStorage::DeferredDirtyWrites& writes);
 
     bool job_excluded_by_options(const JobRecord& job, RunJobsOptions options) const {
         if (options.excluded_job_tags == nullptr) {
@@ -2854,30 +2127,50 @@ private:
 
     const JobGraph& cached_all_jobs_graph() const;
 
-    std::vector<std::uint64_t> entities_;
-    std::uint32_t free_head_ = invalid_index;
-    std::unordered_map<std::uint32_t, ComponentRecord> components_;
-    std::unordered_map<std::string, std::uint32_t> component_names_;
-    std::unordered_map<std::uint32_t, std::unique_ptr<TypeErasedStorage>> storages_;
-    std::vector<Entity> typed_components_;
-    std::vector<TypeErasedStorage*> typed_storages_;
-    std::vector<std::unique_ptr<GroupRecord>> groups_;
-    std::unordered_map<std::uint32_t, GroupRecord*> owned_component_groups_;
-    std::vector<JobRecord> jobs_;
-    std::unordered_map<std::uint64_t, std::size_t> job_index_by_entity_;
-    JobThreadExecutor job_thread_executor_;
-    mutable JobSchedule cached_job_schedule_;
-    mutable bool job_schedule_cache_valid_ = false;
-    mutable JobGraph cached_job_graph_;
-    mutable bool job_graph_cache_valid_ = false;
-    mutable std::vector<std::size_t> ordered_job_indices_cache_;
-    mutable bool ordered_job_indices_cache_valid_ = false;
-    std::uint64_t next_job_sequence_ = 0;
+    struct EntityStore {
+        std::vector<std::uint64_t> slots;
+        std::uint32_t free_head = invalid_index;
+    };
+
+    struct ComponentCatalog {
+        std::unordered_map<std::uint32_t, ComponentRecord> records;
+        std::unordered_map<std::string, std::uint32_t> names;
+        std::vector<Entity> typed_components;
+        Entity singleton_entity;
+        Entity primitive_types[7]{};
+        Entity system_tag;
+    };
+
+    struct StorageRegistry {
+        std::unordered_map<std::uint32_t, std::unique_ptr<TypeErasedStorage>> storages;
+        std::vector<TypeErasedStorage*> typed_storages;
+        std::uint64_t view_topology_token = 1;
+    };
+
+    struct GroupIndex {
+        std::vector<std::unique_ptr<GroupRecord>> groups;
+        std::unordered_map<std::uint32_t, GroupRecord*> owned_component_groups;
+    };
+
+    struct JobRegistry {
+        std::vector<JobRecord> jobs;
+        std::unordered_map<std::uint64_t, std::size_t> index_by_entity;
+        JobThreadExecutor thread_executor;
+        mutable JobSchedule cached_schedule;
+        mutable bool schedule_cache_valid = false;
+        mutable JobGraph cached_graph;
+        mutable bool graph_cache_valid = false;
+        mutable std::vector<std::size_t> ordered_indices_cache;
+        mutable bool ordered_indices_cache_valid = false;
+        std::uint64_t next_sequence = 0;
+    };
+
+    EntityStore entity_store_;
+    ComponentCatalog component_catalog_;
+    StorageRegistry storage_registry_;
+    GroupIndex group_index_;
+    JobRegistry job_registry_;
     std::uint64_t state_token_ = next_state_token();
-    std::uint64_t view_topology_token_ = 1;
-    Entity singleton_entity_;
-    Entity primitive_types_[7]{};
-    Entity system_tag_;
 };
 
 class Registry::Snapshot {
@@ -2891,9 +2184,32 @@ public:
 
     void write(std::ostream& out, const SnapshotIoOptions& options = {}) const;
     static Snapshot read(std::istream& in);
+    void write_native(std::ostream& out, const SnapshotIoOptions& options = {}) const;
+    static Snapshot read_native(std::istream& in);
 
 private:
     friend class Registry;
+    friend class PersistentSnapshotAccess;
+    friend void write_persistent_snapshot(
+        std::ostream& out,
+        const Registry::Snapshot& snapshot,
+        const SnapshotPersistenceCodecs& codecs,
+        const SnapshotIoOptions& options);
+    friend Registry::Snapshot read_persistent_snapshot(
+        std::istream& in,
+        const Registry& schema,
+        const SnapshotPersistenceCodecs& codecs);
+    friend void write_persistent_delta_snapshot(
+        std::ostream& out,
+        const Registry::DeltaSnapshot& snapshot,
+        const Registry::Snapshot& baseline,
+        const SnapshotPersistenceCodecs& codecs,
+        const SnapshotIoOptions& options);
+    friend Registry::DeltaSnapshot read_persistent_delta_snapshot(
+        std::istream& in,
+        const Registry& schema,
+        const Registry::Snapshot& baseline,
+        const SnapshotPersistenceCodecs& codecs);
 
     std::vector<std::uint64_t> entities_;
     std::uint32_t free_head_ = invalid_index;
@@ -2919,9 +2235,23 @@ public:
 
     void write(std::ostream& out, const SnapshotIoOptions& options = {}) const;
     static DeltaSnapshot read(std::istream& in);
+    void write_native(std::ostream& out, const SnapshotIoOptions& options = {}) const;
+    static DeltaSnapshot read_native(std::istream& in);
 
 private:
     friend class Registry;
+    friend class PersistentSnapshotAccess;
+    friend void write_persistent_delta_snapshot(
+        std::ostream& out,
+        const Registry::DeltaSnapshot& snapshot,
+        const Registry::Snapshot& baseline,
+        const SnapshotPersistenceCodecs& codecs,
+        const SnapshotIoOptions& options);
+    friend Registry::DeltaSnapshot read_persistent_delta_snapshot(
+        std::istream& in,
+        const Registry& schema,
+        const Registry::Snapshot& baseline,
+        const SnapshotPersistenceCodecs& codecs);
 
     std::vector<std::uint64_t> entities_;
     std::uint32_t free_head_ = invalid_index;
@@ -2932,671 +2262,131 @@ private:
     std::uint64_t state_token_ = 0;
 };
 
-namespace detail {
+class SnapshotPersistenceCodecs {
+public:
+    template <typename T, typename Traits = SnapshotComponentTraits<T>>
+    Entity register_component(Registry& registry, std::string name = {}) {
+        using Quantized = typename Traits::Quantized;
+        static_assert(
+            std::is_trivially_copyable<Quantized>::value,
+            "persistent snapshot quantized state must be trivially copyable");
+        static_assert(
+            std::is_copy_constructible<T>::value,
+            "persistent snapshot components must be copy constructible when decoded");
 
-inline void write_exact(std::ostream& out, const void* data, std::size_t size) {
-    out.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
-    if (!out) {
-        throw std::runtime_error("ecs snapshot write failed");
-    }
-}
-
-inline void read_exact(std::istream& in, void* data, std::size_t size) {
-    in.read(static_cast<char*>(data), static_cast<std::streamsize>(size));
-    if (!in) {
-        throw std::runtime_error("ecs snapshot read failed");
-    }
-}
-
-template <typename T>
-inline void write_pod(std::ostream& out, T value) {
-    static_assert(std::is_trivially_copyable<T>::value, "snapshot POD I/O requires trivially copyable values");
-    write_exact(out, &value, sizeof(T));
-}
-
-template <typename T>
-inline T read_pod(std::istream& in) {
-    static_assert(std::is_trivially_copyable<T>::value, "snapshot POD I/O requires trivially copyable values");
-    T value{};
-    read_exact(in, &value, sizeof(T));
-    return value;
-}
-
-inline void write_string(std::ostream& out, const std::string& value) {
-    write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(value.size()));
-    if (!value.empty()) {
-        write_exact(out, value.data(), value.size());
-    }
-}
-
-inline std::string read_string(std::istream& in) {
-    const auto size = read_pod<std::uint64_t>(in);
-    if (size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-        throw std::runtime_error("ecs snapshot string is too large");
-    }
-    std::string value(static_cast<std::size_t>(size), '\0');
-    if (!value.empty()) {
-        read_exact(in, &value[0], value.size());
-    }
-    return value;
-}
-
-}  // namespace detail
-
-inline bool snapshot_component_selected(ecs::Entity component, const SnapshotIoOptions& options) {
-    const bool included = options.include_components.empty() ||
-        std::find(options.include_components.begin(), options.include_components.end(), component) !=
-            options.include_components.end();
-    if (!included) {
-        return false;
-    }
-    return std::find(options.exclude_components.begin(), options.exclude_components.end(), component) ==
-        options.exclude_components.end();
-}
-
-inline void write_component_record(std::ostream& out, const Registry::ComponentRecord& record) {
-    detail::write_pod<std::uint64_t>(out, record.entity.value);
-    detail::write_string(out, record.name);
-    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(record.info.size));
-    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(record.info.alignment));
-    detail::write_pod<std::uint8_t>(out, record.info.trivially_copyable ? 1U : 0U);
-    detail::write_pod<std::uint8_t>(out, record.info.tag ? 1U : 0U);
-    detail::write_pod<std::uint8_t>(out, record.singleton ? 1U : 0U);
-    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(record.type_id));
-    detail::write_pod<std::uint32_t>(out, static_cast<std::uint32_t>(record.primitive));
-    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(record.fields.size()));
-    for (const ComponentField& field : record.fields) {
-        detail::write_string(out, field.name);
-        detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(field.offset));
-        detail::write_pod<std::uint64_t>(out, field.type.value);
-        detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(field.count));
-    }
-}
-
-inline Registry::ComponentRecord read_component_record(std::istream& in) {
-    Registry::ComponentRecord record;
-    record.entity = Entity{detail::read_pod<std::uint64_t>(in)};
-    record.name = detail::read_string(in);
-    const auto size = detail::read_pod<std::uint64_t>(in);
-    const auto alignment = detail::read_pod<std::uint64_t>(in);
-    record.info.size = static_cast<std::size_t>(size);
-    record.info.alignment = static_cast<std::size_t>(alignment);
-    record.info.trivially_copyable = detail::read_pod<std::uint8_t>(in) != 0U;
-    record.info.tag = detail::read_pod<std::uint8_t>(in) != 0U;
-    record.singleton = detail::read_pod<std::uint8_t>(in) != 0U;
-    const auto type_id = detail::read_pod<std::uint64_t>(in);
-    record.type_id = type_id > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())
-        ? Registry::npos_type_id
-        : static_cast<std::size_t>(type_id);
-    record.primitive = static_cast<Registry::PrimitiveKind>(detail::read_pod<std::uint32_t>(in));
-    record.lifecycle.trivially_copyable = record.info.trivially_copyable;
-    const auto field_count = detail::read_pod<std::uint64_t>(in);
-    record.fields.reserve(static_cast<std::size_t>(field_count));
-    for (std::uint64_t index = 0; index < field_count; ++index) {
-        ComponentField field;
-        field.name = detail::read_string(in);
-        field.offset = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
-        field.type = Entity{detail::read_pod<std::uint64_t>(in)};
-        field.count = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
-        record.fields.push_back(std::move(field));
-    }
-    return record;
-}
-
-inline void write_storage(std::ostream& out, const Registry::TypeErasedStorage& storage) {
-    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(storage.dense_size()));
-    for (std::size_t dense = 0; dense < storage.dense_size(); ++dense) {
-        detail::write_pod<std::uint32_t>(out, storage.dense_index_at(dense));
-        detail::write_pod<std::uint8_t>(out, storage.dirty_[dense]);
-        if (!storage.info_.tag) {
-            detail::write_exact(out, storage.get_dense(dense), storage.info_.size);
+        const Entity component = registry.register_component<T>(std::move(name));
+        const auto* record_info = registry.component_info(component);
+        if (record_info == nullptr || record_info->tag) {
+            throw std::logic_error("persistent snapshot codecs cannot be registered for tags");
         }
-    }
-    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(storage.tombstone_entry_count()));
-    for (std::size_t position = 0; position < storage.tombstone_entry_count(); ++position) {
-        detail::write_pod<std::uint32_t>(out, storage.tombstone_index_at(position));
-        detail::write_pod<unsigned char>(out, storage.tombstone_flags_at(position));
-    }
-}
+        const auto found_record = registry.component_catalog_.records.find(Registry::entity_index(component));
+        if (found_record == registry.component_catalog_.records.end() || found_record->second.name.empty()) {
+            throw std::logic_error("persistent snapshot codecs require a non-empty component name");
+        }
 
-inline std::unique_ptr<Registry::TypeErasedStorage> read_storage(
-    std::istream& in,
-    const Registry::ComponentRecord& record) {
-    auto storage = std::make_unique<Registry::TypeErasedStorage>(record);
-    const auto dense_count = detail::read_pod<std::uint64_t>(in);
-    for (std::uint64_t dense = 0; dense < dense_count; ++dense) {
-        const auto entity_index = detail::read_pod<std::uint32_t>(in);
-        const auto dirty = detail::read_pod<std::uint8_t>(in);
-        if (record.info.tag) {
-            storage->emplace_or_replace_tag(entity_index);
-        } else {
-            std::vector<unsigned char> bytes(record.info.size);
-            if (!bytes.empty()) {
-                detail::read_exact(in, bytes.data(), bytes.size());
+        Codec codec;
+        codec.component = component;
+        codec.component_size = sizeof(T);
+        codec.quantized_size = sizeof(Quantized);
+        codec.quantize = [](const void* value) {
+            const Quantized quantized = Traits::quantize(*static_cast<const T*>(value));
+            return copy_to_bytes(quantized);
+        };
+        codec.serialize = [](const std::vector<unsigned char>* baseline, const std::vector<unsigned char>& current, BitBuffer& out) {
+            const Quantized* previous = baseline == nullptr ? nullptr : bytes_as<Quantized>(*baseline);
+            Traits::serialize(previous, *bytes_as<Quantized>(current), out);
+        };
+        codec.deserialize = [](BitBuffer& in, const std::vector<unsigned char>* baseline, std::vector<unsigned char>& out) {
+            const Quantized* previous = baseline == nullptr ? nullptr : bytes_as<Quantized>(*baseline);
+            Quantized quantized{};
+            if (!Traits::deserialize(in, previous, quantized)) {
+                return false;
             }
-            storage->emplace_or_replace_bytes(entity_index, bytes.empty() ? nullptr : bytes.data());
-        }
-        if (dirty == 0U) {
-            storage->clear_dirty(entity_index);
-        }
-    }
-    const auto tombstone_count = detail::read_pod<std::uint64_t>(in);
-    for (std::uint64_t position = 0; position < tombstone_count; ++position) {
-        const auto entity_index = detail::read_pod<std::uint32_t>(in);
-        const auto flags = detail::read_pod<unsigned char>(in);
-        storage->mark_tombstone(entity_index, flags);
-    }
-    storage->rebuild_lookup();
-    return storage;
-}
-
-inline void validate_serializable_component(const Registry::ComponentRecord& record) {
-    if (!record.info.tag && !record.info.trivially_copyable) {
-        throw std::logic_error("ecs snapshot selected component is not disk serializable");
-    }
-}
-
-inline void write_snapshot_common(
-    std::ostream& out,
-    std::uint32_t kind,
-    const std::vector<std::uint64_t>& entities,
-    std::uint32_t free_head,
-    const std::unordered_map<std::uint32_t, Registry::ComponentRecord>& components,
-    const std::unordered_map<std::uint32_t, std::unique_ptr<Registry::TypeErasedStorage>>& storages,
-    const std::vector<Entity>& typed_components,
-    const std::vector<std::unique_ptr<Registry::GroupRecord>>* groups,
-    Entity singleton_entity,
-    const Entity* primitive_types,
-    Entity system_tag,
-    bool has_entities,
-    std::uint64_t baseline_token,
-    std::uint64_t state_token,
-    const SnapshotIoOptions& options) {
-    constexpr std::uint32_t magic = 0x53534345U;  // ECSS
-    constexpr std::uint32_t version = 1U;
-    detail::write_pod<std::uint32_t>(out, magic);
-    detail::write_pod<std::uint32_t>(out, version);
-    detail::write_pod<std::uint32_t>(out, kind);
-    detail::write_pod<std::uint8_t>(out, has_entities ? 1U : 0U);
-    detail::write_pod<std::uint64_t>(out, baseline_token);
-    detail::write_pod<std::uint64_t>(out, state_token);
-    detail::write_pod<std::uint32_t>(out, free_head);
-    detail::write_pod<std::uint64_t>(out, singleton_entity.value);
-    detail::write_pod<std::uint64_t>(out, system_tag.value);
-    for (std::size_t index = 0; index < 7U; ++index) {
-        detail::write_pod<std::uint64_t>(out, primitive_types[index].value);
-    }
-
-    auto selected = [&](Entity component) {
-        if (component == system_tag) {
+            out = copy_to_bytes(quantized);
             return true;
-        }
-        for (std::size_t index = 0; index < 7U; ++index) {
-            if (component == primitive_types[index]) {
-                return true;
-            }
-        }
-        return snapshot_component_selected(component, options);
+        };
+        codec.emplace = [](Registry::TypeErasedStorage& storage, std::uint32_t index, const std::vector<unsigned char>& quantized) {
+            const T value = Traits::dequantize(*bytes_as<Quantized>(quantized));
+            storage.emplace_or_replace_copy(index, &value);
+        };
+
+        codecs_[found_record->second.name] = std::move(codec);
+        return component;
+    }
+
+private:
+    friend class PersistentSnapshotAccess;
+    friend void write_persistent_snapshot(
+        std::ostream& out,
+        const Registry::Snapshot& snapshot,
+        const SnapshotPersistenceCodecs& codecs,
+        const SnapshotIoOptions& options);
+    friend Registry::Snapshot read_persistent_snapshot(
+        std::istream& in,
+        const Registry& schema,
+        const SnapshotPersistenceCodecs& codecs);
+    friend void write_persistent_delta_snapshot(
+        std::ostream& out,
+        const Registry::DeltaSnapshot& snapshot,
+        const Registry::Snapshot& baseline,
+        const SnapshotPersistenceCodecs& codecs,
+        const SnapshotIoOptions& options);
+    friend Registry::DeltaSnapshot read_persistent_delta_snapshot(
+        std::istream& in,
+        const Registry& schema,
+        const Registry::Snapshot& baseline,
+        const SnapshotPersistenceCodecs& codecs);
+
+    struct Codec {
+        Entity component;
+        std::size_t component_size = 0;
+        std::size_t quantized_size = 0;
+        std::function<std::vector<unsigned char>(const void*)> quantize;
+        std::function<void(const std::vector<unsigned char>*, const std::vector<unsigned char>&, BitBuffer&)> serialize;
+        std::function<bool(BitBuffer&, const std::vector<unsigned char>*, std::vector<unsigned char>&)> deserialize;
+        std::function<void(Registry::TypeErasedStorage&, std::uint32_t, const std::vector<unsigned char>&)> emplace;
     };
 
-    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(entities.size()));
-    for (std::uint64_t slot : entities) {
-        detail::write_pod<std::uint64_t>(out, slot);
-    }
-
-    std::vector<std::uint32_t> component_indices;
-    component_indices.reserve(components.size());
-    for (const auto& component : components) {
-        if (selected(component.second.entity)) {
-            validate_serializable_component(component.second);
-            component_indices.push_back(component.first);
+    template <typename T>
+    static std::vector<unsigned char> copy_to_bytes(const T& value) {
+        std::vector<unsigned char> bytes(sizeof(T));
+        if (!bytes.empty()) {
+            std::memcpy(bytes.data(), &value, sizeof(T));
         }
-    }
-    std::sort(component_indices.begin(), component_indices.end());
-    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(component_indices.size()));
-    for (std::uint32_t index : component_indices) {
-        detail::write_pod<std::uint32_t>(out, index);
-        write_component_record(out, components.at(index));
+        return bytes;
     }
 
-    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(typed_components.size()));
-    for (Entity component : typed_components) {
-        detail::write_pod<std::uint64_t>(
-            out,
-            selected(component) ? component.value : std::uint64_t{0});
-    }
-
-    if (groups == nullptr) {
-        detail::write_pod<std::uint64_t>(out, 0U);
-    } else {
-        detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(groups->size()));
-        for (const auto& group : *groups) {
-            detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(group->owned.size()));
-            for (std::uint32_t owned : group->owned) {
-                detail::write_pod<std::uint32_t>(out, owned);
-            }
-            detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(group->size));
+    template <typename T>
+    static const T* bytes_as(const std::vector<unsigned char>& bytes) {
+        if (bytes.size() != sizeof(T)) {
+            throw std::runtime_error("persistent snapshot quantized payload has invalid size");
         }
+        return reinterpret_cast<const T*>(bytes.data());
     }
 
-    std::vector<std::uint32_t> storage_indices;
-    storage_indices.reserve(storages.size());
-    for (const auto& storage : storages) {
-        const auto found_component = components.find(storage.first);
-        if (found_component == components.end() ||
-            !selected(found_component->second.entity)) {
-            continue;
-        }
-        validate_serializable_component(found_component->second);
-        storage_indices.push_back(storage.first);
-    }
-    std::sort(storage_indices.begin(), storage_indices.end());
-    detail::write_pod<std::uint64_t>(out, static_cast<std::uint64_t>(storage_indices.size()));
-    for (std::uint32_t index : storage_indices) {
-        detail::write_pod<std::uint32_t>(out, index);
-        write_storage(out, *storages.at(index));
-    }
-}
+    std::unordered_map<std::string, Codec> codecs_;
+};
 
-inline void read_snapshot_header(
+void write_persistent_snapshot(
+    std::ostream& out,
+    const Registry::Snapshot& snapshot,
+    const SnapshotPersistenceCodecs& codecs,
+    const SnapshotIoOptions& options = {});
+Registry::Snapshot read_persistent_snapshot(
     std::istream& in,
-    std::uint32_t expected_kind,
-    bool& has_entities,
-    std::uint64_t& baseline_token,
-    std::uint64_t& state_token,
-    std::uint32_t& free_head,
-    Entity& singleton_entity,
-    Entity* primitive_types,
-    Entity& system_tag,
-    std::vector<std::uint64_t>& entities,
-    std::unordered_map<std::uint32_t, Registry::ComponentRecord>& components,
-    std::vector<Entity>& typed_components,
-    std::vector<std::unique_ptr<Registry::GroupRecord>>& groups,
-    std::unordered_map<std::uint32_t, std::unique_ptr<Registry::TypeErasedStorage>>& storages) {
-    constexpr std::uint32_t magic = 0x53534345U;
-    constexpr std::uint32_t version = 1U;
-    if (detail::read_pod<std::uint32_t>(in) != magic ||
-        detail::read_pod<std::uint32_t>(in) != version ||
-        detail::read_pod<std::uint32_t>(in) != expected_kind) {
-        throw std::runtime_error("ecs snapshot header is invalid");
-    }
-    has_entities = detail::read_pod<std::uint8_t>(in) != 0U;
-    baseline_token = detail::read_pod<std::uint64_t>(in);
-    state_token = detail::read_pod<std::uint64_t>(in);
-    free_head = detail::read_pod<std::uint32_t>(in);
-    singleton_entity = Entity{detail::read_pod<std::uint64_t>(in)};
-    system_tag = Entity{detail::read_pod<std::uint64_t>(in)};
-    for (std::size_t index = 0; index < 7U; ++index) {
-        primitive_types[index] = Entity{detail::read_pod<std::uint64_t>(in)};
-    }
-
-    const auto entity_count = detail::read_pod<std::uint64_t>(in);
-    entities.resize(static_cast<std::size_t>(entity_count));
-    for (std::uint64_t& slot : entities) {
-        slot = detail::read_pod<std::uint64_t>(in);
-    }
-
-    const auto component_count = detail::read_pod<std::uint64_t>(in);
-    for (std::uint64_t offset = 0; offset < component_count; ++offset) {
-        const auto index = detail::read_pod<std::uint32_t>(in);
-        Registry::ComponentRecord record = read_component_record(in);
-        components[index] = std::move(record);
-    }
-
-    const auto typed_count = detail::read_pod<std::uint64_t>(in);
-    typed_components.resize(static_cast<std::size_t>(typed_count));
-    for (Entity& component : typed_components) {
-        component = Entity{detail::read_pod<std::uint64_t>(in)};
-    }
-
-    const auto group_count = detail::read_pod<std::uint64_t>(in);
-    groups.reserve(static_cast<std::size_t>(group_count));
-    for (std::uint64_t group_index = 0; group_index < group_count; ++group_index) {
-        auto group = std::make_unique<Registry::GroupRecord>();
-        const auto owned_count = detail::read_pod<std::uint64_t>(in);
-        group->owned.reserve(static_cast<std::size_t>(owned_count));
-        for (std::uint64_t owned_index = 0; owned_index < owned_count; ++owned_index) {
-            group->owned.push_back(detail::read_pod<std::uint32_t>(in));
-        }
-        group->size = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
-        groups.push_back(std::move(group));
-    }
-
-    const auto storage_count = detail::read_pod<std::uint64_t>(in);
-    for (std::uint64_t offset = 0; offset < storage_count; ++offset) {
-        const auto index = detail::read_pod<std::uint32_t>(in);
-        const auto found = components.find(index);
-        if (found == components.end()) {
-            throw std::runtime_error("ecs snapshot storage references missing component metadata");
-        }
-        storages[index] = read_storage(in, found->second);
-    }
-}
-
-inline void Registry::Snapshot::write(std::ostream& out, const SnapshotIoOptions& options) const {
-    write_snapshot_common(
-        out,
-        1U,
-        entities_,
-        free_head_,
-        components_,
-        storages_,
-        typed_components_,
-        &groups_,
-        singleton_entity_,
-        primitive_types_,
-        system_tag_,
-        true,
-        0U,
-        state_token_,
-        options);
-}
-
-inline Registry::Snapshot Registry::Snapshot::read(std::istream& in) {
-    Snapshot snapshot;
-    bool has_entities = false;
-    std::uint64_t baseline_token = 0;
-    read_snapshot_header(
-        in,
-        1U,
-        has_entities,
-        baseline_token,
-        snapshot.state_token_,
-        snapshot.free_head_,
-        snapshot.singleton_entity_,
-        snapshot.primitive_types_,
-        snapshot.system_tag_,
-        snapshot.entities_,
-        snapshot.components_,
-        snapshot.typed_components_,
-        snapshot.groups_,
-        snapshot.storages_);
-    if (!has_entities || baseline_token != 0U) {
-        throw std::runtime_error("ecs full snapshot payload is invalid");
-    }
-    for (const auto& component : snapshot.components_) {
-        if (!component.second.name.empty()) {
-            snapshot.component_names_[component.second.name] = component.first;
-        }
-    }
-    return snapshot;
-}
-
-inline void Registry::DeltaSnapshot::write(std::ostream& out, const SnapshotIoOptions& options) const {
-    std::vector<Entity> empty_typed_components;
-    std::array<Entity, 7> empty_primitives{};
-    write_snapshot_common(
-        out,
-        2U,
-        entities_,
-        free_head_,
-        components_,
-        storages_,
-        empty_typed_components,
-        nullptr,
-        Entity{},
-        empty_primitives.data(),
-        Entity{},
-        has_entities_,
-        baseline_token_,
-        state_token_,
-        options);
-}
-
-inline Registry::DeltaSnapshot Registry::DeltaSnapshot::read(std::istream& in) {
-    DeltaSnapshot snapshot;
-    Entity singleton_entity;
-    Entity system_tag;
-    std::array<Entity, 7> primitive_types{};
-    std::vector<Entity> typed_components;
-    std::vector<std::unique_ptr<Registry::GroupRecord>> groups;
-    read_snapshot_header(
-        in,
-        2U,
-        snapshot.has_entities_,
-        snapshot.baseline_token_,
-        snapshot.state_token_,
-        snapshot.free_head_,
-        singleton_entity,
-        primitive_types.data(),
-        system_tag,
-        snapshot.entities_,
-        snapshot.components_,
-        typed_components,
-        groups,
-        snapshot.storages_);
-    return snapshot;
-}
-
-inline Registry::Snapshot Registry::snapshot() const {
-    require_runtime_registry_access_allowed("snapshot");
-    Snapshot result;
-    const std::vector<bool> excluded = make_snapshot_exclusion_mask();
-    result.entities_ = make_snapshot_entities(excluded);
-    result.free_head_ = rebuild_free_list(result.entities_);
-    result.components_ = components_;
-    result.component_names_ = component_names_;
-    result.typed_components_ = typed_components_;
-    result.singleton_entity_ = singleton_entity_;
-    result.system_tag_ = system_tag_;
-    result.state_token_ = state_token_;
-    std::copy(std::begin(primitive_types_), std::end(primitive_types_), std::begin(result.primitive_types_));
-
-    result.storages_.reserve(storages_.size());
-    for (const auto& storage : storages_) {
-        if (system_tag_ && storage.first == entity_index(system_tag_)) {
-            continue;
-        }
-        result.storages_.emplace(storage.first, storage.second->clone_excluding(excluded));
-    }
-
-    result.groups_.reserve(groups_.size());
-    for (const auto& group : groups_) {
-        result.groups_.push_back(std::make_unique<GroupRecord>(*group));
-    }
-
-    return result;
-}
-
-inline Registry::DeltaSnapshot Registry::delta_snapshot(const Snapshot& baseline) const {
-    require_runtime_registry_access_allowed("delta_snapshot");
-    DeltaSnapshot result;
-    const std::vector<bool> excluded = make_snapshot_exclusion_mask();
-    if ((excluded.empty() && entities_ == baseline.entities_) ||
-        (!excluded.empty() && make_snapshot_entities(excluded) == baseline.entities_)) {
-        result.has_entities_ = false;
-        result.free_head_ = baseline.free_head_;
-    } else {
-        result.entities_ = make_snapshot_entities(excluded);
-        result.free_head_ = rebuild_free_list(result.entities_);
-    }
-    result.baseline_token_ = baseline.state_token_;
-    result.state_token_ = next_state_token();
-
-    for (const auto& storage : storages_) {
-        if (system_tag_ && storage.first == entity_index(system_tag_)) {
-            continue;
-        }
-        if (!storage.second->has_dirty_entries()) {
-            continue;
-        }
-        auto found_component = components_.find(storage.first);
-        if (found_component == components_.end()) {
-            continue;
-        }
-        auto dirty = storage.second->clone_dirty_excluding(excluded);
-        if (!dirty->has_dirty_entries()) {
-            continue;
-        }
-        result.components_.emplace(found_component->first, found_component->second);
-        result.storages_.emplace(storage.first, std::move(dirty));
-    }
-
-    return result;
-}
-
-inline Registry::DeltaSnapshot Registry::delta_snapshot(const DeltaSnapshot& baseline) const {
-    require_runtime_registry_access_allowed("delta_snapshot");
-    DeltaSnapshot result;
-    const std::vector<bool> excluded = make_snapshot_exclusion_mask();
-    if (baseline.has_entities_ &&
-        ((excluded.empty() && entities_ == baseline.entities_) ||
-         (!excluded.empty() && make_snapshot_entities(excluded) == baseline.entities_))) {
-        result.has_entities_ = false;
-        result.free_head_ = baseline.free_head_;
-    } else {
-        result.entities_ = make_snapshot_entities(excluded);
-        result.free_head_ = rebuild_free_list(result.entities_);
-    }
-    result.baseline_token_ = baseline.state_token_;
-    result.state_token_ = next_state_token();
-
-    for (const auto& storage : storages_) {
-        if (system_tag_ && storage.first == entity_index(system_tag_)) {
-            continue;
-        }
-        if (!storage.second->has_dirty_entries()) {
-            continue;
-        }
-        auto found_component = components_.find(storage.first);
-        if (found_component == components_.end()) {
-            continue;
-        }
-        auto dirty = storage.second->clone_dirty_excluding(excluded);
-        if (!dirty->has_dirty_entries()) {
-            continue;
-        }
-        result.components_.emplace(found_component->first, found_component->second);
-        result.storages_.emplace(storage.first, std::move(dirty));
-    }
-
-    return result;
-}
-
-inline void Registry::restore(const Snapshot& snapshot) {
-    require_runtime_registry_access_allowed("restore");
-    std::unordered_map<std::uint32_t, std::unique_ptr<TypeErasedStorage>> storages;
-    storages.reserve(snapshot.storages_.size());
-    for (const auto& storage : snapshot.storages_) {
-        storages.emplace(storage.first, storage.second->clone_for_restore());
-    }
-
-    std::vector<std::unique_ptr<GroupRecord>> groups;
-    groups.reserve(snapshot.groups_.size());
-    for (const auto& group : snapshot.groups_) {
-        groups.push_back(std::make_unique<GroupRecord>(*group));
-    }
-
-    std::vector<std::uint64_t> entities = snapshot.entities_;
-    merge_current_system_entities(entities);
-    const std::uint32_t free_head = rebuild_free_list(entities);
-
-    entities_ = std::move(entities);
-    free_head_ = free_head;
-    components_ = snapshot.components_;
-    component_names_ = snapshot.component_names_;
-    storages_ = std::move(storages);
-    typed_components_ = snapshot.typed_components_;
-    rebuild_typed_storages();
-    groups_ = std::move(groups);
-    rebuild_group_ownership();
-    singleton_entity_ = snapshot.singleton_entity_;
-    system_tag_ = snapshot.system_tag_;
-    state_token_ = snapshot.state_token_;
-    bump_view_topology_token();
-    std::copy(std::begin(snapshot.primitive_types_), std::end(snapshot.primitive_types_), std::begin(primitive_types_));
-    restore_internal_bookkeeping_tags();
-}
-
-inline void Registry::restore(const DeltaSnapshot& snapshot) {
-    require_runtime_registry_access_allowed("restore");
-    if (state_token_ != snapshot.baseline_token_) {
-        throw std::logic_error("ecs delta snapshot baseline does not match registry state");
-    }
-
-    for (const auto& component : snapshot.components_) {
-        const auto found = components_.find(component.first);
-        if (found == components_.end()) {
-            throw std::logic_error("ecs delta snapshot component is not registered");
-        }
-
-        const ComponentRecord& current = found->second;
-        const ComponentRecord& captured = component.second;
-        if (current.entity != captured.entity ||
-            current.info.size != captured.info.size ||
-            current.info.alignment != captured.info.alignment ||
-            current.info.trivially_copyable != captured.info.trivially_copyable ||
-            current.info.tag != captured.info.tag ||
-            current.singleton != captured.singleton) {
-            throw std::logic_error("ecs delta snapshot component metadata does not match registry");
-        }
-    }
-
-    if (snapshot.has_entities_) {
-        std::vector<std::uint64_t> entities = snapshot.entities_;
-        merge_current_system_entities(entities);
-        entities_ = std::move(entities);
-        free_head_ = rebuild_free_list(entities_);
-    }
-
-    std::vector<std::uint32_t> destroyed_indices;
-    for (const auto& storage : snapshot.storages_) {
-        const TypeErasedStorage& delta_storage = *storage.second;
-        for (std::size_t tombstone = 0; tombstone < delta_storage.tombstone_entry_count(); ++tombstone) {
-            const std::uint32_t entity_index = delta_storage.tombstone_index_at(tombstone);
-            if (delta_storage.has_destroy_tombstone_at_position(tombstone) &&
-                std::find(destroyed_indices.begin(), destroyed_indices.end(), entity_index) == destroyed_indices.end()) {
-                destroyed_indices.push_back(entity_index);
-            }
-        }
-    }
-
-    for (std::uint32_t index : destroyed_indices) {
-        for (auto& storage : storages_) {
-            if (storage.second->contains_index(index)) {
-                remove_from_groups_before_component_removal(index, storage.first);
-                storage.second->remove_index(index);
-            }
-        }
-    }
-
-    for (const auto& storage : snapshot.storages_) {
-        const std::uint32_t component_index = storage.first;
-        const auto found_component = components_.find(component_index);
-        if (found_component == components_.end()) {
-            throw std::logic_error("ecs delta snapshot component is not registered");
-        }
-        const Entity component = found_component->second.entity;
-        const TypeErasedStorage& delta_storage = *storage.second;
-        TypeErasedStorage* target_storage = find_storage(component);
-
-        for (std::size_t tombstone = 0; tombstone < delta_storage.tombstone_entry_count(); ++tombstone) {
-            const std::uint32_t entity_index = delta_storage.tombstone_index_at(tombstone);
-            if (!delta_storage.has_dirty_tombstone_at_position(tombstone) ||
-                delta_storage.has_destroy_tombstone_at_position(tombstone)) {
-                continue;
-            }
-            if (target_storage == nullptr || !target_storage->contains_index(entity_index)) {
-                throw std::logic_error("ecs delta snapshot component removal does not match registry state");
-            }
-            remove_from_groups_before_component_removal(entity_index, component_index);
-            target_storage->remove_index(entity_index);
-        }
-
-        for (std::size_t dense = 0; dense < delta_storage.dense_size(); ++dense) {
-            const std::uint32_t entity_index = delta_storage.dense_index_at(dense);
-            if (entity_index >= entities_.size() || slot_index(entities_[entity_index]) != entity_index) {
-                throw std::logic_error("ecs delta snapshot entity is not alive");
-            }
-            storage_for(component).emplace_or_replace_copy(entity_index, delta_storage.get_dense(dense));
-            refresh_group_after_add(entity_index, component_index);
-        }
-    }
-
-    state_token_ = snapshot.state_token_;
-    bump_view_topology_token();
-    restore_internal_bookkeeping_tags();
-}
+    const Registry& schema,
+    const SnapshotPersistenceCodecs& codecs);
+void write_persistent_delta_snapshot(
+    std::ostream& out,
+    const Registry::DeltaSnapshot& snapshot,
+    const Registry::Snapshot& baseline,
+    const SnapshotPersistenceCodecs& codecs,
+    const SnapshotIoOptions& options = {});
+Registry::DeltaSnapshot read_persistent_delta_snapshot(
+    std::istream& in,
+    const Registry& schema,
+    const Registry::Snapshot& baseline,
+    const SnapshotPersistenceCodecs& codecs);
 
 template <typename... Components>
 class Registry::View {
@@ -3608,7 +2398,7 @@ public:
         : registry_(&registry),
           storages_{{resolve_storage<Components>(registry)...}},
           group_(registry.best_group_for_view<Components...>()),
-          cache_token_(registry.view_topology_token_) {}
+          cache_token_(registry.storage_registry_.view_topology_token) {}
 
     template <typename Fn>
     void each(Fn&& fn) {
@@ -3617,7 +2407,7 @@ public:
         if (driver == nullptr) {
             if constexpr (!detail::contains_non_singleton_component<Components...>::value) {
                 Fn& callback = fn;
-                call_each(callback, Entity{}, entity_index(registry_->singleton_entity_));
+                call_each(callback, Entity{}, entity_index(registry_->component_catalog_.singleton_entity));
             }
             return;
         }
@@ -3630,7 +2420,7 @@ public:
                 continue;
             }
 
-            call_each(callback, Entity{registry_->entities_[index]}, index);
+            call_each(callback, Entity{registry_->entity_store_.slots[index]}, index);
         }
     }
 
@@ -3640,7 +2430,7 @@ public:
         TypeErasedStorage* driver = driver_storage();
         if (driver == nullptr) {
             if constexpr (!detail::contains_non_singleton_component<Components...>::value) {
-                indices.push_back(entity_index(registry_->singleton_entity_));
+                indices.push_back(entity_index(registry_->component_catalog_.singleton_entity));
             }
             return indices;
         }
@@ -3665,7 +2455,7 @@ public:
             if (!contains_all(index)) {
                 continue;
             }
-            call_each(callback, Entity{registry_->entities_[index]}, index);
+            call_each(callback, Entity{registry_->entity_store_.slots[index]}, index);
         }
     }
 
@@ -3726,30 +2516,7 @@ public:
                 storages_,
                 std::array<TypeErasedStorage*, 0>{},
                 std::array<TypeErasedStorage*, 0>{});
-        view.add_runtime_with_tags(tags, false);
-        return view;
-    }
-
-    TagFilteredView<
-        detail::type_list<Components...>,
-        detail::type_list<>,
-        detail::type_list<>,
-        detail::type_list<>,
-        detail::type_list<>>
-    with_mutable_tags(std::initializer_list<Entity> tags) const {
-        refresh_cache_if_needed();
-        TagFilteredView<
-            detail::type_list<Components...>,
-            detail::type_list<>,
-            detail::type_list<>,
-            detail::type_list<>,
-            detail::type_list<>>
-            view(
-                *registry_,
-                storages_,
-                std::array<TypeErasedStorage*, 0>{},
-                std::array<TypeErasedStorage*, 0>{});
-        view.add_runtime_with_tags(tags, true);
+        view.add_runtime_with_tags(tags);
         return view;
     }
 
@@ -3793,30 +2560,7 @@ public:
                 storages_,
                 std::array<TypeErasedStorage*, 0>{},
                 std::array<TypeErasedStorage*, 0>{});
-        view.add_runtime_without_tags(tags, false);
-        return view;
-    }
-
-    TagFilteredView<
-        detail::type_list<Components...>,
-        detail::type_list<>,
-        detail::type_list<>,
-        detail::type_list<>,
-        detail::type_list<>>
-    without_mutable_tags(std::initializer_list<Entity> tags) const {
-        refresh_cache_if_needed();
-        TagFilteredView<
-            detail::type_list<Components...>,
-            detail::type_list<>,
-            detail::type_list<>,
-            detail::type_list<>,
-            detail::type_list<>>
-            view(
-                *registry_,
-                storages_,
-                std::array<TypeErasedStorage*, 0>{},
-                std::array<TypeErasedStorage*, 0>{});
-        view.add_runtime_without_tags(tags, true);
+        view.add_runtime_without_tags(tags);
         return view;
     }
 
@@ -3870,7 +2614,7 @@ public:
         refresh_cache_if_needed();
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
-            index = entity_index(registry_->singleton_entity_);
+            index = entity_index(registry_->component_catalog_.singleton_entity);
         }
 
         const TypeErasedStorage* storage = storage_for_type<T>();
@@ -3890,7 +2634,7 @@ public:
         assert(storage != nullptr);
 
         return *static_cast<const detail::component_query_t<T>*>(
-            storage->get_unchecked(entity_index(registry_->singleton_entity_)));
+            storage->get_unchecked(entity_index(registry_->component_catalog_.singleton_entity)));
     }
 
     template <typename T, typename std::enable_if<
@@ -3901,7 +2645,7 @@ public:
         refresh_cache_if_needed();
         std::uint32_t index = entity_index(entity);
         if constexpr (detail::is_singleton_query<T>::value) {
-            index = entity_index(registry_->singleton_entity_);
+            index = entity_index(registry_->component_catalog_.singleton_entity);
         }
 
         TypeErasedStorage* storage = storage_for_type<T>();
@@ -3923,7 +2667,7 @@ public:
         assert(storage != nullptr);
 
         return *static_cast<detail::component_query_t<T>*>(
-            storage->write_unchecked(entity_index(registry_->singleton_entity_)));
+            storage->write_unchecked(entity_index(registry_->component_catalog_.singleton_entity)));
     }
 
 private:
@@ -3956,17 +2700,17 @@ private:
     }
 
     void refresh_cache_if_needed() const {
-        if (cache_token_ == registry_->view_topology_token_) {
+        if (cache_token_ == registry_->storage_registry_.view_topology_token) {
             return;
         }
         storages_ = {{resolve_storage<Components>(*registry_)...}};
         group_ = registry_->best_group_for_view<Components...>();
-        cache_token_ = registry_->view_topology_token_;
+        cache_token_ = registry_->storage_registry_.view_topology_token;
     }
 
     TypeErasedStorage* driver_storage() const {
         if (group_ != nullptr) {
-            return registry_->find_storage(Entity{registry_->entities_[group_->owned.front()]});
+            return registry_->find_storage(Entity{registry_->entity_store_.slots[group_->owned.front()]});
         }
 
         TypeErasedStorage* driver = nullptr;
@@ -4039,12 +2783,15 @@ private:
     component_ref_t<T> component_ref(std::uint32_t index) {
         TypeErasedStorage* storage = storage_for_type<T>();
         if constexpr (detail::is_singleton_query<T>::value) {
-            index = entity_index(registry_->singleton_entity_);
+            index = entity_index(registry_->component_catalog_.singleton_entity);
         }
         if constexpr (std::is_const<typename std::remove_reference<T>::type>::value) {
             return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(index));
         } else {
-            return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(index));
+            void* value = TypeErasedStorage::range_dirty_deferred()
+                ? storage->write_unchecked_without_dirty(index)
+                : storage->write_unchecked(index);
+            return *static_cast<detail::component_query_t<T>*>(value);
         }
     }
 
@@ -4083,7 +2830,7 @@ public:
           access_storages_{{resolve_storage<AccessComponents>(registry)...}},
           optional_storages_{{resolve_storage<OptionalComponents>(registry)...}},
           group_(registry.best_group_for_view<IterComponents...>()),
-          cache_token_(registry.view_topology_token_) {}
+          cache_token_(registry.storage_registry_.view_topology_token) {}
 
     template <typename Fn>
     void each(Fn&& fn) {
@@ -4092,7 +2839,7 @@ public:
         if (driver == nullptr) {
             if constexpr (!detail::contains_non_singleton_component<IterComponents...>::value) {
                 Fn& callback = fn;
-                call_each(callback, Entity{}, entity_index(registry_->singleton_entity_));
+                call_each(callback, Entity{}, entity_index(registry_->component_catalog_.singleton_entity));
             }
             return;
         }
@@ -4105,7 +2852,7 @@ public:
                 continue;
             }
 
-            call_each(callback, Entity{registry_->entities_[index]}, index);
+            call_each(callback, Entity{registry_->entity_store_.slots[index]}, index);
         }
     }
 
@@ -4115,7 +2862,7 @@ public:
         TypeErasedStorage* driver = driver_storage();
         if (driver == nullptr) {
             if constexpr (!detail::contains_non_singleton_component<IterComponents...>::value) {
-                indices.push_back(entity_index(registry_->singleton_entity_));
+                indices.push_back(entity_index(registry_->component_catalog_.singleton_entity));
             }
             return indices;
         }
@@ -4140,7 +2887,7 @@ public:
             if (!contains_all(index)) {
                 continue;
             }
-            call_each(callback, Entity{registry_->entities_[index]}, index);
+            call_each(callback, Entity{registry_->entity_store_.slots[index]}, index);
         }
     }
 
@@ -4210,26 +2957,7 @@ public:
             detail::type_list<>,
             detail::type_list<>>
             view(*registry_, iter_storages_, access_storages_, optional_storages_);
-        view.add_runtime_with_tags(tags, false);
-        return view;
-    }
-
-    TagFilteredView<
-        detail::type_list<IterComponents...>,
-        detail::type_list<AccessComponents...>,
-        detail::type_list<OptionalComponents...>,
-        detail::type_list<>,
-        detail::type_list<>>
-    with_mutable_tags(std::initializer_list<Entity> tags) const {
-        refresh_cache_if_needed();
-        TagFilteredView<
-            detail::type_list<IterComponents...>,
-            detail::type_list<AccessComponents...>,
-            detail::type_list<OptionalComponents...>,
-            detail::type_list<>,
-            detail::type_list<>>
-            view(*registry_, iter_storages_, access_storages_, optional_storages_);
-        view.add_runtime_with_tags(tags, true);
+        view.add_runtime_with_tags(tags);
         return view;
     }
 
@@ -4265,26 +2993,7 @@ public:
             detail::type_list<>,
             detail::type_list<>>
             view(*registry_, iter_storages_, access_storages_, optional_storages_);
-        view.add_runtime_without_tags(tags, false);
-        return view;
-    }
-
-    TagFilteredView<
-        detail::type_list<IterComponents...>,
-        detail::type_list<AccessComponents...>,
-        detail::type_list<OptionalComponents...>,
-        detail::type_list<>,
-        detail::type_list<>>
-    without_mutable_tags(std::initializer_list<Entity> tags) const {
-        refresh_cache_if_needed();
-        TagFilteredView<
-            detail::type_list<IterComponents...>,
-            detail::type_list<AccessComponents...>,
-            detail::type_list<OptionalComponents...>,
-            detail::type_list<>,
-            detail::type_list<>>
-            view(*registry_, iter_storages_, access_storages_, optional_storages_);
-        view.add_runtime_without_tags(tags, true);
+        view.add_runtime_without_tags(tags);
         return view;
     }
 
@@ -4408,7 +3117,7 @@ public:
         assert(storage != nullptr);
 
         return *static_cast<const detail::component_query_t<T>*>(
-            storage->get_unchecked(entity_index(registry_->singleton_entity_)));
+            storage->get_unchecked(entity_index(registry_->component_catalog_.singleton_entity)));
     }
 
     template <
@@ -4455,7 +3164,7 @@ public:
         assert(storage != nullptr);
 
         return *static_cast<detail::component_query_t<T>*>(
-            storage->write_unchecked(entity_index(registry_->singleton_entity_)));
+            storage->write_unchecked(entity_index(registry_->component_catalog_.singleton_entity)));
     }
 
 private:
@@ -4481,19 +3190,19 @@ private:
     }
 
     void refresh_cache_if_needed() const {
-        if (cache_token_ == registry_->view_topology_token_) {
+        if (cache_token_ == registry_->storage_registry_.view_topology_token) {
             return;
         }
         iter_storages_ = {{resolve_storage<IterComponents>(*registry_)...}};
         access_storages_ = {{resolve_storage<AccessComponents>(*registry_)...}};
         optional_storages_ = {{resolve_storage<OptionalComponents>(*registry_)...}};
         group_ = registry_->best_group_for_view<IterComponents...>();
-        cache_token_ = registry_->view_topology_token_;
+        cache_token_ = registry_->storage_registry_.view_topology_token;
     }
 
     TypeErasedStorage* driver_storage() const {
         if (group_ != nullptr) {
-            return registry_->find_storage(Entity{registry_->entities_[group_->owned.front()]});
+            return registry_->find_storage(Entity{registry_->entity_store_.slots[group_->owned.front()]});
         }
 
         TypeErasedStorage* driver = nullptr;
@@ -4610,12 +3319,15 @@ private:
     component_ref_t<T> component_ref(std::uint32_t index) {
         TypeErasedStorage* storage = storage_for_type<T>();
         if constexpr (detail::is_singleton_query<T>::value) {
-            index = entity_index(registry_->singleton_entity_);
+            index = entity_index(registry_->component_catalog_.singleton_entity);
         }
         if constexpr (std::is_const<typename std::remove_reference<T>::type>::value) {
             return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(index));
         } else {
-            return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(index));
+            void* value = TypeErasedStorage::range_dirty_deferred()
+                ? storage->write_unchecked_without_dirty(index)
+                : storage->write_unchecked(index);
+            return *static_cast<detail::component_query_t<T>*>(value);
         }
     }
 
@@ -4660,14 +3372,14 @@ public:
           optional_storages_(optional_storages),
           with_tag_storages_{{resolve_tag_storage<WithTags>(registry)...}},
           without_tag_storages_{{resolve_tag_storage<WithoutTags>(registry)...}},
-          cache_token_(registry.view_topology_token_) {}
+          cache_token_(registry.storage_registry_.view_topology_token) {}
 
-    void add_runtime_with_tags(std::initializer_list<Entity> tags, bool mutable_access) {
-        append_runtime_tags(tags, runtime_with_tags_, runtime_with_tag_storages_, mutable_access);
+    void add_runtime_with_tags(std::initializer_list<Entity> tags) {
+        append_runtime_tags(tags, runtime_with_tags_, runtime_with_tag_storages_);
     }
 
-    void add_runtime_without_tags(std::initializer_list<Entity> tags, bool mutable_access) {
-        append_runtime_tags(tags, runtime_without_tags_, runtime_without_tag_storages_, mutable_access);
+    void add_runtime_without_tags(std::initializer_list<Entity> tags) {
+        append_runtime_tags(tags, runtime_without_tags_, runtime_without_tag_storages_);
     }
 
     template <typename... Tags>
@@ -4701,20 +3413,7 @@ public:
             detail::type_list<WithoutTags...>> {
         refresh_cache_if_needed();
         auto view = *this;
-        view.add_runtime_with_tags(tags, false);
-        return view;
-    }
-
-    auto with_mutable_tags(std::initializer_list<Entity> tags) const
-        -> TagFilteredView<
-            detail::type_list<IterComponents...>,
-            detail::type_list<AccessComponents...>,
-            detail::type_list<OptionalComponents...>,
-            detail::type_list<WithTags...>,
-            detail::type_list<WithoutTags...>> {
-        refresh_cache_if_needed();
-        auto view = *this;
-        view.add_runtime_with_tags(tags, true);
+        view.add_runtime_with_tags(tags);
         return view;
     }
 
@@ -4749,20 +3448,7 @@ public:
             detail::type_list<WithoutTags...>> {
         refresh_cache_if_needed();
         auto view = *this;
-        view.add_runtime_without_tags(tags, false);
-        return view;
-    }
-
-    auto without_mutable_tags(std::initializer_list<Entity> tags) const
-        -> TagFilteredView<
-            detail::type_list<IterComponents...>,
-            detail::type_list<AccessComponents...>,
-            detail::type_list<OptionalComponents...>,
-            detail::type_list<WithTags...>,
-            detail::type_list<WithoutTags...>> {
-        refresh_cache_if_needed();
-        auto view = *this;
-        view.add_runtime_without_tags(tags, true);
+        view.add_runtime_without_tags(tags);
         return view;
     }
 
@@ -4782,7 +3468,7 @@ public:
                 continue;
             }
 
-            call_each(callback, Entity{registry_->entities_[index]}, index);
+            call_each(callback, Entity{registry_->entity_store_.slots[index]}, index);
         }
     }
 
@@ -4814,7 +3500,7 @@ public:
             if (!contains_all(index)) {
                 continue;
             }
-            call_each(callback, Entity{registry_->entities_[index]}, index);
+            call_each(callback, Entity{registry_->entity_store_.slots[index]}, index);
         }
     }
 
@@ -4925,7 +3611,7 @@ public:
         assert(storage != nullptr);
 
         return *static_cast<const detail::component_query_t<T>*>(
-            storage->get_unchecked(entity_index(registry_->singleton_entity_)));
+            storage->get_unchecked(entity_index(registry_->component_catalog_.singleton_entity)));
     }
 
     template <
@@ -4972,7 +3658,7 @@ public:
         assert(storage != nullptr);
 
         return *static_cast<detail::component_query_t<T>*>(
-            storage->write_unchecked(entity_index(registry_->singleton_entity_)));
+            storage->write_unchecked(entity_index(registry_->component_catalog_.singleton_entity)));
     }
 
     template <
@@ -5006,16 +3692,6 @@ public:
         return registry_->template add<detail::component_query_t<T>>(entity);
     }
 
-    bool add_tag(Entity entity, Entity tag) {
-        require_mutable_runtime_tag(tag);
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
-        detail::RegistryAccessAllowedScope scope;
-#endif
-        const bool added = registry_->add_tag(entity, tag);
-        refresh_cache_if_needed();
-        return added;
-    }
-
     template <
         typename T,
         typename std::enable_if<
@@ -5026,14 +3702,6 @@ public:
         detail::RegistryAccessAllowedScope scope;
 #endif
         return registry_->template remove<detail::component_query_t<T>>(entity);
-    }
-
-    bool remove_tag(Entity entity, Entity tag) {
-        require_mutable_runtime_tag(tag);
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
-        detail::RegistryAccessAllowedScope scope;
-#endif
-        return registry_->remove_tag(entity, tag);
     }
 
     template <typename... ViewComponents>
@@ -5089,16 +3757,11 @@ private:
     void append_runtime_tags(
         std::initializer_list<Entity> tags,
         std::vector<Entity>& target,
-        std::vector<TypeErasedStorage*>& storage_target,
-        bool mutable_access) {
+        std::vector<TypeErasedStorage*>& storage_target) {
         for (Entity tag : tags) {
             registry_->require_tag_component(tag);
             target.push_back(tag);
             storage_target.push_back(registry_->find_storage(tag));
-            if (mutable_access && std::find(mutable_runtime_tags_.begin(), mutable_runtime_tags_.end(), tag) ==
-                                      mutable_runtime_tags_.end()) {
-                mutable_runtime_tags_.push_back(tag);
-            }
         }
     }
 
@@ -5108,11 +3771,10 @@ private:
         other.runtime_without_tags_ = runtime_without_tags_;
         other.runtime_with_tag_storages_ = runtime_with_tag_storages_;
         other.runtime_without_tag_storages_ = runtime_without_tag_storages_;
-        other.mutable_runtime_tags_ = mutable_runtime_tags_;
     }
 
     void refresh_cache_if_needed() const {
-        if (cache_token_ == registry_->view_topology_token_) {
+        if (cache_token_ == registry_->storage_registry_.view_topology_token) {
             return;
         }
         iter_storages_ = {{resolve_storage<IterComponents>(*registry_)...}};
@@ -5121,7 +3783,7 @@ private:
         with_tag_storages_ = {{resolve_tag_storage<WithTags>(*registry_)...}};
         without_tag_storages_ = {{resolve_tag_storage<WithoutTags>(*registry_)...}};
         refresh_runtime_tag_storages();
-        cache_token_ = registry_->view_topology_token_;
+        cache_token_ = registry_->storage_registry_.view_topology_token;
     }
 
     void refresh_runtime_tag_storages() const {
@@ -5292,20 +3954,15 @@ private:
     component_ref_t<T> component_ref(std::uint32_t index) {
         TypeErasedStorage* storage = storage_for_type<T>();
         if constexpr (detail::is_singleton_query<T>::value) {
-            index = entity_index(registry_->singleton_entity_);
+            index = entity_index(registry_->component_catalog_.singleton_entity);
         }
         if constexpr (std::is_const<typename std::remove_reference<T>::type>::value) {
             return *static_cast<const detail::component_query_t<T>*>(storage->get_unchecked(index));
         } else {
-            return *static_cast<detail::component_query_t<T>*>(storage->write_unchecked(index));
-        }
-    }
-
-    void require_mutable_runtime_tag(Entity tag) const {
-        registry_->require_tag_component(tag);
-        if (std::find(mutable_runtime_tags_.begin(), mutable_runtime_tags_.end(), tag) ==
-            mutable_runtime_tags_.end()) {
-            throw std::logic_error("ecs runtime tag was not added as mutable view access");
+            void* value = TypeErasedStorage::range_dirty_deferred()
+                ? storage->write_unchecked_without_dirty(index)
+                : storage->write_unchecked(index);
+            return *static_cast<detail::component_query_t<T>*>(value);
         }
     }
 
@@ -5319,7 +3976,6 @@ private:
     std::vector<Entity> runtime_without_tags_;
     mutable std::vector<TypeErasedStorage*> runtime_with_tag_storages_;
     mutable std::vector<TypeErasedStorage*> runtime_without_tag_storages_;
-    std::vector<Entity> mutable_runtime_tags_;
     mutable std::uint64_t cache_token_ = 0;
     std::uint32_t active_callback_index_ = invalid_index;
     bool job_callback_scope_ = false;
@@ -5499,6 +4155,7 @@ public:
                     auto view = make_view(registry);
                     view.job_callback_scope().each_index_range(*callback, indices, begin, end);
                 },
+            registry_->template make_job_range_dirty_writes<IterComponents...>(),
             threading_,
             false);
     }
@@ -5731,6 +4388,7 @@ public:
                     };
                     view.each_index_range(adapter, indices, begin, end);
                 },
+            registry_->template make_job_range_dirty_writes<IterComponents...>(),
             threading_,
             true);
     }
@@ -5798,6 +4456,7 @@ public:
                     auto view = registry.template view<Components...>();
                     view.job_callback_scope().each_index_range(*callback, indices, begin, end);
                 },
+            registry_->template make_job_range_dirty_writes<Components...>(),
             threading_,
             false);
     }
@@ -6005,20 +4664,23 @@ public:
     Entity each(Fn&& fn) {
         using Callback = typename std::decay<Fn>::type;
         auto callback = std::make_shared<Callback>(std::forward<Fn>(fn));
-        auto view = view_;
         return registry_->add_job(
             order_,
             registry_->template make_job_access_metadata<IterComponents..., AccessComponents..., OptionalComponents...>(),
-            [view, callback](Registry&) mutable {
+            [callback](Registry& registry) mutable {
+                auto view = make_view(registry);
                 view.job_callback_scope().each(*callback);
             },
-            [view](Registry&) mutable {
+            [](Registry& registry) {
+                auto view = make_view(registry);
                 return view.matching_indices();
             },
-            [view, callback](Registry&, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end)
+            [callback](Registry& registry, const std::vector<std::uint32_t>& indices, std::size_t begin, std::size_t end)
                 mutable {
+                    auto view = make_view(registry);
                     view.job_callback_scope().each_index_range(*callback, indices, begin, end);
                 },
+            registry_->template make_job_range_dirty_writes<IterComponents...>(),
             threading_,
             false);
     }
@@ -6113,6 +4775,20 @@ public:
     }
 
 private:
+    static auto make_view(Registry& registry) {
+        if constexpr (sizeof...(AccessComponents) == 0 && sizeof...(OptionalComponents) == 0) {
+            return registry.template view<IterComponents...>();
+        } else if constexpr (sizeof...(AccessComponents) == 0) {
+            return registry.template view<IterComponents...>().template optional<OptionalComponents...>();
+        } else if constexpr (sizeof...(OptionalComponents) == 0) {
+            return registry.template view<IterComponents...>().template access<AccessComponents...>();
+        } else {
+            return registry.template view<IterComponents...>()
+                .template access<AccessComponents...>()
+                .template optional<OptionalComponents...>();
+        }
+    }
+
     Registry* registry_;
     int order_ = 0;
     AccessView<
@@ -6163,6 +4839,7 @@ public:
                     };
                     view.each_index_range(adapter, indices, begin, end);
                 },
+            registry_->template make_job_range_dirty_writes<IterComponents...>(),
             threading_,
             true);
     }
@@ -6221,6 +4898,7 @@ public:
                     };
                     view.each_index_range(adapter, indices, begin, end);
                 },
+            registry_->template make_job_range_dirty_writes<IterComponents...>(),
             threading_,
             true);
     }
@@ -6245,390 +4923,33 @@ Registry::JobView<Components...> Registry::job(int order) {
 
 class Orchestrator {
 public:
-    explicit Orchestrator(const Registry& registry)
-        : registry_(&registry) {}
+    explicit Orchestrator(const Registry& registry);
 
-    JobSchedule schedule() const {
-        if (registry_->job_schedule_cache_valid_) {
-            return registry_->cached_job_schedule_;
-        }
-
-        JobSchedule result = build_schedule(registry_->ordered_job_indices());
-        registry_->cached_job_schedule_ = result;
-        registry_->job_schedule_cache_valid_ = true;
-        return result;
-    }
-
-    JobSchedule schedule_for_jobs(const std::vector<Entity>& jobs) const {
-        std::vector<std::size_t> ordered_indices;
-        ordered_indices.reserve(jobs.size());
-        for (Entity job : jobs) {
-            ordered_indices.push_back(registry_->job_index(job));
-        }
-        std::sort(
-            ordered_indices.begin(),
-            ordered_indices.end(),
-            [&](std::size_t lhs, std::size_t rhs) {
-                const Registry::JobRecord& left = registry_->jobs_[lhs];
-                const Registry::JobRecord& right = registry_->jobs_[rhs];
-                if (left.order != right.order) {
-                    return left.order < right.order;
-                }
-                return left.sequence < right.sequence;
-            });
-        ordered_indices.erase(std::unique(ordered_indices.begin(), ordered_indices.end()), ordered_indices.end());
-        return build_schedule(ordered_indices);
-    }
+    JobSchedule schedule() const;
+    JobSchedule schedule_for_jobs(const std::vector<Entity>& jobs) const;
 
 private:
-    JobSchedule build_schedule(const std::vector<std::size_t>& ordered_indices) const {
-        JobSchedule result;
-
-        std::unordered_map<std::uint32_t, std::size_t> last_reader_stage;
-        std::unordered_map<std::uint32_t, std::size_t> last_writer_stage;
-        std::size_t latest_stage = 0;
-        std::size_t structural_barrier_stage = 0;
-        bool has_previous_job = false;
-        bool has_structural_barrier = false;
-
-        for (std::size_t job_index : ordered_indices) {
-            const Registry::JobRecord& job = registry_->jobs_[job_index];
-
-            std::size_t stage_index = has_structural_barrier ? structural_barrier_stage + 1 : 0;
-            if (job.structural) {
-                stage_index = has_previous_job ? latest_stage + 1 : 0;
-            } else {
-                apply_read_dependencies(job.reads, last_writer_stage, stage_index);
-                apply_write_dependencies(job.writes, last_reader_stage, last_writer_stage, stage_index);
-            }
-
-            if (result.stages.size() <= stage_index) {
-                result.stages.resize(stage_index + 1);
-            }
-            result.stages[stage_index].jobs.push_back(job.entity);
-
-            latest_stage = has_previous_job ? std::max(latest_stage, stage_index) : stage_index;
-            has_previous_job = true;
-
-            if (job.structural) {
-                structural_barrier_stage = stage_index;
-                has_structural_barrier = true;
-                continue;
-            }
-
-            record_read_stage(job.reads, last_reader_stage, stage_index);
-            record_write_stage(job.writes, last_writer_stage, stage_index);
-        }
-
-        return result;
-    }
-
+    JobSchedule build_schedule(const std::vector<std::size_t>& ordered_indices) const;
     static void apply_read_dependencies(
         const std::vector<std::uint32_t>& reads,
         const std::unordered_map<std::uint32_t, std::size_t>& last_writer_stage,
-        std::size_t& stage_index) {
-        for (std::uint32_t component : reads) {
-            const auto found = last_writer_stage.find(component);
-            if (found != last_writer_stage.end()) {
-                stage_index = std::max(stage_index, found->second + 1);
-            }
-        }
-    }
-
+        std::size_t& stage_index);
     static void apply_write_dependencies(
         const std::vector<std::uint32_t>& writes,
         const std::unordered_map<std::uint32_t, std::size_t>& last_reader_stage,
         const std::unordered_map<std::uint32_t, std::size_t>& last_writer_stage,
-        std::size_t& stage_index) {
-        for (std::uint32_t component : writes) {
-            const auto found_reader = last_reader_stage.find(component);
-            if (found_reader != last_reader_stage.end()) {
-                stage_index = std::max(stage_index, found_reader->second + 1);
-            }
-            const auto found_writer = last_writer_stage.find(component);
-            if (found_writer != last_writer_stage.end()) {
-                stage_index = std::max(stage_index, found_writer->second + 1);
-            }
-        }
-    }
-
+        std::size_t& stage_index);
     static void record_read_stage(
         const std::vector<std::uint32_t>& reads,
         std::unordered_map<std::uint32_t, std::size_t>& last_reader_stage,
-        std::size_t stage_index) {
-        for (std::uint32_t component : reads) {
-            auto inserted = last_reader_stage.emplace(component, stage_index);
-            if (!inserted.second) {
-                inserted.first->second = std::max(inserted.first->second, stage_index);
-            }
-        }
-    }
-
+        std::size_t stage_index);
     static void record_write_stage(
         const std::vector<std::uint32_t>& writes,
         std::unordered_map<std::uint32_t, std::size_t>& last_writer_stage,
-        std::size_t stage_index) {
-        for (std::uint32_t component : writes) {
-            last_writer_stage[component] = stage_index;
-        }
-    }
+        std::size_t stage_index);
 
     const Registry* registry_;
 };
-
-inline void JobGraph::tick(Registry& registry, RunJobsOptions options) const {
-    const std::size_t job_count = registry.jobs_.size();
-    if (options.force_single_threaded) {
-        for (const JobScheduleStage& stage : schedule_.stages) {
-            for (Entity job_entity : stage.jobs) {
-                const std::size_t index = registry.job_index(job_entity);
-                if (index >= job_count || registry.job_excluded_by_options(registry.jobs_[index], options)) {
-                    continue;
-                }
-                registry.jobs_[index].run(registry);
-            }
-        }
-        return;
-    }
-
-    std::exception_ptr first_exception;
-    std::mutex exception_mutex;
-    auto make_safe_task = [&](JobThreadTask task) {
-        task.run = [run = std::move(task.run), &first_exception, &exception_mutex]() mutable {
-            try {
-                run();
-            } catch (...) {
-                std::lock_guard<std::mutex> lock(exception_mutex);
-                if (first_exception == nullptr) {
-                    first_exception = std::current_exception();
-                }
-            }
-        };
-        return task;
-    };
-
-    for (const JobScheduleStage& stage : schedule_.stages) {
-        std::vector<JobThreadTask> tasks;
-        for (Entity job_entity : stage.jobs) {
-            const std::size_t index = registry.job_index(job_entity);
-            if (index >= job_count) {
-                continue;
-            }
-
-            Registry::JobRecord& job = registry.jobs_[index];
-            if (registry.job_excluded_by_options(job, options)) {
-                continue;
-            }
-            if (job.single_thread || job.structural || job.max_threads <= 1) {
-                tasks.push_back(make_safe_task(JobThreadTask{
-                    job.entity,
-                    0,
-                    1,
-                    [&registry, index]() {
-                        registry.jobs_[index].run(registry);
-                    }}));
-                continue;
-            }
-
-            auto indices = std::make_shared<std::vector<std::uint32_t>>(job.collect_indices(registry));
-            const std::size_t entity_count = indices->size();
-            if (entity_count == 0) {
-                tasks.push_back(make_safe_task(JobThreadTask{
-                    job.entity,
-                    0,
-                    1,
-                    [&registry, index]() {
-                        registry.jobs_[index].run(registry);
-                    }}));
-                continue;
-            }
-
-            const std::size_t desired_threads =
-                std::max<std::size_t>(1, (entity_count + job.min_entities_per_thread - 1) / job.min_entities_per_thread);
-            const std::size_t thread_count = std::min(job.max_threads, desired_threads);
-            for (std::size_t thread_index = 0; thread_index < thread_count; ++thread_index) {
-                const std::size_t begin = entity_count * thread_index / thread_count;
-                const std::size_t end = entity_count * (thread_index + 1) / thread_count;
-                tasks.push_back(make_safe_task(JobThreadTask{
-                    job.entity,
-                    thread_index,
-                    thread_count,
-                    [&registry, index, indices, begin, end]() {
-                        registry.jobs_[index].run_range(registry, *indices, begin, end);
-                    }}));
-            }
-        }
-
-        if (registry.job_thread_executor_) {
-            registry.job_thread_executor_(tasks);
-        } else {
-            for (const JobThreadTask& task : tasks) {
-                task.run();
-            }
-        }
-
-        if (first_exception != nullptr) {
-            std::rethrow_exception(first_exception);
-        }
-    }
-}
-
-inline void JobGraph::tick_for_entities(
-    Registry& registry,
-    const std::vector<Entity>& entities,
-    RunJobsOptions options) const {
-    if (entities.empty()) {
-        return;
-    }
-
-    std::vector<std::uint32_t> target_indices;
-    target_indices.reserve(entities.size());
-    for (Entity entity : entities) {
-        if (registry.alive(entity)) {
-            target_indices.push_back(Registry::entity_index(entity));
-        }
-    }
-    if (target_indices.empty()) {
-        return;
-    }
-    std::sort(target_indices.begin(), target_indices.end());
-    target_indices.erase(std::unique(target_indices.begin(), target_indices.end()), target_indices.end());
-
-    const std::size_t job_count = registry.jobs_.size();
-    if (options.force_single_threaded) {
-        for (const JobScheduleStage& stage : schedule_.stages) {
-            for (Entity job_entity : stage.jobs) {
-                const std::size_t index = registry.job_index(job_entity);
-                if (index >= job_count || registry.job_excluded_by_options(registry.jobs_[index], options)) {
-                    continue;
-                }
-                std::vector<std::uint32_t> indices = registry.jobs_[index].collect_indices(registry);
-                indices.erase(
-                    std::remove_if(
-                        indices.begin(),
-                        indices.end(),
-                        [&](std::uint32_t entity_index) {
-                            return !std::binary_search(target_indices.begin(), target_indices.end(), entity_index);
-                        }),
-                    indices.end());
-                if (!indices.empty()) {
-                    registry.jobs_[index].run_range(registry, indices, 0, indices.size());
-                }
-            }
-        }
-        return;
-    }
-
-    std::exception_ptr first_exception;
-    std::mutex exception_mutex;
-    auto make_safe_task = [&](JobThreadTask task) {
-        task.run = [run = std::move(task.run), &first_exception, &exception_mutex]() mutable {
-            try {
-                run();
-            } catch (...) {
-                std::lock_guard<std::mutex> lock(exception_mutex);
-                if (first_exception == nullptr) {
-                    first_exception = std::current_exception();
-                }
-            }
-        };
-        return task;
-    };
-
-    for (const JobScheduleStage& stage : schedule_.stages) {
-        std::vector<JobThreadTask> tasks;
-        for (Entity job_entity : stage.jobs) {
-            const std::size_t index = registry.job_index(job_entity);
-            if (index >= job_count) {
-                continue;
-            }
-
-            Registry::JobRecord& job = registry.jobs_[index];
-            if (registry.job_excluded_by_options(job, options)) {
-                continue;
-            }
-            auto indices = std::make_shared<std::vector<std::uint32_t>>(job.collect_indices(registry));
-            indices->erase(
-                std::remove_if(
-                    indices->begin(),
-                    indices->end(),
-                    [&](std::uint32_t entity_index) {
-                        return !std::binary_search(target_indices.begin(), target_indices.end(), entity_index);
-                    }),
-                indices->end());
-            if (indices->empty()) {
-                continue;
-            }
-
-            if (job.single_thread || job.structural || job.max_threads <= 1) {
-                tasks.push_back(make_safe_task(JobThreadTask{
-                    job.entity,
-                    0,
-                    1,
-                    [&registry, index, indices]() {
-                        registry.jobs_[index].run_range(registry, *indices, 0, indices->size());
-                    }}));
-                continue;
-            }
-
-            const std::size_t entity_count = indices->size();
-            const std::size_t desired_threads =
-                std::max<std::size_t>(1, (entity_count + job.min_entities_per_thread - 1) / job.min_entities_per_thread);
-            const std::size_t thread_count = std::min(job.max_threads, desired_threads);
-            for (std::size_t thread_index = 0; thread_index < thread_count; ++thread_index) {
-                const std::size_t begin = entity_count * thread_index / thread_count;
-                const std::size_t end = entity_count * (thread_index + 1) / thread_count;
-                tasks.push_back(make_safe_task(JobThreadTask{
-                    job.entity,
-                    thread_index,
-                    thread_count,
-                    [&registry, index, indices, begin, end]() {
-                        registry.jobs_[index].run_range(registry, *indices, begin, end);
-                    }}));
-            }
-        }
-
-        if (registry.job_thread_executor_) {
-            registry.job_thread_executor_(tasks);
-        } else {
-            for (const JobThreadTask& task : tasks) {
-                task.run();
-            }
-        }
-
-        if (first_exception != nullptr) {
-            std::rethrow_exception(first_exception);
-        }
-    }
-}
-
-inline JobGraph Registry::compile_job_graph(const std::vector<Entity>& jobs) const {
-    require_runtime_registry_access_allowed("compile_job_graph");
-    return JobGraph(Orchestrator(*this).schedule_for_jobs(jobs));
-}
-
-inline JobGraph Registry::compile_all_jobs_graph() const {
-    require_runtime_registry_access_allowed("compile_all_jobs_graph");
-    return JobGraph(Orchestrator(*this).schedule());
-}
-
-inline const JobGraph& Registry::cached_all_jobs_graph() const {
-    if (!job_graph_cache_valid_) {
-        cached_job_graph_ = compile_all_jobs_graph();
-        job_graph_cache_valid_ = true;
-    }
-    return cached_job_graph_;
-}
-
-inline void Registry::run_jobs(RunJobsOptions options) {
-    require_runtime_registry_access_allowed("run_jobs");
-    cached_all_jobs_graph().tick(*this, options);
-}
-
-inline void Registry::run_jobs_for_entities(const std::vector<Entity>& entities, RunJobsOptions options) {
-    require_runtime_registry_access_allowed("run_jobs_for_entities");
-    cached_all_jobs_graph().tick_for_entities(*this, entities, options);
-}
 
 template <typename... Owned>
 void Registry::declare_owned_group() {

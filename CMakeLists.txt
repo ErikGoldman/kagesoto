@@ -6,21 +6,22 @@ project(ECS
     LANGUAGES CXX
 )
 
-include(CTest)
-
-option(ECS_BUILD_EXAMPLE "Build the example executable" ON)
-option(ECS_BUILD_BENCHMARKS "Build Google Benchmark suites" OFF)
-option(ECS_BUILD_PROFILING "Build benchmark-friendly profiling instrumentation" OFF)
-set(ECS_INDEX_BACKEND "flat_sorted" CACHE STRING "Internal component index backend")
-set_property(CACHE ECS_INDEX_BACKEND PROPERTY STRINGS optimized_bplus flat_sorted)
-
-if(ECS_INDEX_BACKEND STREQUAL "optimized_bplus")
-    set(ECS_INDEX_BACKEND_VALUE 1)
-elseif(ECS_INDEX_BACKEND STREQUAL "flat_sorted")
-    set(ECS_INDEX_BACKEND_VALUE 2)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    set(ecs_is_top_level ON)
 else()
-    message(FATAL_ERROR "ECS_INDEX_BACKEND must be one of: optimized_bplus, flat_sorted")
+    set(ecs_is_top_level OFF)
 endif()
+
+if(ecs_is_top_level)
+    include(CTest)
+    set(ecs_build_testing_default ${BUILD_TESTING})
+else()
+    set(ecs_build_testing_default OFF)
+endif()
+
+option(ECS_BUILD_EXAMPLE "Build the example executable" ${ecs_is_top_level})
+option(ECS_BUILD_TESTING "Build ECS tests" ${ecs_build_testing_default})
+option(ECS_BUILD_BENCHMARKS "Build Google Benchmark suites" OFF)
 
 file(GLOB_RECURSE ecs_public_headers CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
@@ -42,8 +43,7 @@ list(FILTER ecs_test_sources INCLUDE REGEX [[\.test\.(c|cc|cpp|cxx)$]])
 set(ecs_sources ${ecs_all_src})
 list(FILTER ecs_sources EXCLUDE REGEX [[\.test\.(c|cc|cpp|cxx)$]])
 
-add_library(ecs
-        src/registry.hpp)
+add_library(ecs)
 
 target_sources(ecs
     PRIVATE
@@ -62,10 +62,8 @@ target_include_directories(ecs
 )
 
 target_compile_definitions(ecs
-    PRIVATE ECS_BUILDING_LIBRARY
-    PUBLIC
-        ECS_INDEX_BACKEND=${ECS_INDEX_BACKEND_VALUE}
-        ECS_INDEX_BACKEND_NAME="${ECS_INDEX_BACKEND}"
+    PRIVATE
+        ECS_BUILDING_LIBRARY
 )
 
 if(NOT BUILD_SHARED_LIBS)
@@ -85,24 +83,15 @@ else()
     target_compile_options(ecs PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-if(ECS_BUILD_PROFILING)
-    target_compile_definitions(ecs PUBLIC ECS_ENABLE_PROFILING=1)
-    if(MSVC)
-        target_compile_options(ecs PRIVATE /Zi)
-    else()
-        target_compile_options(ecs PRIVATE -g -fno-omit-frame-pointer)
-    endif()
-endif()
-
 if(ECS_BUILD_EXAMPLE)
     add_subdirectory(examples)
 endif()
 
-if(BUILD_TESTING OR ECS_BUILD_BENCHMARKS)
+if(ECS_BUILD_TESTING OR ECS_BUILD_BENCHMARKS)
     include(FetchContent)
 endif()
 
-if(BUILD_TESTING)
+if(ECS_BUILD_TESTING)
 
     FetchContent_Declare(
         Catch2
@@ -114,8 +103,7 @@ if(BUILD_TESTING)
 
     include(Catch)
 
-    add_executable(ecs_tests
-            src/registry.hpp)
+    add_executable(ecs_tests)
 
     target_sources(ecs_tests
         PRIVATE
@@ -145,28 +133,6 @@ if(ECS_BUILD_BENCHMARKS)
     )
 
     FetchContent_MakeAvailable(google_benchmark)
-
-    if(ECS_BUILD_PROFILING)
-        FetchContent_Declare(
-            tracy
-            GIT_REPOSITORY https://github.com/wolfpld/tracy.git
-            GIT_TAG v0.11.1
-        )
-
-        FetchContent_MakeAvailable(tracy)
-
-        if(TARGET TracyClient)
-            target_link_libraries(ecs PRIVATE TracyClient)
-            target_compile_definitions(ecs PUBLIC TRACY_ENABLE=1)
-        else()
-            message(FATAL_ERROR "ECS_BUILD_PROFILING=ON requires TracyClient target from tracy")
-        endif()
-
-        if(NOT TARGET tracy-capture)
-            set(NO_FILESELECTOR ON CACHE BOOL "" FORCE)
-            add_subdirectory("${tracy_SOURCE_DIR}/capture" "${tracy_BINARY_DIR}/capture")
-        endif()
-    endif()
 
     add_subdirectory(benchmarks)
 endif()

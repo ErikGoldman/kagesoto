@@ -121,7 +121,7 @@ public:
     void capture_checkpoint(ecs::Registry& registry, std::uint64_t frame) {
         RewindFrame record;
         record.frame = frame;
-        record.checkpoint.emplace(registry.snapshot());
+        record.checkpoint.emplace(registry.create_snapshot());
         frames_.push_back(std::move(record));
         trim();
     }
@@ -130,9 +130,9 @@ public:
         RewindFrame record;
         record.frame = frame;
         if (baseline.checkpoint.has_value()) {
-            record.delta.emplace(registry.delta_snapshot(*baseline.checkpoint));
+            record.delta.emplace(registry.create_delta_snapshot(*baseline.checkpoint));
         } else {
-            record.delta.emplace(registry.delta_snapshot(*baseline.delta));
+            record.delta.emplace(registry.create_delta_snapshot(*baseline.delta));
         }
         frames_.push_back(std::move(record));
         trim();
@@ -161,10 +161,10 @@ public:
             return false;
         }
 
-        registry.restore(*frames_[checkpoint_index].checkpoint);
+        registry.restore_snapshot(*frames_[checkpoint_index].checkpoint);
         for (std::size_t i = checkpoint_index + 1; i <= frame_index; ++i) {
             if (frames_[i].delta.has_value()) {
-                registry.restore(*frames_[i].delta);
+                registry.restore_delta_snapshot(*frames_[i].delta);
             }
         }
         return true;

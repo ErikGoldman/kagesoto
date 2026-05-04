@@ -11,7 +11,7 @@ A small C++17 sparse-set ECS.
 
 Deleted entity indices are recycled through an implicit free list stored in the entity slot list. A free slot stores the next free index in the low bits and the bumped version in the high bits, which makes stale handles fail `Registry::alive`.
 
-Components are also entities. Registering a component creates a normal entity and stores its size, alignment, lifecycle, dirty state, and optional field metadata in the registry's component-info table.
+Entity indices are opaque. Components are also entities: registering a component creates a normal entity and stores its size, alignment, lifecycle, dirty state, and optional field metadata in the registry's component-info table. Jobs and internal bookkeeping also use entity handles. Use `Registry::entity_kind()` or `Registry::is_user_entity()` when code needs to distinguish user-created entities from component descriptors, jobs, or system bookkeeping.
 
 ## Typed Components
 
@@ -72,9 +72,11 @@ Runtime tags are registered separately:
 ecs::Entity selected = registry.register_tag("Selected");
 registry.add_tag(entity, selected);
 
-auto view = registry.view<Position>().with_mutable_tags({selected});
+auto view = registry.view<Position>().with_tags({selected});
 view.each([&](auto& active_view, ecs::Entity entity, Position&) {
-    active_view.remove_tag(entity, selected);
+    if (active_view.has_tag(entity, selected)) {
+        // Runtime tag filters are read-only view filters.
+    }
 });
 ```
 
@@ -289,6 +291,8 @@ std::string text = registry.debug_print(entity, position_type);
 - `ecs::Entity Registry::create()`
 - `bool Registry::destroy(Entity entity)`
 - `bool Registry::alive(Entity entity) const`
+- `EntityKind Registry::entity_kind(Entity entity) const`
+- `bool Registry::is_user_entity(Entity entity) const`
 - `Entity Registry::register_component<T>(std::string name = {})`
 - `Entity Registry::register_component(ComponentDesc desc)`
 - `Entity Registry::register_tag(std::string name = {})`
@@ -324,11 +328,20 @@ std::string text = registry.debug_print(entity, position_type);
 - `void Registry::clear_all_dirty<T>()`
 - `void Registry::clear_all_dirty(Entity component)`
 - `Entity Registry::system_tag() const`
-- `Registry::Snapshot Registry::snapshot() const`
-- `Registry::DeltaSnapshot Registry::delta_snapshot(const Registry::Snapshot& baseline) const`
-- `Registry::DeltaSnapshot Registry::delta_snapshot(const Registry::DeltaSnapshot& baseline) const`
-- `void Registry::restore(const Registry::Snapshot& snapshot)`
-- `void Registry::restore(const Registry::DeltaSnapshot& snapshot)`
+- `Registry::Snapshot Registry::create_snapshot() const`
+- `Registry::DeltaSnapshot Registry::create_delta_snapshot(const Registry::Snapshot& baseline) const`
+- `Registry::DeltaSnapshot Registry::create_delta_snapshot(const Registry::DeltaSnapshot& baseline) const`
+- `void Registry::restore_snapshot(const Registry::Snapshot& snapshot)`
+- `void Registry::restore_delta_snapshot(const Registry::DeltaSnapshot& snapshot)`
+- `void Registry::Snapshot::write_native(std::ostream& out, const SnapshotIoOptions& options = {}) const`
+- `Registry::Snapshot Registry::Snapshot::read_native(std::istream& in)`
+- `void Registry::DeltaSnapshot::write_native(std::ostream& out, const SnapshotIoOptions& options = {}) const`
+- `Registry::DeltaSnapshot Registry::DeltaSnapshot::read_native(std::istream& in)`
+- `ecs::SnapshotPersistenceCodecs::register_component<T, Traits>(Registry& registry, std::string name = {})`
+- `void ecs::write_persistent_snapshot(std::ostream& out, const Registry::Snapshot& snapshot, const SnapshotPersistenceCodecs& codecs, const SnapshotIoOptions& options = {})`
+- `Registry::Snapshot ecs::read_persistent_snapshot(std::istream& in, const Registry& schema, const SnapshotPersistenceCodecs& codecs)`
+- `void ecs::write_persistent_delta_snapshot(std::ostream& out, const Registry::DeltaSnapshot& snapshot, const Registry::Snapshot& baseline, const SnapshotPersistenceCodecs& codecs, const SnapshotIoOptions& options = {})`
+- `Registry::DeltaSnapshot ecs::read_persistent_delta_snapshot(std::istream& in, const Registry& schema, const Registry::Snapshot& baseline, const SnapshotPersistenceCodecs& codecs)`
 - `Registry::View<Components...> Registry::view<Components...>()`
 - `Registry::JobView<Components...> Registry::job<Components...>(int order)`
 - `void Registry::set_job_thread_executor(JobThreadExecutor executor)`
@@ -350,14 +363,10 @@ std::string text = registry.debug_print(entity, position_type);
 - `auto View<Components...>::without_tags<Tags...>() const`
 - `auto View<Components...>::with_tags(std::initializer_list<Entity> tags) const`
 - `auto View<Components...>::without_tags(std::initializer_list<Entity> tags) const`
-- `auto View<Components...>::with_mutable_tags(std::initializer_list<Entity> tags) const`
-- `auto View<Components...>::without_mutable_tags(std::initializer_list<Entity> tags) const`
 - `bool filtered_view.has_tag<T>(Entity entity) const`
 - `bool filtered_view.add_tag<T>(Entity entity)` (non-const tag filters only)
 - `bool filtered_view.remove_tag<T>(Entity entity)` (non-const tag filters only)
 - `bool filtered_view.has_tag(Entity entity, Entity tag) const`
-- `bool filtered_view.add_tag(Entity entity, Entity tag)` (mutable runtime tag filters only)
-- `bool filtered_view.remove_tag(Entity entity, Entity tag)` (mutable runtime tag filters only)
 - `bool View<Components...>::contains<T>(Entity entity) const` (non-singleton components only)
 - `const T* View<Components...>::try_get<T>(Entity entity) const` (non-singleton components only)
 - `const T& View<Components...>::get<T>(Entity entity) const`
@@ -383,7 +392,13 @@ Component pointers remain valid until that component storage is removed or mutat
 
 `add<T>()`, runtime `add()`, `ensure()`, and `write()` mark the component dirty because they return writable storage. Tag add/remove marks tag membership dirty. `get()`, `try_get()`, `contains()`, and `has()` are read-only and do not modify dirty state.
 
-Snapshots capture entity/component world state for later restoration. Delta snapshots validate against a baseline snapshot token, copy current entity slot state, and save only dirty component values plus dirty component-removal tombstones. Trivially copyable component storage is byte-copied, copy-constructible typed components are cloned through their lifecycle hook, and move-only non-trivial component storage rejects snapshot creation when captured. Registered job callbacks are not part of snapshots. Internal bookkeeping entities are tagged with `Registry::system_tag()` and excluded from snapshot payloads.
+In-memory snapshots are created with `Registry::create_snapshot()` / `create_delta_snapshot()` and applied with `restore_snapshot()` / `restore_delta_snapshot()`. Delta snapshots validate against a baseline snapshot token, copy current entity slot state, and save only dirty component values plus dirty component-removal tombstones. In-memory snapshots are optimized for creation and restore speed: trivially copyable component storage is byte-copied, copy-constructible typed components are cloned through their lifecycle hook, and move-only non-trivial component storage rejects snapshot creation when captured.
+
+Reading and writing snapshots means serializing an existing snapshot object to or from a stream/bit buffer. `Snapshot::write_native()` / `read_native()` and `DeltaSnapshot::write_native()` / `read_native()` serialize the native in-memory snapshot binary format; `write()` / `read()` remain compatibility wrappers. That native format is useful for local transient I/O but is not a durable or portable disk format.
+
+Persistent snapshots are separate disk frames written with `write_persistent_snapshot()` and `write_persistent_delta_snapshot()`. Persistent frames identify components by unique non-empty component names, dedupe those names in a per-frame name table, store the frame length in bits before the frame body for skipping, and use `SnapshotComponentTraits<T>`/`SnapshotPersistenceCodecs` to quantize and serialize present component values through `ecs::BitBuffer`. Component removals and destroyed-entity tombstones are encoded by the snapshot system, not by component codecs. Persistent reads require a schema registry with matching component names and registered codecs, then return normal snapshot objects for `Registry::restore_snapshot()` or `Registry::restore_delta_snapshot()`.
+
+Registered job callbacks are not part of snapshots. Internal bookkeeping entities are tagged with `Registry::system_tag()` and excluded from snapshot payloads.
 
 View callbacks mark non-const listed components dirty before passing mutable references. Structurally mutating viewed component storage during `each()` is unsupported.
 
@@ -394,5 +409,17 @@ Destroying a component entity unregisters that component, clears its typed cache
 ## Build
 
 ```bash
-./test.sh
+cmake -S . -B build -DECS_BUILD_TESTING=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Build benchmarks explicitly when collecting performance data:
+
+```bash
+cmake -S . -B build-bench \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DECS_BUILD_TESTING=ON \
+  -DECS_BUILD_BENCHMARKS=ON
+cmake --build build-bench --target basic_operations_benchmark
 ```
