@@ -242,6 +242,16 @@ struct HasRegistryRemove<
     std::void_t<decltype(std::declval<Registry&>().template remove<T>(std::declval<ecs::Entity>()))>>
     : std::true_type {};
 
+template <typename Registry, typename Components, typename = void>
+struct HasRegistryView : std::false_type {};
+
+template <typename Registry, typename... Components>
+struct HasRegistryView<
+    Registry,
+    std::tuple<Components...>,
+    std::void_t<decltype(std::declval<Registry&>().template view<Components...>())>>
+    : std::true_type {};
+
 template <typename View, typename T, typename = void>
 struct HasViewSingletonGet : std::false_type {};
 

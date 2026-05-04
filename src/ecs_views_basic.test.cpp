@@ -68,6 +68,8 @@ TEST_CASE("tag filter constness controls view-level tag mutation") {
     using MutableWithoutView =
         decltype(std::declval<ecs::Registry::View<Position>&>().template without_tags<Disabled>());
 
+    static_assert(HasRegistryView<ecs::Registry, std::tuple<Position>>::value, "components can be view drivers");
+    static_assert(!HasRegistryView<ecs::Registry, std::tuple<Active>>::value, "tags cannot be view drivers");
     static_assert(HasViewTagAdd<MutableView, Active>::value, "non-const with tag can be added");
     static_assert(HasViewTagRemove<MutableView, Active>::value, "non-const with tag can be removed");
     static_assert(!HasViewTagAdd<ConstView, Active>::value, "const with tag cannot be added");

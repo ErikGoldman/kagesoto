@@ -109,6 +109,19 @@ struct unique_components<First, Rest...>
           bool,
           !contains_component<First, Rest...>::value && unique_components<Rest...>::value> {};
 
+template <typename... Components>
+struct contains_tag_query;
+
+template <>
+struct contains_tag_query<> : std::false_type {};
+
+template <typename First, typename... Rest>
+struct contains_tag_query<First, Rest...>
+    : std::conditional<
+          is_tag_query<First>::value,
+          std::true_type,
+          contains_tag_query<Rest...>>::type {};
+
 template <typename T, typename... Components>
 struct contains_mutable_component;
 
@@ -872,7 +885,7 @@ public:
     }
 
     template <typename... Components>
-    View<Components...> view();
+    typename std::enable_if<!detail::contains_tag_query<Components...>::value, View<Components...>>::type view();
 
     template <typename... Components>
     JobView<Components...> job(int order);
@@ -1837,6 +1850,7 @@ template <typename... Components>
 class Registry::View {
     static_assert(sizeof...(Components) > 0, "ecs views require at least one component");
     static_assert(detail::unique_components<Components...>::value, "ecs views cannot repeat component types");
+    static_assert(!detail::contains_tag_query<Components...>::value, "ecs tags must be view filters");
 
 public:
     explicit View(Registry& registry)
@@ -2012,7 +2026,8 @@ public:
     template <typename... ViewComponents>
     typename std::enable_if<
         detail::requested_components_allowed<detail::type_list<Components...>>::template with<ViewComponents...>::
-            value,
+            value &&
+            !detail::contains_tag_query<ViewComponents...>::value,
         View<ViewComponents...>>::type
     view() const {
         return View<ViewComponents...>(*registry_);
@@ -2445,7 +2460,8 @@ public:
     template <typename... ViewComponents>
     typename std::enable_if<
         detail::requested_components_allowed<detail::type_list<IterComponents..., AccessComponents...>>::
-            template with<ViewComponents...>::value,
+            template with<ViewComponents...>::value &&
+            !detail::contains_tag_query<ViewComponents...>::value,
         View<ViewComponents...>>::type
     view() const {
         return View<ViewComponents...>(*registry_);
@@ -3152,7 +3168,8 @@ public:
     template <typename... ViewComponents>
     typename std::enable_if<
         detail::requested_components_allowed<detail::type_list<IterComponents..., AccessComponents...>>::
-            template with<ViewComponents...>::value,
+            template with<ViewComponents...>::value &&
+            !detail::contains_tag_query<ViewComponents...>::value,
         decltype(std::declval<View<ViewComponents...>>()
                      .template with_tags<WithTags...>()
                      .template without_tags<WithoutTags...>())>::type
@@ -4355,7 +4372,7 @@ private:
 };
 
 template <typename... Components>
-Registry::View<Components...> Registry::view() {
+typename std::enable_if<!detail::contains_tag_query<Components...>::value, Registry::View<Components...>>::type Registry::view() {
     require_runtime_registry_access_allowed("view");
     return View<Components...>(*this);
 }
