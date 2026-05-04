@@ -51,7 +51,7 @@ set(ecs_test_sources
     src/ecs_views_iteration.test.cpp
 )
 
-add_library(ecs)
+add_library(ecs STATIC)
 
 target_sources(ecs
     PRIVATE
@@ -69,18 +69,7 @@ target_include_directories(ecs
         $<INSTALL_INTERFACE:include>
 )
 
-target_compile_definitions(ecs
-    PRIVATE
-        ECS_BUILDING_LIBRARY
-)
-
-if(NOT BUILD_SHARED_LIBS)
-    target_compile_definitions(ecs PUBLIC ECS_STATIC)
-endif()
-
 set_target_properties(ecs PROPERTIES
-    CXX_VISIBILITY_PRESET hidden
-    VISIBILITY_INLINES_HIDDEN YES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
