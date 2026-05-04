@@ -585,6 +585,11 @@ static PersistentComponentSelection select_persistent_components(
         if (record.name.empty()) {
             throw std::logic_error("persistent snapshot components require non-empty names");
         }
+        selection.storage_indices.push_back(storage.first);
+    }
+    std::sort(selection.storage_indices.begin(), selection.storage_indices.end());
+    for (std::uint32_t component_index : selection.storage_indices) {
+        const Registry::ComponentRecord& record = components.at(component_index);
         const auto inserted = selection.name_indices.emplace(
             record.name,
             static_cast<std::uint32_t>(selection.names.size()));
@@ -592,9 +597,7 @@ static PersistentComponentSelection select_persistent_components(
             throw std::logic_error("persistent snapshot component names must be unique");
         }
         selection.names.push_back(record.name);
-        selection.storage_indices.push_back(storage.first);
     }
-    std::sort(selection.storage_indices.begin(), selection.storage_indices.end());
     return selection;
 }
 
