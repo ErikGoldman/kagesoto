@@ -59,8 +59,7 @@ TEST_CASE("run jobs can exclude jobs by job entity tag") {
 
     const ecs::Entity disabled = registry.component<Disabled>();
     ecs::RunJobsOptions options;
-    options.excluded_job_tags = &disabled;
-    options.excluded_job_tag_count = 1;
+    options.excluded_job_tags = {disabled};
     registry.run_jobs(options);
     REQUIRE(calls == 0);
 
@@ -84,8 +83,7 @@ TEST_CASE("run jobs for entities can exclude jobs by job entity tag") {
 
     const ecs::Entity disabled = registry.component<Disabled>();
     ecs::RunJobsOptions options;
-    options.excluded_job_tags = &disabled;
-    options.excluded_job_tag_count = 1;
+    options.excluded_job_tags = {disabled};
     registry.run_jobs_for_entities({entity}, options);
     REQUIRE(calls == 0);
 

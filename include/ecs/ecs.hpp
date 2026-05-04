@@ -273,8 +273,7 @@ struct JobSchedule {
 
 struct RunJobsOptions {
     bool force_single_threaded = false;
-    const Entity* excluded_job_tags = nullptr;
-    std::size_t excluded_job_tag_count = 0;
+    std::vector<Entity> excluded_job_tags;
 };
 
 struct SnapshotIoOptions {
@@ -2169,12 +2168,9 @@ private:
         std::size_t end);
     void merge_deferred_dirty_writes(const TypeErasedStorage::DeferredDirtyWrites& writes);
 
-    bool job_excluded_by_options(const JobRecord& job, RunJobsOptions options) const {
-        if (options.excluded_job_tags == nullptr) {
-            return false;
-        }
-        for (std::size_t i = 0; i < options.excluded_job_tag_count; ++i) {
-            if (options.excluded_job_tags[i] && has(job.entity, options.excluded_job_tags[i])) {
+    bool job_excluded_by_options(const JobRecord& job, const RunJobsOptions& options) const {
+        for (Entity tag : options.excluded_job_tags) {
+            if (tag && has(job.entity, tag)) {
                 return true;
             }
         }
