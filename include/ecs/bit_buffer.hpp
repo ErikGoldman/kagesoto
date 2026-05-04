@@ -49,6 +49,7 @@ public:
         bytes_ = std::move(bytes);
         bit_size_ = bit_size;
         read_bit_ = 0;
+        clear_unused_tail_bits();
     }
 
     void reserve_bytes(std::size_t capacity) {
@@ -73,6 +74,8 @@ public:
         }
         if (value) {
             bytes_[bit_size_ / 8U] |= static_cast<std::uint8_t>(1U << (bit_size_ % 8U));
+        } else {
+            bytes_[bit_size_ / 8U] &= static_cast<std::uint8_t>(~(1U << (bit_size_ % 8U)));
         }
         ++bit_size_;
     }
@@ -324,6 +327,16 @@ private:
         if (num_bits > remaining_bits()) {
             throw std::out_of_range("bit buffer read past end");
         }
+    }
+
+    void clear_unused_tail_bits() noexcept {
+        const std::size_t used_bits = bit_size_ % 8U;
+        if (used_bits == 0U || bytes_.empty()) {
+            return;
+        }
+
+        const auto mask = static_cast<std::uint8_t>((1U << used_bits) - 1U);
+        bytes_.back() &= mask;
     }
 
     std::vector<std::uint8_t> bytes_;

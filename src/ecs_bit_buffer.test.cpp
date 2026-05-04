@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 TEST_CASE("bit buffer pushes and reads bits bytes and bools") {
     ecs::BitBuffer buffer;
@@ -35,6 +36,30 @@ TEST_CASE("bit buffer preserves exact non byte aligned frame lengths") {
     REQUIRE(loaded.read_bits(3U) == 0b101);
     REQUIRE(loaded.read_unsigned_bits(32U) == 0xcafebabeU);
     REQUIRE(loaded.remaining_bits() == 0U);
+}
+
+TEST_CASE("bit buffer clears stale trailing bits after assigning non byte aligned payloads") {
+    ecs::BitBuffer buffer;
+    buffer.assign_bytes(std::vector<std::uint8_t>{0xFEU}, 1U);
+
+    buffer.push_bool(false);
+
+    REQUIRE(buffer.bit_size() == 2U);
+    REQUIRE(buffer.read_bool() == false);
+    REQUIRE(buffer.read_bool() == false);
+}
+
+TEST_CASE("bit buffer copies only logical bits from non byte aligned source buffers") {
+    ecs::BitBuffer source;
+    source.assign_bytes(std::vector<std::uint8_t>{0xFEU}, 1U);
+
+    ecs::BitBuffer copied;
+    copied.push_buffer_bits(source);
+    copied.push_bool(false);
+
+    REQUIRE(copied.bit_size() == 2U);
+    REQUIRE(copied.read_bool() == false);
+    REQUIRE(copied.read_bool() == false);
 }
 
 TEST_CASE("bit buffer validates invalid reads writes and assignment") {
