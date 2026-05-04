@@ -23,25 +23,33 @@ option(ECS_BUILD_EXAMPLE "Build the example executable" ${ecs_is_top_level})
 option(ECS_BUILD_TESTING "Build ECS tests" ${ecs_build_testing_default})
 option(ECS_BUILD_BENCHMARKS "Build Google Benchmark suites" OFF)
 
-file(GLOB_RECURSE ecs_public_headers CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hh"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hxx"
+set(ecs_public_headers
+    include/ecs/bit_buffer.hpp
+    include/ecs/ecs.hpp
 )
 
-file(GLOB_RECURSE ecs_all_src CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cxx"
+set(ecs_sources
+    src/ecs.cpp
+    src/groups.cpp
+    src/jobs.cpp
+    src/snapshot.cpp
+    src/storage.cpp
 )
 
-set(ecs_test_sources ${ecs_all_src})
-list(FILTER ecs_test_sources INCLUDE REGEX [[\.test\.(c|cc|cpp|cxx)$]])
-
-set(ecs_sources ${ecs_all_src})
-list(FILTER ecs_sources EXCLUDE REGEX [[\.test\.(c|cc|cpp|cxx)$]])
+set(ecs_test_sources
+    src/ecs_bit_buffer.test.cpp
+    src/ecs_groups.test.cpp
+    src/ecs_job_callbacks.test.cpp
+    src/ecs_job_graph.test.cpp
+    src/ecs_job_threading.test.cpp
+    src/ecs_jobs_basic.test.cpp
+    src/ecs_metadata.test.cpp
+    src/ecs_registry.test.cpp
+    src/ecs_snapshot.test.cpp
+    src/ecs_storage.test.cpp
+    src/ecs_views_basic.test.cpp
+    src/ecs_views_iteration.test.cpp
+)
 
 add_library(ecs)
 
