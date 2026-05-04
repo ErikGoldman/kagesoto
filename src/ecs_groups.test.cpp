@@ -48,6 +48,39 @@ TEST_CASE("declared owned groups are used by matching views and track membership
     REQUIRE(std::find(after_changes.begin(), after_changes.end(), both_b) != after_changes.end());
 }
 
+TEST_CASE("owned groups declared before storage start empty and accept later matches") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    registry.declare_owned_group<Position, Velocity>();
+
+    int before_storage = 0;
+    registry.view<Position, Velocity>().each([&](ecs::Entity, Position&, Velocity&) {
+        ++before_storage;
+    });
+    REQUIRE(before_storage == 0);
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{4, 5}) != nullptr);
+
+    int position_only = 0;
+    registry.view<Position, Velocity>().each([&](ecs::Entity, Position&, Velocity&) {
+        ++position_only;
+    });
+    REQUIRE(position_only == 0);
+
+    REQUIRE(registry.add<Velocity>(entity, Velocity{6.0f, 7.0f}) != nullptr);
+
+    std::vector<ecs::Entity> after_match;
+    registry.view<Position, Velocity>().each([&](ecs::Entity visited, Position& position, Velocity& velocity) {
+        after_match.push_back(visited);
+        REQUIRE(position.x == 4);
+        REQUIRE(velocity.dx == 6.0f);
+    });
+    REQUIRE(after_match == std::vector<ecs::Entity>{entity});
+}
+
 TEST_CASE("owned group view iteration tolerates later entities gaining components") {
     ecs::Registry registry;
     registry.register_component<Position>("Position");
@@ -189,6 +222,61 @@ TEST_CASE("owned group declarations allow identical groups but reject shared own
     conflict.register_component<Health>("Health");
     conflict.declare_owned_group<Position, Velocity>();
     REQUIRE_THROWS_AS((conflict.declare_owned_group<Position, Health>()), std::logic_error);
+}
+
+TEST_CASE("destroying a component entity removes owned groups that include it") {
+    ecs::Registry registry;
+    const ecs::Entity position_component = registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 2}) != nullptr);
+    REQUIRE(registry.add<Velocity>(entity, Velocity{3.0f, 4.0f}) != nullptr);
+
+    registry.declare_owned_group<Position, Velocity>();
+    REQUIRE(registry.destroy(position_component));
+
+    REQUIRE(registry.component_info(position_component) == nullptr);
+    registry.declare_owned_group<Velocity>();
+
+    std::vector<ecs::Entity> velocity_group;
+    registry.view<Velocity>().each([&](ecs::Entity visited, Velocity&) {
+        velocity_group.push_back(visited);
+    });
+    REQUIRE(velocity_group == std::vector<ecs::Entity>{entity});
+}
+
+TEST_CASE("owned groups are rebuilt after registry snapshot restore") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Velocity>("Velocity");
+
+    const ecs::Entity kept = registry.create();
+    const ecs::Entity later_removed = registry.create();
+    REQUIRE(registry.add<Position>(kept, Position{1, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(kept, Velocity{1.0f, 0.0f}) != nullptr);
+    REQUIRE(registry.add<Position>(later_removed, Position{2, 0}) != nullptr);
+    REQUIRE(registry.add<Velocity>(later_removed, Velocity{2.0f, 0.0f}) != nullptr);
+
+    registry.declare_owned_group<Position, Velocity>();
+    auto snapshot = registry.create_snapshot();
+
+    REQUIRE(registry.remove<Velocity>(kept));
+    REQUIRE(registry.destroy(later_removed));
+
+    registry.restore_snapshot(snapshot);
+
+    std::vector<ecs::Entity> grouped;
+    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position& position, Velocity& velocity) {
+        grouped.push_back(entity);
+        velocity.dx = static_cast<float>(position.x + 10);
+    });
+
+    REQUIRE(grouped.size() == 2);
+    REQUIRE(std::find(grouped.begin(), grouped.end(), kept) != grouped.end());
+    REQUIRE(std::find(grouped.begin(), grouped.end(), later_removed) != grouped.end());
+    REQUIRE(registry.get<Velocity>(kept).dx == 11.0f);
+    REQUIRE(registry.get<Velocity>(later_removed).dx == 12.0f);
 }
 
 TEST_CASE("owned groups preserve non-trivial components while packing") {

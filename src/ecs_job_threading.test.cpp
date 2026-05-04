@@ -260,6 +260,71 @@ TEST_CASE("force single threaded run ignores executor chunking") {
     REQUIRE(executor_calls == 0);
 }
 
+TEST_CASE("threaded job executor must run every task before returning") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    for (int i = 0; i < 4; ++i) {
+        const ecs::Entity entity = registry.create();
+        REQUIRE(registry.add<Position>(entity, Position{i, 0}) != nullptr);
+    }
+
+    registry.job<Position>(0)
+        .max_threads(4)
+        .min_entities_per_thread(1)
+        .each([](ecs::Entity, Position& position) {
+            position.x += 1;
+        });
+    registry.set_job_thread_executor([](const std::vector<ecs::JobThreadTask>&) {});
+
+    REQUIRE_THROWS_AS(registry.run_jobs(), std::logic_error);
+}
+
+TEST_CASE("threaded job executor cannot run a task after returning") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    for (int i = 0; i < 2; ++i) {
+        const ecs::Entity entity = registry.create();
+        REQUIRE(registry.add<Position>(entity, Position{i, 0}) != nullptr);
+    }
+
+    std::vector<ecs::JobThreadTask> captured;
+    registry.job<Position>(0)
+        .max_threads(2)
+        .min_entities_per_thread(1)
+        .each([](ecs::Entity, Position&) {});
+    registry.set_job_thread_executor([&](const std::vector<ecs::JobThreadTask>& tasks) {
+        captured = tasks;
+    });
+
+    REQUIRE_THROWS_AS(registry.run_jobs(), std::logic_error);
+    REQUIRE_FALSE(captured.empty());
+    REQUIRE_THROWS_AS(captured.front().run(), std::logic_error);
+}
+
+TEST_CASE("threaded job exceptions are rethrown after task completion") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
+
+    registry.job<Position>(0)
+        .max_threads(2)
+        .min_entities_per_thread(1)
+        .each([](ecs::Entity, Position&) {
+            throw std::runtime_error("job failed");
+        });
+    registry.set_job_thread_executor([](const std::vector<ecs::JobThreadTask>& tasks) {
+        for (const ecs::JobThreadTask& task : tasks) {
+            task.run();
+        }
+    });
+
+    REQUIRE_THROWS_AS(registry.run_jobs(), std::runtime_error);
+}
+
 TEST_CASE("structural jobs expose declared add and remove operations and stay single threaded") {
     ecs::Registry registry;
     registry.register_component<Position>("Position");

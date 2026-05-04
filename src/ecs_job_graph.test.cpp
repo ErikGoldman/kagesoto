@@ -60,6 +60,61 @@ TEST_CASE("compiled job graphs can run only target entities") {
     REQUIRE(registry.get<Position>(second_entity).x == 1);
 }
 
+TEST_CASE("compiled job graphs ignore empty stale and duplicate target entities") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ecs::Entity alive = registry.create();
+    const ecs::Entity stale = registry.create();
+    REQUIRE(registry.add<Position>(alive, Position{0, 0}) != nullptr);
+    REQUIRE(registry.add<Position>(stale, Position{0, 0}) != nullptr);
+    REQUIRE(registry.destroy(stale));
+
+    int calls = 0;
+    const ecs::Entity job = registry.job<Position>(0).each([&](ecs::Entity entity, Position& position) {
+        REQUIRE(entity == alive);
+        ++calls;
+        position.x += 1;
+    });
+
+    ecs::JobGraph graph = registry.compile_job_graph({job});
+    graph.tick_for_entities(registry, {});
+    graph.tick_for_entities(registry, {stale});
+    graph.tick_for_entities(registry, {alive, alive, stale});
+
+    REQUIRE(calls == 1);
+    REQUIRE(registry.get<Position>(alive).x == 1);
+}
+
+TEST_CASE("compiled job graphs honor excluded job tags for targeted runs") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    registry.register_component<Disabled>("Disabled");
+
+    const ecs::Entity entity = registry.create();
+    REQUIRE(registry.add<Position>(entity, Position{0, 0}) != nullptr);
+
+    int first_calls = 0;
+    int second_calls = 0;
+    const ecs::Entity first = registry.job<Position>(0).each([&](ecs::Entity, Position& position) {
+        ++first_calls;
+        position.x += 1;
+    });
+    const ecs::Entity second = registry.job<Position>(1).each([&](ecs::Entity, Position& position) {
+        ++second_calls;
+        position.x += 10;
+    });
+    REQUIRE(registry.add<Disabled>(second));
+
+    ecs::RunJobsOptions options;
+    options.excluded_job_tags = {registry.component<Disabled>()};
+    registry.compile_job_graph({first, second}).tick_for_entities(registry, {entity}, options);
+
+    REQUIRE(first_calls == 1);
+    REQUIRE(second_calls == 0);
+    REQUIRE(registry.get<Position>(entity).x == 1);
+}
+
 TEST_CASE("orchestrator returns no stages when no jobs are registered") {
     ecs::Registry registry;
 

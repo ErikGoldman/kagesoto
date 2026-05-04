@@ -88,6 +88,66 @@ TEST_CASE("runtime components use component entities and the shared write path")
     REQUIRE(registry.get(entity, velocity_component) == nullptr);
 }
 
+TEST_CASE("runtime component APIs reject tag/component mixups and invalid entities") {
+    ecs::Registry registry;
+
+    ecs::ComponentDesc desc;
+    desc.name = "Velocity";
+    desc.size = sizeof(Velocity);
+    desc.alignment = alignof(Velocity);
+    const ecs::Entity velocity_component = registry.register_component(std::move(desc));
+    const ecs::Entity visible = registry.register_tag("Visible");
+    const ecs::Entity entity = registry.create();
+    const ecs::Entity invalid{};
+    const Velocity value{1.0f, 2.0f};
+
+    REQUIRE_THROWS_AS(registry.add(entity, visible, nullptr), std::logic_error);
+    REQUIRE_THROWS_AS(registry.ensure(entity, visible), std::logic_error);
+    REQUIRE_THROWS_AS(registry.write(entity, visible), std::logic_error);
+    REQUIRE_THROWS_AS(registry.get(entity, visible), std::logic_error);
+    REQUIRE_THROWS_AS(registry.has(entity, velocity_component), std::logic_error);
+    REQUIRE_THROWS_AS(registry.add_tag(entity, velocity_component), std::logic_error);
+
+    REQUIRE(registry.add(invalid, velocity_component, &value) == nullptr);
+    REQUIRE(registry.ensure(invalid, velocity_component) == nullptr);
+    REQUIRE(registry.write(invalid, velocity_component) == nullptr);
+    REQUIRE(registry.get(invalid, velocity_component) == nullptr);
+    REQUIRE_FALSE(registry.clear_dirty(invalid, velocity_component));
+    REQUIRE_FALSE(registry.is_dirty(invalid, velocity_component));
+    REQUIRE_FALSE(registry.add_tag(invalid, visible));
+    REQUIRE_FALSE(registry.has(invalid, visible));
+    REQUIRE_FALSE(registry.remove_tag(invalid, visible));
+}
+
+TEST_CASE("runtime component add replaces existing values and zero-initializes null payloads") {
+    ecs::Registry registry;
+
+    ecs::ComponentDesc desc;
+    desc.name = "Velocity";
+    desc.size = sizeof(Velocity);
+    desc.alignment = alignof(Velocity);
+    const ecs::Entity velocity_component = registry.register_component(std::move(desc));
+
+    const ecs::Entity entity = registry.create();
+    Velocity first{1.0f, 2.0f};
+    Velocity second{3.0f, 4.0f};
+
+    void* added = registry.add(entity, velocity_component, &first);
+    REQUIRE(added != nullptr);
+    REQUIRE(registry.clear_dirty(entity, velocity_component));
+
+    void* replaced = registry.add(entity, velocity_component, &second);
+    REQUIRE(replaced == added);
+    REQUIRE(static_cast<const Velocity*>(registry.get(entity, velocity_component))->dx == 3.0f);
+    REQUIRE(static_cast<const Velocity*>(registry.get(entity, velocity_component))->dy == 4.0f);
+    REQUIRE(registry.is_dirty(entity, velocity_component));
+
+    void* zeroed = registry.add(entity, velocity_component, nullptr);
+    REQUIRE(zeroed == added);
+    REQUIRE(static_cast<const Velocity*>(registry.get(entity, velocity_component))->dx == 0.0f);
+    REQUIRE(static_cast<const Velocity*>(registry.get(entity, velocity_component))->dy == 0.0f);
+}
+
 TEST_CASE("runtime ensure creates zeroed components and returns existing storage") {
     ecs::Registry registry;
 
@@ -143,6 +203,28 @@ TEST_CASE("runtime byte add rejects non-trivial typed components") {
     Tracker value{counts, 1};
 
     REQUIRE_THROWS_AS(registry.add(entity, tracker_component, &value), std::logic_error);
+}
+
+TEST_CASE("runtime tag dirty state follows add remove and clear operations") {
+    ecs::Registry registry;
+    const ecs::Entity visible = registry.register_tag("Visible");
+    const ecs::Entity entity = registry.create();
+
+    REQUIRE(registry.add_tag(entity, visible));
+    REQUIRE(registry.has(entity, visible));
+    REQUIRE(registry.is_dirty(entity, visible));
+    REQUIRE(registry.clear_dirty(entity, visible));
+    REQUIRE_FALSE(registry.is_dirty(entity, visible));
+
+    REQUIRE(registry.add_tag(entity, visible));
+    REQUIRE(registry.is_dirty(entity, visible));
+    REQUIRE(registry.clear_dirty(entity, visible));
+
+    REQUIRE(registry.remove_tag(entity, visible));
+    REQUIRE_FALSE(registry.has(entity, visible));
+    REQUIRE(registry.is_dirty(entity, visible));
+    REQUIRE(registry.clear_dirty(entity, visible));
+    REQUIRE_FALSE(registry.is_dirty(entity, visible));
 }
 
 TEST_CASE("dirty bits move with components in dense storage") {
@@ -285,4 +367,33 @@ TEST_CASE("moved registries retain entities components metadata singletons and d
     REQUIRE(fields != nullptr);
     REQUIRE(fields->size() == 1);
     REQUIRE((*fields)[0].name == "x");
+}
+
+TEST_CASE("move-assigned registries retain dirty tombstones and tag storage") {
+    ecs::Registry source;
+    source.register_component<Position>("Position");
+    source.register_component<Active>("Active");
+
+    const ecs::Entity removed = source.create();
+    const ecs::Entity tagged = source.create();
+    REQUIRE(source.add<Position>(removed, Position{1, 2}) != nullptr);
+    REQUIRE(source.add<Active>(tagged));
+    source.clear_all_dirty<Position>();
+    source.clear_all_dirty<Active>();
+
+    REQUIRE(source.remove<Position>(removed));
+    REQUIRE(source.add<Active>(removed));
+
+    ecs::Registry destination;
+    destination.register_component<Velocity>("Velocity");
+    destination = std::move(source);
+
+    REQUIRE(destination.is_dirty<Position>(removed));
+    REQUIRE(destination.clear_dirty<Position>(removed));
+    REQUIRE_FALSE(destination.is_dirty<Position>(removed));
+    REQUIRE(destination.has<Active>(tagged));
+    REQUIRE(destination.has<Active>(removed));
+    REQUIRE(destination.is_dirty<Active>(removed));
+    REQUIRE_FALSE(destination.is_dirty<Active>(tagged));
+    REQUIRE_THROWS_AS(destination.component<Velocity>(), std::logic_error);
 }

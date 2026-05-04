@@ -499,6 +499,36 @@ TEST_CASE("registry in-memory snapshot native format read rejects invalid header
     REQUIRE_THROWS_AS(ecs::Registry::Snapshot::read(stream), std::runtime_error);
 }
 
+TEST_CASE("registry in-memory delta and native snapshot reads reject invalid headers") {
+    std::stringstream delta_stream(std::ios::in | std::ios::out | std::ios::binary);
+    delta_stream.write("bad", 3);
+    REQUIRE_THROWS_AS(ecs::Registry::DeltaSnapshot::read(delta_stream), std::runtime_error);
+
+    std::stringstream native_stream(std::ios::in | std::ios::out | std::ios::binary);
+    native_stream.write("bad", 3);
+    REQUIRE_THROWS_AS(ecs::Registry::Snapshot::read_native(native_stream), std::runtime_error);
+
+    std::stringstream native_delta_stream(std::ios::in | std::ios::out | std::ios::binary);
+    native_delta_stream.write("bad", 3);
+    REQUIRE_THROWS_AS(ecs::Registry::DeltaSnapshot::read_native(native_delta_stream), std::runtime_error);
+}
+
+TEST_CASE("registry in-memory snapshot reads reject truncated payloads") {
+    ecs::Registry source;
+    source.register_component<Position>("Position");
+    const ecs::Entity entity = source.create();
+    REQUIRE(source.add<Position>(entity, Position{1, 2}) != nullptr);
+
+    std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
+    source.create_snapshot().write(stream);
+    std::string bytes = stream.str();
+    REQUIRE(bytes.size() > 8U);
+    bytes.resize(bytes.size() - 3U);
+
+    std::stringstream truncated(bytes, std::ios::in | std::ios::out | std::ios::binary);
+    REQUIRE_THROWS_AS(ecs::Registry::Snapshot::read(truncated), std::runtime_error);
+}
+
 TEST_CASE("persistent full snapshots use component codecs and restore through schema names") {
     ecs::SnapshotPersistenceCodecs codecs;
     ecs::Registry source;
@@ -699,6 +729,26 @@ TEST_CASE("persistent snapshot read rejects unread codec payload bits") {
     reader_codecs.register_component<Position, UnreadPositionTraits>(schema, "Position");
 
     REQUIRE_THROWS_AS(ecs::read_persistent_snapshot(stream, schema, reader_codecs), std::runtime_error);
+}
+
+TEST_CASE("persistent snapshot reads reject truncated frames") {
+    ecs::SnapshotPersistenceCodecs codecs;
+    ecs::Registry source;
+    codecs.register_component<Position, CountingPositionTraits>(source, "Position");
+
+    const ecs::Entity entity = source.create();
+    REQUIRE(source.add<Position>(entity, Position{3, 4}) != nullptr);
+
+    std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
+    ecs::write_persistent_snapshot(stream, source.create_snapshot(), codecs);
+    std::string bytes = stream.str();
+    REQUIRE(bytes.size() > 8U);
+    bytes.pop_back();
+
+    ecs::Registry schema;
+    codecs.register_component<Position, CountingPositionTraits>(schema, "Position");
+    std::stringstream truncated(bytes, std::ios::in | std::ios::out | std::ios::binary);
+    REQUIRE_THROWS_AS(ecs::read_persistent_snapshot(truncated, schema, codecs), std::runtime_error);
 }
 
 TEST_CASE("delta snapshots restore dirty values additions removals and destroyed entities") {
