@@ -373,6 +373,7 @@ void Registry::TypeErasedStorage::swap_dense(std::uint32_t lhs, std::uint32_t rh
             std::memcpy(lhs_value, rhs_value, info_.size);
             std::memcpy(rhs_value, temp, info_.size);
         } else {
+            assert(lifecycle_.nothrow_move_constructible);
             unsigned char* temp = allocate(1, info_);
             try {
                 lifecycle_.move_construct(temp, lhs_value);
@@ -545,6 +546,7 @@ void Registry::TypeErasedStorage::ensure_capacity(std::size_t required) {
             std::memcpy(next, data_, info_.size * size_);
         }
     } else {
+        assert(lifecycle_.nothrow_move_constructible);
         std::size_t constructed = 0;
         try {
             for (; constructed < size_; ++constructed) {
@@ -584,6 +586,7 @@ void Registry::TypeErasedStorage::erase_at(std::uint32_t dense) {
             if (info_.trivially_copyable) {
                 std::memcpy(target, last, info_.size);
             } else {
+                assert(lifecycle_.nothrow_move_constructible);
                 lifecycle_.destroy(target);
                 lifecycle_.move_construct(target, last);
                 lifecycle_.destroy(last);

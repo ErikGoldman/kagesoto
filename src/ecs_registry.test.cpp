@@ -2,6 +2,25 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+namespace {
+
+struct ThrowingMoveComponent {
+    int value = 0;
+
+    ThrowingMoveComponent() = default;
+    ThrowingMoveComponent(const ThrowingMoveComponent&) = default;
+    ThrowingMoveComponent& operator=(const ThrowingMoveComponent&) = default;
+
+    ThrowingMoveComponent(ThrowingMoveComponent&& other) noexcept(false)
+        : value(other.value) {}
+    ThrowingMoveComponent& operator=(ThrowingMoveComponent&& other) noexcept(false) {
+        value = other.value;
+        return *this;
+    }
+};
+
+}  // namespace
+
 TEST_CASE("entities are created, destroyed, and recycled with versions") {
     ecs::Registry registry;
 
@@ -97,6 +116,10 @@ TEST_CASE("typed components require explicit registration") {
 }
 
 TEST_CASE("component registration validates descriptors and duplicate names") {
+    static_assert(!std::is_trivially_copyable<ThrowingMoveComponent>::value);
+    static_assert(!std::is_nothrow_move_constructible<ThrowingMoveComponent>::value);
+    static_assert(std::is_nothrow_move_constructible<Tracker>::value);
+
     ecs::Registry registry;
 
     ecs::ComponentDesc zero_size;

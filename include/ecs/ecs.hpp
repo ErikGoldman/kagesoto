@@ -528,6 +528,9 @@ public:
         static_assert(
             !is_singleton_component<T>::value || std::is_default_constructible<T>::value,
             "ecs singleton components must be default constructible");
+        static_assert(
+            std::is_trivially_copyable<T>::value || std::is_nothrow_move_constructible<T>::value,
+            "ecs non-trivially-copyable components must be nothrow move constructible");
 
         const std::size_t id = type_id<T>();
         if (id < component_catalog_.typed_components.size() && component_catalog_.typed_components[id]) {
@@ -545,6 +548,7 @@ public:
 
         ComponentLifecycle lifecycle;
         lifecycle.trivially_copyable = std::is_trivially_copyable<T>::value;
+        lifecycle.nothrow_move_constructible = std::is_nothrow_move_constructible<T>::value;
         if constexpr (std::is_copy_constructible<T>::value) {
             lifecycle.copy_construct = &copy_construct<T>;
         }
@@ -936,6 +940,7 @@ private:
         using Destroy = void (*)(void*);
 
         bool trivially_copyable = true;
+        bool nothrow_move_constructible = true;
         CopyConstruct copy_construct = nullptr;
         MoveConstruct move_construct = nullptr;
         Destroy destroy = nullptr;
