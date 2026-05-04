@@ -1400,9 +1400,6 @@ private:
         std::uint64_t sequence = 0;
         std::vector<std::uint32_t> reads;
         std::vector<std::uint32_t> writes;
-        std::uint64_t read_mask = 0;
-        std::uint64_t write_mask = 0;
-        bool access_masks_complete = true;
         std::function<void(Registry&)> run;
         std::function<std::vector<std::uint32_t>(Registry&)> collect_indices;
         std::function<void(Registry&, const std::vector<std::uint32_t>&, std::size_t, std::size_t)> run_range;
@@ -1416,26 +1413,11 @@ private:
     struct JobAccessMetadata {
         std::vector<std::uint32_t> reads;
         std::vector<std::uint32_t> writes;
-        std::uint64_t read_mask = 0;
-        std::uint64_t write_mask = 0;
-        bool masks_complete = true;
     };
 
     static void canonicalize_components(std::vector<std::uint32_t>& components) {
         std::sort(components.begin(), components.end());
         components.erase(std::unique(components.begin(), components.end()), components.end());
-    }
-
-    static std::uint64_t make_component_mask(const std::vector<std::uint32_t>& components, bool& complete) {
-        std::uint64_t mask = 0;
-        for (std::uint32_t component : components) {
-            if (component >= 64) {
-                complete = false;
-                continue;
-            }
-            mask |= std::uint64_t{1} << component;
-        }
-        return mask;
     }
 
     static void canonicalize_job_metadata(JobAccessMetadata& metadata) {
@@ -1450,9 +1432,6 @@ private:
             metadata.writes.end(),
             std::back_inserter(reads));
         metadata.reads = std::move(reads);
-        metadata.masks_complete = true;
-        metadata.read_mask = make_component_mask(metadata.reads, metadata.masks_complete);
-        metadata.write_mask = make_component_mask(metadata.writes, metadata.masks_complete);
     }
 
     static void append_unique_component(std::vector<std::uint32_t>& components, std::uint32_t component) {
@@ -1546,9 +1525,6 @@ private:
             job_registry_.next_sequence++,
             std::move(metadata.reads),
             std::move(metadata.writes),
-            metadata.read_mask,
-            metadata.write_mask,
-            metadata.masks_complete,
             std::move(run),
             std::move(collect_indices),
             std::move(run_range),
