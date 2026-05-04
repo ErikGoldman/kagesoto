@@ -1,7 +1,7 @@
 # ECS
 
 [![Tests](https://github.com/ErikGoldman/kagesoto/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ErikGoldman/kagesoto/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/ErikGoldman/kagesoto/badges/coverage.json)](https://github.com/ErikGoldman/kagesoto/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Ferikgoldman.github.io%2Fkagesoto%2Fcoverage.json)](https://github.com/ErikGoldman/kagesoto/actions/workflows/ci.yml)
 
 A small C++17 sparse-set ECS.
 

@@ -14,40 +14,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: Build and test
+  test-and-coverage:
+    name: Test and coverage
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Configure
-        run: >
-          cmake -S . -B build
-          -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          -DBUILD_TESTING=ON
-          -DECS_BUILD_EXAMPLE=OFF
-          -DECS_BUILD_TESTING=ON
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Run tests
-        run: ctest --test-dir build --output-on-failure
-
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-
-    permissions:
-      contents: write
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Configure coverage build
         run: >
           cmake -S . -B build-coverage
           -DCMAKE_BUILD_TYPE=Debug
@@ -61,7 +40,7 @@ jobs:
           set -o pipefail
           cmake --build build-coverage --target coverage | tee build-coverage/coverage.log
 
-      - name: Create coverage badge endpoint
+      - name: Create coverage badge
         shell: bash
         run: |
           coverage="$(sed -n 's/^-- Line coverage: \([0-9.]*\)%.*/\1/p' build-coverage/coverage.log | tail -n 1)"
@@ -87,11 +66,12 @@ jobs:
           mkdir -p badge
           printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "${coverage}" "${color}" > badge/coverage.json
 
-      - name: Publish coverage badge endpoint
+      - name: Upload coverage badge artifact
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: peaceiris/actions-gh-pages@v4
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_branch: badges
-          publish_dir: badge
-          keep_files: false
+          path: badge
+
+      - name: Deploy coverage badge to Pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/deploy-pages@v4
