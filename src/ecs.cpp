@@ -49,7 +49,7 @@ const std::vector<ComponentField>* Registry::component_fields(Entity component) 
 bool Registry::set_component_fields(Entity component, std::vector<ComponentField> fields) {
     require_runtime_registry_access_allowed("set_component_fields");
     ComponentRecord* record = find_component_record(component);
-    if (record == nullptr) {
+    if (record == nullptr || !valid_component_fields(*record, fields)) {
         return false;
     }
 
@@ -60,7 +60,7 @@ bool Registry::set_component_fields(Entity component, std::vector<ComponentField
 bool Registry::add_component_field(Entity component, ComponentField field) {
     require_runtime_registry_access_allowed("add_component_field");
     ComponentRecord* record = find_component_record(component);
-    if (record == nullptr) {
+    if (record == nullptr || !valid_component_field(*record, field)) {
         return false;
     }
 
@@ -341,6 +341,9 @@ Entity Registry::register_component_impl(
     record.entity = component;
     record.name = std::move(desc.name);
     record.info = ComponentInfo{desc.size, desc.alignment, trivially_copyable, tag};
+    if (!valid_component_fields(record, desc.fields)) {
+        throw std::invalid_argument("component field metadata is invalid");
+    }
     record.fields = std::move(desc.fields);
     record.lifecycle = lifecycle;
     record.type_id = typed_id;
@@ -396,6 +399,34 @@ const Registry::ComponentRecord& Registry::require_component_record(Entity compo
     }
 
     return *record;
+}
+
+bool Registry::valid_component_field(const ComponentRecord& component, const ComponentField& field) const {
+    const ComponentRecord* field_type = find_component_record(field.type);
+    if (field_type == nullptr || field_type->info.tag || field.count == 0) {
+        return false;
+    }
+
+    const std::size_t field_size = field_type->info.size;
+    const std::size_t field_alignment = field_type->info.alignment;
+    if (field_size == 0 || field_alignment == 0 || field.offset % field_alignment != 0) {
+        return false;
+    }
+
+    if (field.count > std::numeric_limits<std::size_t>::max() / field_size) {
+        return false;
+    }
+
+    const std::size_t byte_size = field.count * field_size;
+    return field.offset <= component.info.size && byte_size <= component.info.size - field.offset;
+}
+
+bool Registry::valid_component_fields(
+    const ComponentRecord& component,
+    const std::vector<ComponentField>& fields) const {
+    return std::all_of(fields.begin(), fields.end(), [&](const ComponentField& field) {
+        return valid_component_field(component, field);
+    });
 }
 
 void Registry::rebuild_typed_storages() {

@@ -1441,6 +1441,8 @@ private:
     const ComponentRecord* find_component_record(Entity component) const;
     ComponentRecord& require_component_record(Entity component);
     const ComponentRecord& require_component_record(Entity component) const;
+    bool valid_component_field(const ComponentRecord& component, const ComponentField& field) const;
+    bool valid_component_fields(const ComponentRecord& component, const std::vector<ComponentField>& fields) const;
 
     TypeErasedStorage& storage_for(Entity component) {
         const ComponentRecord& record = require_component_record(component);

@@ -58,6 +58,71 @@ TEST_CASE("field metadata accessors append replace and reject invalid components
     REQUIRE_FALSE(registry.add_component_field(position_component, ecs::ComponentField{}));
 }
 
+TEST_CASE("field metadata rejects invalid ranges alignment counts and types") {
+    ecs::Registry registry;
+    const ecs::Entity position_component = registry.register_component<Position>("Position");
+    const ecs::Entity i32 = registry.primitive_type(ecs::PrimitiveType::I32);
+
+    REQUIRE(registry.set_component_fields(
+        position_component,
+        {ecs::ComponentField{"x", offsetof(Position, x), i32, 1}}));
+
+    const std::vector<ecs::ComponentField>* fields = registry.component_fields(position_component);
+    REQUIRE(fields != nullptr);
+    REQUIRE(fields->size() == 1);
+    REQUIRE((*fields)[0].name == "x");
+
+    REQUIRE_FALSE(registry.set_component_fields(
+        position_component,
+        {ecs::ComponentField{"past_end", sizeof(Position), i32, 1}}));
+    REQUIRE(registry.component_fields(position_component)->size() == 1);
+    REQUIRE((*registry.component_fields(position_component))[0].name == "x");
+
+    REQUIRE_FALSE(registry.add_component_field(
+        position_component,
+        ecs::ComponentField{"misaligned", 1, i32, 1}));
+    REQUIRE_FALSE(registry.add_component_field(
+        position_component,
+        ecs::ComponentField{"too_many", offsetof(Position, y), i32, 2}));
+    REQUIRE_FALSE(registry.add_component_field(
+        position_component,
+        ecs::ComponentField{"zero_count", offsetof(Position, y), i32, 0}));
+    REQUIRE_FALSE(registry.add_component_field(
+        position_component,
+        ecs::ComponentField{
+            "overflow_count",
+            offsetof(Position, y),
+            i32,
+            std::numeric_limits<std::size_t>::max()}));
+    REQUIRE_FALSE(registry.add_component_field(
+        position_component,
+        ecs::ComponentField{"invalid_type", offsetof(Position, y), ecs::Entity{}, 1}));
+
+    const ecs::Entity active_tag = registry.register_tag("ActiveTag");
+    REQUIRE_FALSE(registry.add_component_field(
+        position_component,
+        ecs::ComponentField{"tag_type", offsetof(Position, y), active_tag, 1}));
+
+    REQUIRE(registry.component_fields(position_component)->size() == 1);
+    REQUIRE((*registry.component_fields(position_component))[0].name == "x");
+}
+
+TEST_CASE("component registration rejects invalid field metadata") {
+    ecs::Registry registry;
+
+    ecs::ComponentDesc desc;
+    desc.name = "BadFields";
+    desc.size = sizeof(Position);
+    desc.alignment = alignof(Position);
+    desc.fields = {ecs::ComponentField{
+        "past_end",
+        sizeof(Position),
+        registry.primitive_type(ecs::PrimitiveType::I32),
+        1}};
+
+    REQUIRE_THROWS_AS(registry.register_component(std::move(desc)), std::invalid_argument);
+}
+
 TEST_CASE("debug printing supports primitive scalars and unprintable fields") {
     ecs::Registry registry;
     registry.register_component<Position>("Position");
