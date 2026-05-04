@@ -22,6 +22,7 @@ endif()
 option(ECS_BUILD_EXAMPLE "Build the example executable" ${ecs_is_top_level})
 option(ECS_BUILD_TESTING "Build ECS tests" ${ecs_build_testing_default})
 option(ECS_BUILD_BENCHMARKS "Build Google Benchmark suites" OFF)
+option(ECS_INSTALL "Install ECS library and CMake package files" ${ecs_is_top_level})
 
 set(ecs_public_headers
     include/ecs/bit_buffer.hpp
@@ -78,6 +79,49 @@ if(MSVC)
     target_compile_options(ecs PRIVATE /W4)
 else()
     target_compile_options(ecs PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(ECS_INSTALL)
+    include(GNUInstallDirs)
+    include(CMakePackageConfigHelpers)
+
+    install(TARGETS ecs
+        EXPORT ecsTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+
+    install(DIRECTORY include/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+
+    set(ecs_package_config_dir ${CMAKE_INSTALL_LIBDIR}/cmake/ecs)
+
+    install(EXPORT ecsTargets
+        FILE ecsTargets.cmake
+        NAMESPACE ecs::
+        DESTINATION ${ecs_package_config_dir}
+    )
+
+    configure_package_config_file(
+        cmake/ecsConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/ecsConfig.cmake
+        INSTALL_DESTINATION ${ecs_package_config_dir}
+    )
+
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/ecsConfigVersion.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion
+    )
+
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/ecsConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/ecsConfigVersion.cmake
+        DESTINATION ${ecs_package_config_dir}
+    )
 endif()
 
 if(ECS_BUILD_EXAMPLE)
