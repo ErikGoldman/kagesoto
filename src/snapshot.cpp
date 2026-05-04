@@ -1079,8 +1079,7 @@ void Registry::restore_snapshot(const Snapshot& snapshot) {
     component_catalog_.records = snapshot.components_;
     component_catalog_.names = snapshot.component_names_;
     storage_registry_.storages = std::move(storages);
-    component_catalog_.typed_components = snapshot.typed_components_;
-    rebuild_typed_storages();
+    rebind_typed_components_by_registered_names();
     group_index_.groups = std::move(groups);
     rebuild_group_ownership();
     component_catalog_.singleton_entity = snapshot.singleton_entity_;

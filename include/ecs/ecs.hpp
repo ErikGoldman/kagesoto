@@ -563,6 +563,15 @@ public:
             detail::is_tag_query<T>::value,
             id);
 
+        record_typed_component_binding(
+            id,
+            component_catalog_.records.at(entity_index(component)).name,
+            ComponentInfo{
+                detail::is_tag_query<T>::value ? 0 : sizeof(T),
+                alignof(T),
+                std::is_trivially_copyable<T>::value,
+                detail::is_tag_query<T>::value},
+            is_singleton_component<T>::value);
         ensure_typed_capacity(id);
         component_catalog_.typed_components[id] = component;
         if constexpr (is_singleton_component<T>::value) {
@@ -1645,10 +1654,81 @@ private:
         return next++;
     }
 
+    struct TypedComponentBinding {
+        std::string name;
+        ComponentInfo info;
+        bool singleton = false;
+        bool registered = false;
+    };
+
+    static std::vector<TypedComponentBinding>& typed_component_bindings() {
+        static std::vector<TypedComponentBinding> bindings;
+        return bindings;
+    }
+
+    static std::mutex& typed_component_bindings_mutex() {
+        static std::mutex mutex;
+        return mutex;
+    }
+
     template <typename T>
     static std::size_t type_id() {
         static const std::size_t id = next_type_id();
         return id;
+    }
+
+    static void record_typed_component_binding(
+        std::size_t id,
+        std::string name,
+        ComponentInfo info,
+        bool singleton) {
+        std::lock_guard<std::mutex> lock(typed_component_bindings_mutex());
+        auto& bindings = typed_component_bindings();
+        if (id >= bindings.size()) {
+            bindings.resize(id + 1);
+        }
+        bindings[id] = TypedComponentBinding{std::move(name), info, singleton, true};
+    }
+
+    void rebind_typed_components_by_registered_names() {
+        std::vector<TypedComponentBinding> bindings;
+        {
+            std::lock_guard<std::mutex> lock(typed_component_bindings_mutex());
+            bindings = typed_component_bindings();
+        }
+
+        component_catalog_.typed_components.assign(bindings.size(), Entity{});
+        storage_registry_.typed_storages.assign(bindings.size(), nullptr);
+        for (std::size_t id = 0; id < bindings.size(); ++id) {
+            const TypedComponentBinding& binding = bindings[id];
+            if (!binding.registered || binding.name.empty()) {
+                continue;
+            }
+
+            const auto found_name = component_catalog_.names.find(binding.name);
+            if (found_name == component_catalog_.names.end()) {
+                continue;
+            }
+
+            const auto found_record = component_catalog_.records.find(found_name->second);
+            if (found_record == component_catalog_.records.end()) {
+                continue;
+            }
+
+            const ComponentRecord& record = found_record->second;
+            if (record.info.size != binding.info.size ||
+                record.info.alignment != binding.info.alignment ||
+                record.info.trivially_copyable != binding.info.trivially_copyable ||
+                record.info.tag != binding.info.tag ||
+                record.singleton != binding.singleton) {
+                throw std::logic_error("restored component metadata does not match registered component type");
+            }
+
+            component_catalog_.typed_components[id] = record.entity;
+            const auto found_storage = storage_registry_.storages.find(found_record->first);
+            storage_registry_.typed_storages[id] =
+                found_storage != storage_registry_.storages.end() ? found_storage->second.get() : nullptr;
+        }
     }
 
     void ensure_typed_capacity(std::size_t id) {

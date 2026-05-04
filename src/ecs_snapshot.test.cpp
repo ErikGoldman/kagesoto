@@ -2,6 +2,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstring>
+
 namespace {
 
 struct CountingPositionTraits {
@@ -50,6 +52,83 @@ struct UnreadPositionTraits : CountingPositionTraits {
         return true;
     }
 };
+
+struct NativeRebindPosition {
+    int x = 0;
+};
+
+struct NativeRebindVelocity {
+    int dx = 0;
+};
+
+template <typename T>
+T read_native_value(const std::string& bytes, std::size_t& cursor) {
+    T value{};
+    REQUIRE(cursor + sizeof(T) <= bytes.size());
+    std::memcpy(&value, bytes.data() + cursor, sizeof(T));
+    cursor += sizeof(T);
+    return value;
+}
+
+void skip_native_string(const std::string& bytes, std::size_t& cursor) {
+    const auto size = read_native_value<std::uint64_t>(bytes, cursor);
+    REQUIRE(cursor + static_cast<std::size_t>(size) <= bytes.size());
+    cursor += static_cast<std::size_t>(size);
+}
+
+void skip_native_component_record(const std::string& bytes, std::size_t& cursor) {
+    (void)read_native_value<std::uint64_t>(bytes, cursor); // entity
+    skip_native_string(bytes, cursor);
+    (void)read_native_value<std::uint64_t>(bytes, cursor); // size
+    (void)read_native_value<std::uint64_t>(bytes, cursor); // alignment
+    (void)read_native_value<std::uint8_t>(bytes, cursor);  // trivially copyable
+    (void)read_native_value<std::uint8_t>(bytes, cursor);  // tag
+    (void)read_native_value<std::uint8_t>(bytes, cursor);  // singleton
+    (void)read_native_value<std::uint64_t>(bytes, cursor); // type id
+    (void)read_native_value<std::uint32_t>(bytes, cursor); // primitive
+
+    const auto field_count = read_native_value<std::uint64_t>(bytes, cursor);
+    for (std::uint64_t field = 0; field < field_count; ++field) {
+        skip_native_string(bytes, cursor);
+        (void)read_native_value<std::uint64_t>(bytes, cursor); // offset
+        (void)read_native_value<std::uint64_t>(bytes, cursor); // type entity
+        (void)read_native_value<std::uint64_t>(bytes, cursor); // count
+    }
+}
+
+void zero_native_typed_component_table(std::string& bytes) {
+    std::size_t cursor = 0;
+    (void)read_native_value<std::uint32_t>(bytes, cursor); // magic
+    (void)read_native_value<std::uint32_t>(bytes, cursor); // version
+    (void)read_native_value<std::uint32_t>(bytes, cursor); // kind
+    (void)read_native_value<std::uint8_t>(bytes, cursor);  // has entities
+    (void)read_native_value<std::uint64_t>(bytes, cursor); // baseline token
+    (void)read_native_value<std::uint64_t>(bytes, cursor); // state token
+    (void)read_native_value<std::uint32_t>(bytes, cursor); // free head
+    (void)read_native_value<std::uint64_t>(bytes, cursor); // singleton entity
+    (void)read_native_value<std::uint64_t>(bytes, cursor); // system tag
+    for (std::size_t primitive = 0; primitive < 7U; ++primitive) {
+        (void)read_native_value<std::uint64_t>(bytes, cursor);
+    }
+
+    const auto entity_count = read_native_value<std::uint64_t>(bytes, cursor);
+    cursor += static_cast<std::size_t>(entity_count) * sizeof(std::uint64_t);
+    REQUIRE(cursor <= bytes.size());
+
+    const auto component_count = read_native_value<std::uint64_t>(bytes, cursor);
+    for (std::uint64_t component = 0; component < component_count; ++component) {
+        (void)read_native_value<std::uint32_t>(bytes, cursor);
+        skip_native_component_record(bytes, cursor);
+    }
+
+    const auto typed_count = read_native_value<std::uint64_t>(bytes, cursor);
+    REQUIRE(cursor + static_cast<std::size_t>(typed_count) * sizeof(std::uint64_t) <= bytes.size());
+    for (std::uint64_t typed = 0; typed < typed_count; ++typed) {
+        const std::uint64_t zero = 0;
+        std::memcpy(&bytes[cursor], &zero, sizeof(zero));
+        cursor += sizeof(zero);
+    }
+}
 
 }  // namespace
 
@@ -253,6 +332,33 @@ TEST_CASE("registry full snapshots write read and restore from in-memory snapsho
     REQUIRE(restored.get<GameTime>().tick == 99);
     REQUIRE(restored.is_dirty<GameTime>());
     REQUIRE(restored.component_fields(position_component)->size() == 1);
+}
+
+TEST_CASE("native snapshot restore rebinds typed components by registered names") {
+    ecs::Registry source;
+    const ecs::Entity position_component =
+        source.register_component<NativeRebindPosition>("NativeRebindPosition");
+    const ecs::Entity velocity_component =
+        source.register_component<NativeRebindVelocity>("NativeRebindVelocity");
+
+    const ecs::Entity entity = source.create();
+    REQUIRE(source.add<NativeRebindPosition>(entity, NativeRebindPosition{11}) != nullptr);
+    REQUIRE(source.add<NativeRebindVelocity>(entity, NativeRebindVelocity{22}) != nullptr);
+
+    std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
+    source.create_snapshot().write_native(stream);
+    std::string bytes = stream.str();
+    zero_native_typed_component_table(bytes);
+
+    std::stringstream patched(bytes, std::ios::in | std::ios::out | std::ios::binary);
+    ecs::Registry::Snapshot loaded = ecs::Registry::Snapshot::read_native(patched);
+    ecs::Registry restored;
+    restored.restore_snapshot(loaded);
+
+    REQUIRE(restored.component<NativeRebindPosition>() == position_component);
+    REQUIRE(restored.component<NativeRebindVelocity>() == velocity_component);
+    REQUIRE(restored.get<NativeRebindPosition>(entity).x == 11);
+    REQUIRE(restored.get<NativeRebindVelocity>(entity).dx == 22);
 }
 
 TEST_CASE("registry delta snapshots write read and restore from in-memory snapshot native format") {
