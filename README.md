@@ -1,5 +1,8 @@
 # ECS
 
+[![Tests](https://github.com/ErikGoldman/kagesoto/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ErikGoldman/kagesoto/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/ErikGoldman/kagesoto/badges/coverage.json)](https://github.com/ErikGoldman/kagesoto/actions/workflows/ci.yml)
+
 A small C++17 sparse-set ECS.
 
 ## Entity Handles
@@ -413,6 +416,21 @@ cmake -S . -B build -DECS_BUILD_TESTING=ON
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+Generate coverage stats with GCC or Clang:
+
+```bash
+cmake -S . -B build-coverage \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DECS_BUILD_EXAMPLE=OFF \
+  -DECS_BUILD_TESTING=ON \
+  -DECS_ENABLE_COVERAGE=ON
+cmake --build build-coverage --target coverage
+```
+
+The coverage target runs the test suite, writes generated `.gcov` files under
+`build-coverage/coverage`, and prints line, branch, and function coverage for
+project sources.
 
 Build benchmarks explicitly when collecting performance data:
 

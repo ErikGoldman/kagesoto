@@ -35,3 +35,63 @@ jobs:
 
       - name: Run tests
         run: ctest --test-dir build --output-on-failure
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure coverage build
+        run: >
+          cmake -S . -B build-coverage
+          -DCMAKE_BUILD_TYPE=Debug
+          -DECS_BUILD_EXAMPLE=OFF
+          -DECS_BUILD_TESTING=ON
+          -DECS_ENABLE_COVERAGE=ON
+
+      - name: Build, test, and collect coverage
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build build-coverage --target coverage | tee build-coverage/coverage.log
+
+      - name: Create coverage badge endpoint
+        shell: bash
+        run: |
+          coverage="$(sed -n 's/^-- Line coverage: \([0-9.]*\)%.*/\1/p' build-coverage/coverage.log | tail -n 1)"
+          if [[ -z "${coverage}" ]]; then
+            echo "Unable to find line coverage in build-coverage/coverage.log" >&2
+            exit 1
+          fi
+
+          coverage_int="${coverage%.*}"
+          color="red"
+          if (( coverage_int >= 90 )); then
+            color="brightgreen"
+          elif (( coverage_int >= 80 )); then
+            color="green"
+          elif (( coverage_int >= 70 )); then
+            color="yellowgreen"
+          elif (( coverage_int >= 60 )); then
+            color="yellow"
+          elif (( coverage_int >= 50 )); then
+            color="orange"
+          fi
+
+          mkdir -p badge
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "${coverage}" "${color}" > badge/coverage.json
+
+      - name: Publish coverage badge endpoint
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: badges
+          publish_dir: badge
+          keep_files: false

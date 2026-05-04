@@ -22,7 +22,12 @@ endif()
 option(ECS_BUILD_EXAMPLE "Build the example executable" ${ecs_is_top_level})
 option(ECS_BUILD_TESTING "Build ECS tests" ${ecs_build_testing_default})
 option(ECS_BUILD_BENCHMARKS "Build Google Benchmark suites" OFF)
+option(ECS_ENABLE_COVERAGE "Build ECS targets with coverage instrumentation" OFF)
 option(ECS_INSTALL "Install ECS library and CMake package files" ${ecs_is_top_level})
+
+if(ECS_ENABLE_COVERAGE AND NOT ECS_BUILD_TESTING)
+    message(FATAL_ERROR "ECS_ENABLE_COVERAGE requires ECS_BUILD_TESTING=ON")
+endif()
 
 set(ecs_public_headers
     include/ecs/bit_buffer.hpp
@@ -74,6 +79,19 @@ set_target_properties(ecs PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
+
+if(ECS_ENABLE_COVERAGE)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR "ECS_ENABLE_COVERAGE requires GCC or Clang")
+    endif()
+
+    function(ecs_enable_coverage target_name)
+        target_compile_options(${target_name} PRIVATE -O0 -g --coverage)
+        target_link_options(${target_name} PRIVATE --coverage)
+    endfunction()
+
+    ecs_enable_coverage(ecs)
+endif()
 
 if(MSVC)
     target_compile_options(ecs PRIVATE /W4)
@@ -156,6 +174,25 @@ if(ECS_BUILD_TESTING)
             ecs::ecs
             Catch2::Catch2WithMain
     )
+
+    if(ECS_ENABLE_COVERAGE)
+        ecs_enable_coverage(ecs_tests)
+
+        find_program(ECS_GCOV_EXECUTABLE gcov REQUIRED)
+
+        add_custom_target(coverage
+            COMMAND ${CMAKE_CTEST_COMMAND} --test-dir ${CMAKE_BINARY_DIR} --output-on-failure
+            COMMAND ${CMAKE_COMMAND}
+                -DECS_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -DECS_BINARY_DIR=${CMAKE_BINARY_DIR}
+                -DECS_GCOV_EXECUTABLE=${ECS_GCOV_EXECUTABLE}
+                -DECS_COVERAGE_OUTPUT_DIR=${CMAKE_BINARY_DIR}/coverage
+                -P ${CMAKE_SOURCE_DIR}/cmake/ecs_coverage_report.cmake
+            DEPENDS ecs_tests
+            USES_TERMINAL
+            COMMENT "Running tests and generating gcov coverage stats"
+        )
+    endif()
 
     add_custom_target(tests DEPENDS ecs_tests)
 
