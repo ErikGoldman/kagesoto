@@ -137,8 +137,7 @@ bool Registry::has(Entity entity, Entity component) const {
     return found != nullptr && found->contains_index(entity_index(entity));
 }
 
-bool Registry::clear_dirty(Entity entity, Entity component) {
-    require_runtime_registry_access_allowed("clear_dirty");
+bool Registry::dirty_clear(Entity entity, Entity component) {
     const ComponentRecord& record = require_component_record(component);
     if (record.singleton) {
         entity = component_catalog_.singleton_entity;
@@ -151,8 +150,7 @@ bool Registry::clear_dirty(Entity entity, Entity component) {
     return found != nullptr && found->clear_dirty(entity_index(entity));
 }
 
-bool Registry::is_dirty(Entity entity, Entity component) const {
-    require_runtime_registry_access_allowed("is_dirty");
+bool Registry::dirty_is(Entity entity, Entity component) const {
     const ComponentRecord& record = require_component_record(component);
     if (record.singleton) {
         entity = component_catalog_.singleton_entity;
@@ -165,11 +163,16 @@ bool Registry::is_dirty(Entity entity, Entity component) const {
     return found != nullptr && found->is_dirty(entity_index(entity));
 }
 
-void Registry::clear_all_dirty(Entity component) {
-    require_runtime_registry_access_allowed("clear_all_dirty");
+void Registry::dirty_clear_all(Entity component) {
     require_component_record(component);
     if (auto* found = find_storage(component)) {
         found->clear_all_dirty();
+    }
+}
+
+void Registry::clear_all_dirty_entries() {
+    for (auto& storage : storage_registry_.storages) {
+        storage.second->clear_all_dirty();
     }
 }
 

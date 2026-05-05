@@ -30,6 +30,10 @@
 #include <utility>
 #include <vector>
 
+namespace kage::sync {
+class ReplicationServer;
+}
+
 #ifndef ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
 #ifdef NDEBUG
 #define ECS_RUNTIME_REGISTRY_ACCESS_CHECKING 0
@@ -289,7 +293,7 @@ struct RunJobsOptions {
     std::vector<Entity> excluded_job_tags;
 };
 
-struct SnapshotIoOptions {
+struct SnapshotComponentOptions {
     std::vector<Entity> include_components;
     std::vector<Entity> exclude_components;
 };
@@ -394,6 +398,7 @@ enum class PrimitiveType {
 class Registry {
     friend class Orchestrator;
     friend class JobGraph;
+    friend class kage::sync::ReplicationServer;
 
 public:
     static constexpr std::uint32_t invalid_index = std::numeric_limits<std::uint32_t>::max();
@@ -784,105 +789,95 @@ public:
 
     bool has(Entity entity, Entity component) const;
 
-    template <typename T>
-    bool clear_dirty(Entity entity) {
-        require_runtime_registry_access_allowed("clear_dirty");
-        const Entity component = registered_component<T>();
-        if constexpr (is_singleton_component<T>::value) {
-            return clear_dirty(component_catalog_.singleton_entity, component);
-        }
-        return clear_dirty(entity, component);
-    }
+    class DirtyView {
+    public:
+        DirtyView() = default;
 
-    template <typename T, typename std::enable_if<is_singleton_component<T>::value, int>::type = 0>
-    bool clear_dirty() {
-        require_runtime_registry_access_allowed("clear_dirty");
-        const Entity component = registered_component<T>();
-        return clear_dirty(component_catalog_.singleton_entity, component);
-    }
-
-    bool clear_dirty(Entity entity, Entity component);
-
-    template <typename T>
-    bool is_dirty(Entity entity) const {
-        require_runtime_registry_access_allowed("is_dirty");
-        const Entity component = registered_component<T>();
-        if constexpr (is_singleton_component<T>::value) {
-            return is_dirty(component_catalog_.singleton_entity, component);
-        }
-        return is_dirty(entity, component);
-    }
-
-    template <typename T, typename std::enable_if<is_singleton_component<T>::value, int>::type = 0>
-    bool is_dirty() const {
-        require_runtime_registry_access_allowed("is_dirty");
-        const Entity component = registered_component<T>();
-        return is_dirty(component_catalog_.singleton_entity, component);
-    }
-
-    bool is_dirty(Entity entity, Entity component) const;
-
-    template <typename T>
-    void clear_all_dirty() {
-        require_runtime_registry_access_allowed("clear_all_dirty");
-        const Entity component = registered_component<T>();
-        clear_all_dirty(component);
-    }
-
-    void clear_all_dirty(Entity component);
-
-    template <typename T, typename Fn>
-    void each_dirty(Fn&& fn) const {
-        require_runtime_registry_access_allowed("each_dirty");
-        const Entity component = registered_component<T>();
-        each_dirty(component, std::forward<Fn>(fn));
-    }
-
-    template <typename Fn>
-    void each_dirty(Entity component, Fn&& fn) const {
-        require_runtime_registry_access_allowed("each_dirty");
-        const ComponentRecord& record = require_component_record(component);
-        Entity singleton = Entity{};
-        if (record.singleton) {
-            singleton = component_catalog_.singleton_entity;
+        template <typename T>
+        bool is_dirty(Entity entity) const {
+            return registry_ != nullptr && registry_->dirty_is<T>(entity);
         }
 
-        const auto* found = find_storage(component);
-        if (found == nullptr) {
-            return;
+        template <typename T, typename std::enable_if<is_singleton_component<T>::value, int>::type = 0>
+        bool is_dirty() const {
+            return registry_ != nullptr && registry_->dirty_is<T>();
         }
 
-        Fn& callback = fn;
-        found->each_dirty([&](std::uint32_t index, const void* value) {
-            callback(record.singleton ? singleton : Entity{entity_store_.slots[index]}, value);
-        });
-    }
-
-    template <typename T, typename Fn>
-    void each_removed(Fn&& fn) const {
-        require_runtime_registry_access_allowed("each_removed");
-        const Entity component = registered_component<T>();
-        each_removed(component, std::forward<Fn>(fn));
-    }
-
-    template <typename Fn>
-    void each_removed(Entity component, Fn&& fn) const {
-        require_runtime_registry_access_allowed("each_removed");
-        const ComponentRecord& record = require_component_record(component);
-        if (record.singleton) {
-            return;
+        bool is_dirty(Entity entity, Entity component) const {
+            return registry_ != nullptr && registry_->dirty_is(entity, component);
         }
 
-        const auto* found = find_storage(component);
-        if (found == nullptr) {
-            return;
+        template <typename T, typename Fn>
+        void each_dirty(Fn&& fn) const {
+            if (registry_ != nullptr) {
+                registry_->dirty_each<T>(std::forward<Fn>(fn));
+            }
         }
 
-        Fn& callback = fn;
-        found->each_removed([&](ComponentRemoval removal) {
-            callback(removal);
-        });
-    }
+        template <typename Fn>
+        void each_dirty(Entity component, Fn&& fn) const {
+            if (registry_ != nullptr) {
+                registry_->dirty_each(component, std::forward<Fn>(fn));
+            }
+        }
+
+        template <typename T, typename Fn>
+        void each_removed(Fn&& fn) const {
+            if (registry_ != nullptr) {
+                registry_->dirty_each_removed<T>(std::forward<Fn>(fn));
+            }
+        }
+
+        template <typename Fn>
+        void each_removed(Entity component, Fn&& fn) const {
+            if (registry_ != nullptr) {
+                registry_->dirty_each_removed(component, std::forward<Fn>(fn));
+            }
+        }
+
+    private:
+        friend class Registry;
+        explicit DirtyView(const Registry& registry) : registry_(&registry) {}
+
+        const Registry* registry_ = nullptr;
+    };
+
+    class DirtyFrame {
+    public:
+        DirtyFrame(const DirtyFrame&) = delete;
+        DirtyFrame& operator=(const DirtyFrame&) = delete;
+        DirtyFrame(DirtyFrame&& other) noexcept : registry_(other.registry_) {
+            other.registry_ = nullptr;
+        }
+        DirtyFrame& operator=(DirtyFrame&& other) noexcept {
+            if (this != &other) {
+                clear();
+                registry_ = other.registry_;
+                other.registry_ = nullptr;
+            }
+            return *this;
+        }
+        ~DirtyFrame() {
+            clear();
+        }
+
+        DirtyView view() const {
+            return registry_ != nullptr ? DirtyView(*registry_) : DirtyView{};
+        }
+
+    private:
+        friend class Registry;
+        explicit DirtyFrame(Registry& registry) : registry_(&registry) {}
+
+        void clear() {
+            if (registry_ != nullptr) {
+                registry_->clear_all_dirty_entries();
+                registry_ = nullptr;
+            }
+        }
+
+        Registry* registry_ = nullptr;
+    };
 
     template <typename... Components>
     typename std::enable_if<!detail::contains_tag_query<Components...>::value, View<Components...>>::type view();
@@ -934,6 +929,95 @@ private:
 #else
         (void)operation;
 #endif
+    }
+
+    DirtyFrame begin_dirty_frame() {
+        require_runtime_registry_access_allowed("begin_dirty_frame");
+        return DirtyFrame(*this);
+    }
+
+    bool dirty_clear(Entity entity, Entity component);
+    void dirty_clear_all(Entity component);
+    void clear_all_dirty_entries();
+    bool dirty_is(Entity entity, Entity component) const;
+
+    template <typename T>
+    bool dirty_clear(Entity entity) {
+        const Entity component = registered_component<T>();
+        if constexpr (is_singleton_component<T>::value) {
+            return dirty_clear(component_catalog_.singleton_entity, component);
+        }
+        return dirty_clear(entity, component);
+    }
+
+    template <typename T, typename std::enable_if<is_singleton_component<T>::value, int>::type = 0>
+    bool dirty_clear() {
+        const Entity component = registered_component<T>();
+        return dirty_clear(component_catalog_.singleton_entity, component);
+    }
+
+    template <typename T>
+    bool dirty_is(Entity entity) const {
+        const Entity component = registered_component<T>();
+        if constexpr (is_singleton_component<T>::value) {
+            return dirty_is(component_catalog_.singleton_entity, component);
+        }
+        return dirty_is(entity, component);
+    }
+
+    template <typename T, typename std::enable_if<is_singleton_component<T>::value, int>::type = 0>
+    bool dirty_is() const {
+        const Entity component = registered_component<T>();
+        return dirty_is(component_catalog_.singleton_entity, component);
+    }
+
+    template <typename T, typename Fn>
+    void dirty_each(Fn&& fn) const {
+        const Entity component = registered_component<T>();
+        dirty_each(component, std::forward<Fn>(fn));
+    }
+
+    template <typename Fn>
+    void dirty_each(Entity component, Fn&& fn) const {
+        const ComponentRecord& record = require_component_record(component);
+        Entity singleton = Entity{};
+        if (record.singleton) {
+            singleton = component_catalog_.singleton_entity;
+        }
+
+        const auto* found = find_storage(component);
+        if (found == nullptr) {
+            return;
+        }
+
+        Fn& callback = fn;
+        found->each_dirty([&](std::uint32_t index, const void* value) {
+            callback(record.singleton ? singleton : Entity{entity_store_.slots[index]}, value);
+        });
+    }
+
+    template <typename T, typename Fn>
+    void dirty_each_removed(Fn&& fn) const {
+        const Entity component = registered_component<T>();
+        dirty_each_removed(component, std::forward<Fn>(fn));
+    }
+
+    template <typename Fn>
+    void dirty_each_removed(Entity component, Fn&& fn) const {
+        const ComponentRecord& record = require_component_record(component);
+        if (record.singleton) {
+            return;
+        }
+
+        const auto* found = find_storage(component);
+        if (found == nullptr) {
+            return;
+        }
+
+        Fn& callback = fn;
+        found->each_removed([&](ComponentRemoval removal) {
+            callback(removal);
+        });
     }
 
     enum class PrimitiveKind {
@@ -1199,7 +1283,7 @@ private:
         bool has_entities,
         std::uint64_t baseline_token,
         std::uint64_t state_token,
-        const SnapshotIoOptions& options);
+        const SnapshotComponentOptions& options);
     friend void read_snapshot_header(
         std::istream& in,
         std::uint32_t expected_kind,
@@ -1219,7 +1303,7 @@ private:
         std::ostream& out,
         const Registry::Snapshot& snapshot,
         const SnapshotPersistenceCodecs& codecs,
-        const SnapshotIoOptions& options);
+        const SnapshotComponentOptions& options);
     friend Registry::Snapshot read_persistent_snapshot(
         std::istream& in,
         const Registry& schema,
@@ -1229,7 +1313,7 @@ private:
         const Registry::DeltaSnapshot& snapshot,
         const Registry::Snapshot& baseline,
         const SnapshotPersistenceCodecs& codecs,
-        const SnapshotIoOptions& options);
+        const SnapshotComponentOptions& options);
     friend Registry::DeltaSnapshot read_persistent_delta_snapshot(
         std::istream& in,
         const Registry& schema,
@@ -1618,9 +1702,9 @@ public:
     Snapshot& operator=(Snapshot&&) noexcept = default;
     ~Snapshot() = default;
 
-    void write(std::ostream& out, const SnapshotIoOptions& options = {}) const;
+    void write(std::ostream& out, const SnapshotComponentOptions& options = {}) const;
     static Snapshot read(std::istream& in);
-    void write_native(std::ostream& out, const SnapshotIoOptions& options = {}) const;
+    void write_native(std::ostream& out, const SnapshotComponentOptions& options = {}) const;
     static Snapshot read_native(std::istream& in);
 
 private:
@@ -1630,7 +1714,7 @@ private:
         std::ostream& out,
         const Registry::Snapshot& snapshot,
         const SnapshotPersistenceCodecs& codecs,
-        const SnapshotIoOptions& options);
+        const SnapshotComponentOptions& options);
     friend Registry::Snapshot read_persistent_snapshot(
         std::istream& in,
         const Registry& schema,
@@ -1640,7 +1724,7 @@ private:
         const Registry::DeltaSnapshot& snapshot,
         const Registry::Snapshot& baseline,
         const SnapshotPersistenceCodecs& codecs,
-        const SnapshotIoOptions& options);
+        const SnapshotComponentOptions& options);
     friend Registry::DeltaSnapshot read_persistent_delta_snapshot(
         std::istream& in,
         const Registry& schema,
@@ -1669,9 +1753,9 @@ public:
     DeltaSnapshot& operator=(DeltaSnapshot&&) noexcept = default;
     ~DeltaSnapshot() = default;
 
-    void write(std::ostream& out, const SnapshotIoOptions& options = {}) const;
+    void write(std::ostream& out, const SnapshotComponentOptions& options = {}) const;
     static DeltaSnapshot read(std::istream& in);
-    void write_native(std::ostream& out, const SnapshotIoOptions& options = {}) const;
+    void write_native(std::ostream& out, const SnapshotComponentOptions& options = {}) const;
     static DeltaSnapshot read_native(std::istream& in);
 
 private:
@@ -1682,7 +1766,7 @@ private:
         const Registry::DeltaSnapshot& snapshot,
         const Registry::Snapshot& baseline,
         const SnapshotPersistenceCodecs& codecs,
-        const SnapshotIoOptions& options);
+        const SnapshotComponentOptions& options);
     friend Registry::DeltaSnapshot read_persistent_delta_snapshot(
         std::istream& in,
         const Registry& schema,
@@ -1768,7 +1852,7 @@ private:
         std::ostream& out,
         const Registry::Snapshot& snapshot,
         const SnapshotPersistenceCodecs& codecs,
-        const SnapshotIoOptions& options);
+        const SnapshotComponentOptions& options);
     friend Registry::Snapshot read_persistent_snapshot(
         std::istream& in,
         const Registry& schema,
@@ -1778,7 +1862,7 @@ private:
         const Registry::DeltaSnapshot& snapshot,
         const Registry::Snapshot& baseline,
         const SnapshotPersistenceCodecs& codecs,
-        const SnapshotIoOptions& options);
+        const SnapshotComponentOptions& options);
     friend Registry::DeltaSnapshot read_persistent_delta_snapshot(
         std::istream& in,
         const Registry& schema,
@@ -1829,7 +1913,7 @@ void write_persistent_snapshot(
     std::ostream& out,
     const Registry::Snapshot& snapshot,
     const SnapshotPersistenceCodecs& codecs,
-    const SnapshotIoOptions& options = {});
+    const SnapshotComponentOptions& options = {});
 Registry::Snapshot read_persistent_snapshot(
     std::istream& in,
     const Registry& schema,
@@ -1839,7 +1923,7 @@ void write_persistent_delta_snapshot(
     const Registry::DeltaSnapshot& snapshot,
     const Registry::Snapshot& baseline,
     const SnapshotPersistenceCodecs& codecs,
-    const SnapshotIoOptions& options = {});
+    const SnapshotComponentOptions& options = {});
 Registry::DeltaSnapshot read_persistent_delta_snapshot(
     std::istream& in,
     const Registry& schema,

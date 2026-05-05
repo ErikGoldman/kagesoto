@@ -462,7 +462,7 @@ TEST_CASE("registry in-memory snapshot native format component filters include a
     REQUIRE(source.add<Position>(entity, Position{8, 9}) != nullptr);
     REQUIRE(source.add<Velocity>(entity, Velocity{3.0f, 4.0f}) != nullptr);
 
-    ecs::SnapshotIoOptions options;
+    ecs::SnapshotComponentOptions options;
     options.include_components.push_back(source.component<Position>());
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
     source.create_snapshot().write(stream, options);
@@ -487,7 +487,7 @@ TEST_CASE("registry in-memory snapshot native format rejects selected non-trivia
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
     REQUIRE_THROWS_AS(source.create_snapshot().write(stream), std::logic_error);
 
-    ecs::SnapshotIoOptions options;
+    ecs::SnapshotComponentOptions options;
     options.include_components.push_back(source.component<Position>());
     std::stringstream filtered(std::ios::in | std::ios::out | std::ios::binary);
     REQUIRE_NOTHROW(source.create_snapshot().write(filtered, options));

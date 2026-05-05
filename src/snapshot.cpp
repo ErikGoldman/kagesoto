@@ -152,7 +152,7 @@ BitBuffer read_frame(std::istream& in, std::uint32_t expected_kind) {
 
 }  // namespace detail
 
-bool snapshot_component_selected(ecs::Entity component, const SnapshotIoOptions& options) {
+bool snapshot_component_selected(ecs::Entity component, const SnapshotComponentOptions& options) {
     const bool included = options.include_components.empty() ||
         std::find(options.include_components.begin(), options.include_components.end(), component) !=
             options.include_components.end();
@@ -280,7 +280,7 @@ void write_snapshot_common(
     bool has_entities,
     std::uint64_t baseline_token,
     std::uint64_t state_token,
-    const SnapshotIoOptions& options) {
+    const SnapshotComponentOptions& options) {
     constexpr std::uint32_t magic = 0x53534345U;  // ECSS
     constexpr std::uint32_t version = 1U;
     detail::write_pod<std::uint32_t>(out, magic);
@@ -442,11 +442,11 @@ void read_snapshot_header(
     }
 }
 
-void Registry::Snapshot::write(std::ostream& out, const SnapshotIoOptions& options) const {
+void Registry::Snapshot::write(std::ostream& out, const SnapshotComponentOptions& options) const {
     write_native(out, options);
 }
 
-void Registry::Snapshot::write_native(std::ostream& out, const SnapshotIoOptions& options) const {
+void Registry::Snapshot::write_native(std::ostream& out, const SnapshotComponentOptions& options) const {
     write_snapshot_common(
         out,
         1U,
@@ -499,11 +499,11 @@ Registry::Snapshot Registry::Snapshot::read_native(std::istream& in) {
     return snapshot;
 }
 
-void Registry::DeltaSnapshot::write(std::ostream& out, const SnapshotIoOptions& options) const {
+void Registry::DeltaSnapshot::write(std::ostream& out, const SnapshotComponentOptions& options) const {
     write_native(out, options);
 }
 
-void Registry::DeltaSnapshot::write_native(std::ostream& out, const SnapshotIoOptions& options) const {
+void Registry::DeltaSnapshot::write_native(std::ostream& out, const SnapshotComponentOptions& options) const {
     std::vector<Entity> empty_typed_components;
     std::array<Entity, 7> empty_primitives{};
     write_snapshot_common(
@@ -570,7 +570,7 @@ static PersistentComponentSelection select_persistent_components(
     const std::unordered_map<std::uint32_t, Registry::ComponentRecord>& components,
     const std::unordered_map<std::uint32_t, std::unique_ptr<Registry::TypeErasedStorage>>& storages,
     Entity system_tag,
-    const SnapshotIoOptions& options) {
+    const SnapshotComponentOptions& options) {
     PersistentComponentSelection selection;
     for (const auto& storage : storages) {
         const auto found = components.find(storage.first);
@@ -834,7 +834,7 @@ void write_persistent_snapshot(
     std::ostream& out,
     const Registry::Snapshot& snapshot,
     const SnapshotPersistenceCodecs& codecs,
-    const SnapshotIoOptions& options) {
+    const SnapshotComponentOptions& options) {
     const auto selection =
         PersistentSnapshotAccess::select_persistent_components(
             snapshot.components_,
@@ -903,7 +903,7 @@ void write_persistent_delta_snapshot(
     const Registry::DeltaSnapshot& snapshot,
     const Registry::Snapshot& baseline,
     const SnapshotPersistenceCodecs& codecs,
-    const SnapshotIoOptions& options) {
+    const SnapshotComponentOptions& options) {
     const auto selection =
         PersistentSnapshotAccess::select_persistent_components(
             snapshot.components_,
