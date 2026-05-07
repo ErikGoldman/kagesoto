@@ -2,6 +2,7 @@
 
 [![Tests](https://img.shields.io/endpoint?url=https%3A%2F%2Ferikgoldman.github.io%2Fkagesoto%2Fci.json)](https://github.com/ErikGoldman/kagesoto/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Ferikgoldman.github.io%2Fkagesoto%2Fcoverage.json)](https://github.com/ErikGoldman/kagesoto/actions/workflows/ci.yml)
+[![Benchmarks](https://img.shields.io/badge/benchmarks-results-blue)](https://erikgoldman.github.io/kagesoto/benchmarks/)
 
 A small C++17 sparse-set ECS.
 
