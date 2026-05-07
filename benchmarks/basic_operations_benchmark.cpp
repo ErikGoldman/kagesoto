@@ -2,8 +2,13 @@
 
 #include <benchmark/benchmark.h>
 
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <exception>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -78,6 +83,103 @@ struct TagB {};
 
 struct CopyablePayload {
     std::string value;
+};
+
+class BenchmarkThreadPool {
+public:
+    static constexpr std::size_t thread_count = 4;
+
+    explicit BenchmarkThreadPool(std::size_t thread_count) {
+        workers_.reserve(thread_count);
+        for (std::size_t i = 0; i < thread_count; ++i) {
+            workers_.emplace_back([this]() {
+                worker_loop();
+            });
+        }
+    }
+
+    BenchmarkThreadPool(const BenchmarkThreadPool&) = delete;
+    BenchmarkThreadPool& operator=(const BenchmarkThreadPool&) = delete;
+
+    ~BenchmarkThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        work_ready_.notify_all();
+        for (std::thread& worker : workers_) {
+            worker.join();
+        }
+    }
+
+    void run(const std::vector<ecs::JobThreadTask>& tasks) {
+        if (tasks.empty()) {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            remaining_ = tasks.size();
+            first_exception_ = nullptr;
+            for (const ecs::JobThreadTask& task : tasks) {
+                queue_.push_back(&task);
+            }
+        }
+
+        work_ready_.notify_all();
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        work_done_.wait(lock, [this]() {
+            return remaining_ == 0;
+        });
+        if (first_exception_) {
+            std::rethrow_exception(first_exception_);
+        }
+    }
+
+private:
+    void worker_loop() {
+        for (;;) {
+            const ecs::JobThreadTask* task = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                work_ready_.wait(lock, [this]() {
+                    return stopping_ || !queue_.empty();
+                });
+                if (stopping_ && queue_.empty()) {
+                    return;
+                }
+                task = queue_.front();
+                queue_.pop_front();
+            }
+
+            try {
+                task->run();
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!first_exception_) {
+                    first_exception_ = std::current_exception();
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                --remaining_;
+                if (remaining_ == 0) {
+                    work_done_.notify_one();
+                }
+            }
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::deque<const ecs::JobThreadTask*> queue_;
+    std::mutex mutex_;
+    std::condition_variable work_ready_;
+    std::condition_variable work_done_;
+    std::size_t remaining_ = 0;
+    bool stopping_ = false;
+    std::exception_ptr first_exception_;
 };
 
 template <typename T>
@@ -965,6 +1067,92 @@ void BM_RunJobsSingleThread(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(entity_count) * 4);
 }
 
+void BM_RunJobsParallelThreadPool(benchmark::State& state) {
+    const unsigned int hardware_threads = std::thread::hardware_concurrency();
+    if (hardware_threads < BenchmarkThreadPool::thread_count) {
+        state.SkipWithError("BM_RunJobsParallelThreadPool requires at least 4 hardware threads");
+        return;
+    }
+
+    const int entity_count = static_cast<int>(state.range(0));
+    ecs::Registry registry;
+    register_first_n_components(registry, 1);
+    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    add_first_n_components(registry, entities, 1);
+
+    for (int i = 0; i < 4; ++i) {
+        registry.job<C0>(i)
+            .max_threads(BenchmarkThreadPool::thread_count)
+            .min_entities_per_thread(1024)
+            .each([](ecs::Entity, C0& c0) {
+                c0.value += 1;
+            });
+    }
+
+    BenchmarkThreadPool thread_pool(BenchmarkThreadPool::thread_count);
+    registry.set_job_thread_executor([&thread_pool](const std::vector<ecs::JobThreadTask>& tasks) {
+        thread_pool.run(tasks);
+    });
+
+    for (auto _ : state) {
+        registry.run_jobs();
+        benchmark::ClobberMemory();
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(entity_count) * 4);
+}
+
+void BM_RunJobsParallelOverlappingWritesThreadPool(benchmark::State& state) {
+    const unsigned int hardware_threads = std::thread::hardware_concurrency();
+    if (hardware_threads < BenchmarkThreadPool::thread_count) {
+        state.SkipWithError("BM_RunJobsParallelOverlappingWritesThreadPool requires at least 4 hardware threads");
+        return;
+    }
+
+    const int entity_count = static_cast<int>(state.range(0));
+    ecs::Registry registry;
+    register_first_n_components(registry, 4);
+    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    add_first_n_components(registry, entities, 4);
+
+    registry.job<C0>(0)
+        .max_threads(BenchmarkThreadPool::thread_count)
+        .min_entities_per_thread(1024)
+        .each([](ecs::Entity, C0& c0) {
+            c0.value += 1;
+        });
+    registry.job<C1>(0)
+        .max_threads(BenchmarkThreadPool::thread_count)
+        .min_entities_per_thread(1024)
+        .each([](ecs::Entity, C1& c1) {
+            c1.value += 1;
+        });
+    registry.job<C2>(0)
+        .max_threads(BenchmarkThreadPool::thread_count)
+        .min_entities_per_thread(1024)
+        .each([](ecs::Entity, C2& c2) {
+            c2.value += 1;
+        });
+    registry.job<C3>(0)
+        .max_threads(BenchmarkThreadPool::thread_count)
+        .min_entities_per_thread(1024)
+        .each([](ecs::Entity, C3& c3) {
+            c3.value += 1;
+        });
+
+    BenchmarkThreadPool thread_pool(BenchmarkThreadPool::thread_count);
+    registry.set_job_thread_executor([&thread_pool](const std::vector<ecs::JobThreadTask>& tasks) {
+        thread_pool.run(tasks);
+    });
+
+    for (auto _ : state) {
+        registry.run_jobs();
+        benchmark::ClobberMemory();
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(entity_count) * 4);
+}
+
 void BasicOperationArgs(benchmark::internal::Benchmark* benchmark) {
     benchmark->Arg(1024)->Arg(16384)->Arg(65536);
 }
@@ -1010,5 +1198,7 @@ BENCHMARK(BM_NonTrivialComponentChurn)->Apply(BasicOperationArgs);
 BENCHMARK(BM_JobScheduleReadOnly)->Apply(JobCountArgs);
 BENCHMARK(BM_JobScheduleConflictingWrites)->Apply(JobCountArgs);
 BENCHMARK(BM_RunJobsSingleThread)->Apply(BasicOperationArgs);
+BENCHMARK(BM_RunJobsParallelThreadPool)->Apply(BasicOperationArgs);
+BENCHMARK(BM_RunJobsParallelOverlappingWritesThreadPool)->Apply(BasicOperationArgs);
 
 }  // namespace

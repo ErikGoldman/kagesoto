@@ -5,6 +5,21 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      benchmark_subset:
+        description: Benchmark subset to run
+        required: true
+        default: characteristic
+        type: choice
+        options:
+          - characteristic
+          - all
+      benchmark_filter:
+        description: Optional Google Benchmark regex. Overrides the selected subset.
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -93,11 +108,52 @@ jobs:
           COVERAGE_OUTCOME: ${{ steps.coverage.outcome }}
           COVERAGE_BADGE_OUTCOME: ${{ steps.coverage-badge.outcome }}
 
-  publish-badges:
-    name: Publish badges
+  benchmarks:
+    name: Characteristic benchmarks
     runs-on: ubuntu-latest
-    needs: test-and-coverage
-    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Configure benchmarks
+        run: >
+          cmake -S . -B build-benchmarks
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DECS_BUILD_EXAMPLE=OFF
+          -DECS_BUILD_TESTING=OFF
+          -DECS_BUILD_BENCHMARKS=ON
+
+      - name: Build benchmarks
+        run: cmake --build build-benchmarks --target basic_operations_benchmark
+
+      - name: Run benchmarks
+        run: >
+          python3 scripts/ci/run_benchmarks.py
+          --build-dir build-benchmarks
+          --output-dir benchmark-results
+          --subset "${{ inputs.benchmark_subset || 'characteristic' }}"
+          --benchmark-filter "${{ inputs.benchmark_filter || '' }}"
+          --commit "${{ github.sha }}"
+          --ref "${{ github.ref_name }}"
+          --run-id "${{ github.run_id }}"
+          --run-attempt "${{ github.run_attempt }}"
+          --repository "${{ github.repository }}"
+
+      - name: Upload benchmark result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results
+
+  publish-pages:
+    name: Publish Pages
+    runs-on: ubuntu-latest
+    needs:
+      - test-and-coverage
+      - benchmarks
+    if: always() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     continue-on-error: true
     permissions:
       contents: read
@@ -108,15 +164,18 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
       - name: Create badge artifacts
         shell: bash
         run: |
-          mkdir -p badge
-          printf '{"schemaVersion":1,"label":"CI","message":"%s","color":"%s"}\n' "${CI_MESSAGE:-failing}" "${CI_COLOR:-red}" > badge/ci.json
+          mkdir -p site
+          printf '{"schemaVersion":1,"label":"CI","message":"%s","color":"%s"}\n' "${CI_MESSAGE:-failing}" "${CI_COLOR:-red}" > site/ci.json
           if [[ -n "${COVERAGE}" && -n "${COLOR}" ]]; then
-            printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "${COVERAGE}" "${COLOR}" > badge/coverage.json
+            printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "${COVERAGE}" "${COLOR}" > site/coverage.json
           else
-            printf '{"schemaVersion":1,"label":"coverage","message":"unknown","color":"lightgrey"}\n' > badge/coverage.json
+            printf '{"schemaVersion":1,"label":"coverage","message":"unknown","color":"lightgrey"}\n' > site/coverage.json
           fi
         env:
           COVERAGE: ${{ needs.test-and-coverage.outputs.coverage }}
@@ -124,11 +183,26 @@ jobs:
           CI_MESSAGE: ${{ needs.test-and-coverage.outputs.ci_message }}
           CI_COLOR: ${{ needs.test-and-coverage.outputs.ci_color }}
 
-      - name: Upload badge artifacts
+      - name: Download benchmark artifact
+        if: needs.benchmarks.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results
+
+      - name: Build benchmark pages
+        if: needs.benchmarks.result == 'success'
+        run: >
+          python3 scripts/ci/build_benchmark_pages.py
+          --site-dir site
+          --results-dir benchmark-results
+          --history-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/benchmarks/history/index.json"
+
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
-          path: badge
+          path: site
 
-      - name: Deploy coverage badge to Pages
+      - name: Deploy Pages
         id: deployment
         uses: actions/deploy-pages@v5
