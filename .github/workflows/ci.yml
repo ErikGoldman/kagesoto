@@ -17,14 +17,13 @@ jobs:
   test-and-coverage:
     name: Test and coverage
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
+    outputs:
+      coverage: ${{ steps.coverage-badge.outputs.coverage }}
+      color: ${{ steps.coverage-badge.outputs.color }}
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Configure
         run: >
@@ -41,6 +40,7 @@ jobs:
           cmake --build build-coverage --target coverage | tee build-coverage/coverage.log
 
       - name: Create coverage badge
+        id: coverage-badge
         shell: bash
         run: |
           coverage="$(sed -n 's/^-- Line coverage: \([0-9.]*\)%.*/\1/p' build-coverage/coverage.log | tail -n 1)"
@@ -65,13 +65,38 @@ jobs:
 
           mkdir -p badge
           printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "${coverage}" "${color}" > badge/coverage.json
+          echo "coverage=${coverage}" >> "${GITHUB_OUTPUT}"
+          echo "color=${color}" >> "${GITHUB_OUTPUT}"
+
+  publish-coverage-badge:
+    name: Publish coverage badge
+    runs-on: ubuntu-latest
+    needs: test-and-coverage
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    continue-on-error: true
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Create coverage badge artifact
+        shell: bash
+        run: |
+          mkdir -p badge
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "${COVERAGE}" "${COLOR}" > badge/coverage.json
+        env:
+          COVERAGE: ${{ needs.test-and-coverage.outputs.coverage }}
+          COLOR: ${{ needs.test-and-coverage.outputs.color }}
 
       - name: Upload coverage badge artifact
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: badge
 
       - name: Deploy coverage badge to Pages
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/deploy-pages@v4
+        id: deployment
+        uses: actions/deploy-pages@v5
