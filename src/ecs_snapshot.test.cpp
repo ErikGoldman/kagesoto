@@ -2,8 +2,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -98,6 +100,45 @@ struct OverAlignedPersistentTraits {
 };
 
 bool OverAlignedPersistentTraits::all_aligned = true;
+
+struct ContextPositionSerializationTraits {
+    using Quantized = Position;
+
+    static Quantized quantize(const Position& value) {
+        return value;
+    }
+
+    static Position dequantize(const Quantized& value) {
+        return value;
+    }
+
+    static void serialize(
+        const Quantized*,
+        const Quantized& current,
+        ecs::BitBuffer& out,
+        ecs::ComponentSerializationContext& context) {
+        auto* counter = static_cast<int*>(context.userContext);
+        if (counter != nullptr) {
+            ++(*counter);
+        }
+        out.push_bits(current.x, 32U);
+        out.push_bits(current.y, 32U);
+    }
+
+    static bool deserialize(
+        ecs::BitBuffer& in,
+        const Quantized*,
+        Quantized& out,
+        ecs::ComponentSerializationContext& context) {
+        auto* counter = static_cast<int*>(context.userContext);
+        if (counter != nullptr) {
+            *counter += 10;
+        }
+        out.x = static_cast<int>(in.read_bits(32U));
+        out.y = static_cast<int>(in.read_bits(32U));
+        return true;
+    }
+};
 
 struct NativeRebindPosition {
     int x = 0;
@@ -529,12 +570,12 @@ TEST_CASE("registry in-memory snapshot reads reject truncated payloads") {
     REQUIRE_THROWS_AS(ecs::Registry::Snapshot::read(truncated), std::runtime_error);
 }
 
-TEST_CASE("persistent full snapshots use component codecs and restore through schema names") {
-    ecs::SnapshotPersistenceCodecs codecs;
+TEST_CASE("persistent full snapshots use component serialization and restore through schema names") {
+    ecs::ComponentSerializationRegistry serialization;
     ecs::Registry source;
-    codecs.register_component<Position, CountingPositionTraits>(source, "Position");
-    codecs.register_component<Velocity>(source, "Velocity");
-    codecs.register_component<GameTime>(source, "GameTime");
+    serialization.register_component<Position, CountingPositionTraits>(source, "Position");
+    serialization.register_component<Velocity>(source, "Velocity");
+    serialization.register_component<GameTime>(source, "GameTime");
     source.register_component<Active>("Active");
 
     const ecs::Entity entity = source.create();
@@ -545,17 +586,17 @@ TEST_CASE("persistent full snapshots use component codecs and restore through sc
     source.write<GameTime>().tick = 77;
 
     ecs::Registry schema;
-    codecs.register_component<Position, CountingPositionTraits>(schema, "Position");
-    codecs.register_component<Velocity>(schema, "Velocity");
-    codecs.register_component<GameTime>(schema, "GameTime");
+    serialization.register_component<Position, CountingPositionTraits>(schema, "Position");
+    serialization.register_component<Velocity>(schema, "Velocity");
+    serialization.register_component<GameTime>(schema, "GameTime");
     schema.register_component<Active>("Active");
 
     CountingPositionTraits::serialize_calls = 0;
     CountingPositionTraits::deserialize_calls = 0;
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_snapshot(stream, source.create_snapshot(), codecs);
+    ecs::write_persistent_snapshot(stream, source.create_snapshot(), serialization);
 
-    ecs::Registry::Snapshot loaded = ecs::read_persistent_snapshot(stream, schema, codecs);
+    ecs::Registry::Snapshot loaded = ecs::read_persistent_snapshot(stream, schema, serialization);
     ecs::Registry restored;
     restored.restore_snapshot(loaded);
 
@@ -570,11 +611,76 @@ TEST_CASE("persistent full snapshots use component codecs and restore through sc
     REQUIRE(CountingPositionTraits::deserialize_calls == 1);
 }
 
-TEST_CASE("persistent delta snapshots handle values and tombstones separately from codecs") {
-    ecs::SnapshotPersistenceCodecs codecs;
+TEST_CASE("component serialization ops use raw quantized bytes and user context") {
+    ecs::ComponentSerializationOps ops =
+        ecs::make_component_serialization_ops<Position, ContextPositionSerializationTraits>("Position");
+
+    Position source{7, 9};
+    std::array<std::uint8_t, sizeof(Position)> quantized{};
+    ops.quantize(&source, quantized.data());
+
+    int context_calls = 0;
+    ecs::ComponentSerializationContext context{&context_calls};
+    ecs::BitBuffer payload;
+    ops.serialize(nullptr, quantized.data(), payload, &context);
+    REQUIRE(context_calls == 1);
+
+    std::array<std::uint8_t, sizeof(Position)> decoded{};
+    REQUIRE(ops.deserialize(payload, nullptr, decoded.data(), &context));
+    REQUIRE(context_calls == 11);
+
+    Position restored{};
+    ops.dequantize(decoded.data(), &restored);
+    REQUIRE(restored.x == 7);
+    REQUIRE(restored.y == 9);
+}
+
+TEST_CASE("dirty snapshot tracker owns full and delta baseline cadence") {
+    ecs::Registry registry;
+    registry.register_component<Position>("Position");
+    const ecs::Entity entity = registry.create();
+
+    std::vector<ecs::DirtySnapshotFrameKind> frames;
+    ecs::DirtySnapshotTrackerOptions options;
+    options.full_snapshot_interval_dirty_frames = 3;
+    options.write = [&](const ecs::DirtySnapshotFrame& frame) {
+        frames.push_back(frame.kind);
+        REQUIRE(frame.registry == &registry);
+        if (frame.kind == ecs::DirtySnapshotFrameKind::Full) {
+            REQUIRE(frame.full != nullptr);
+            REQUIRE(frame.delta == nullptr);
+        } else {
+            REQUIRE(frame.full == nullptr);
+            REQUIRE(frame.delta != nullptr);
+        }
+    };
+
+    ecs::DirtySnapshotTracker tracker(std::move(options));
+    ecs::RegistryDirtyFrameBroadcaster broadcaster;
+    auto subscription = broadcaster.subscribe(tracker);
+
+    REQUIRE(registry.add<Position>(entity, Position{1, 1}) != nullptr);
+    broadcaster.broadcast(registry);
+    REQUIRE_FALSE(registry.is_dirty<Position>(entity));
+
+    registry.write<Position>(entity).x = 2;
+    broadcaster.broadcast(registry);
+
+    registry.write<Position>(entity).x = 3;
+    broadcaster.broadcast(registry);
+
+    REQUIRE(subscription.active());
+    REQUIRE(frames.size() == 3);
+    REQUIRE(frames[0] == ecs::DirtySnapshotFrameKind::Full);
+    REQUIRE(frames[1] == ecs::DirtySnapshotFrameKind::Delta);
+    REQUIRE(frames[2] == ecs::DirtySnapshotFrameKind::Full);
+}
+
+TEST_CASE("persistent delta snapshots handle values and tombstones separately from serialization") {
+    ecs::ComponentSerializationRegistry serialization;
     ecs::Registry source;
-    codecs.register_component<Position, CountingPositionTraits>(source, "Position");
-    codecs.register_component<Velocity>(source, "Velocity");
+    serialization.register_component<Position, CountingPositionTraits>(source, "Position");
+    serialization.register_component<Velocity>(source, "Velocity");
     source.register_component<Active>("Active");
 
     const ecs::Entity updated = source.create();
@@ -591,8 +697,8 @@ TEST_CASE("persistent delta snapshots handle values and tombstones separately fr
 
     auto baseline = source.create_snapshot();
     ecs::Registry replay;
-    codecs.register_component<Position, CountingPositionTraits>(replay, "Position");
-    codecs.register_component<Velocity>(replay, "Velocity");
+    serialization.register_component<Position, CountingPositionTraits>(replay, "Position");
+    serialization.register_component<Velocity>(replay, "Velocity");
     replay.register_component<Active>("Active");
     replay.restore_snapshot(baseline);
 
@@ -603,9 +709,9 @@ TEST_CASE("persistent delta snapshots handle values and tombstones separately fr
     CountingPositionTraits::serialize_calls = 0;
     CountingPositionTraits::deserialize_calls = 0;
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_delta_snapshot(stream, source.create_delta_snapshot(baseline), baseline, codecs);
+    ecs::write_persistent_delta_snapshot(stream, source.create_delta_snapshot(baseline), baseline, serialization);
 
-    ecs::Registry::DeltaSnapshot loaded = ecs::read_persistent_delta_snapshot(stream, replay, baseline, codecs);
+    ecs::Registry::DeltaSnapshot loaded = ecs::read_persistent_delta_snapshot(stream, replay, baseline, serialization);
     replay.restore_delta_snapshot(loaded);
 
     REQUIRE(replay.get<Position>(updated).x == 10);
@@ -616,21 +722,21 @@ TEST_CASE("persistent delta snapshots handle values and tombstones separately fr
     REQUIRE(CountingPositionTraits::deserialize_calls == 1);
 }
 
-TEST_CASE("persistent snapshot codecs pass aligned quantized values to traits") {
-    ecs::SnapshotPersistenceCodecs codecs;
+TEST_CASE("persistent snapshot serialization pass aligned quantized values to traits") {
+    ecs::ComponentSerializationRegistry serialization;
     ecs::Registry source;
-    codecs.register_component<OverAlignedPersistentComponent, OverAlignedPersistentTraits>(source, "OverAligned");
+    serialization.register_component<OverAlignedPersistentComponent, OverAlignedPersistentTraits>(source, "OverAligned");
 
     const ecs::Entity entity = source.create();
     REQUIRE(source.add<OverAlignedPersistentComponent>(entity, OverAlignedPersistentComponent{7}) != nullptr);
 
     OverAlignedPersistentTraits::all_aligned = true;
     std::stringstream full_stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_snapshot(full_stream, source.create_snapshot(), codecs);
+    ecs::write_persistent_snapshot(full_stream, source.create_snapshot(), serialization);
 
     ecs::Registry schema;
-    codecs.register_component<OverAlignedPersistentComponent, OverAlignedPersistentTraits>(schema, "OverAligned");
-    ecs::Registry::Snapshot loaded = ecs::read_persistent_snapshot(full_stream, schema, codecs);
+    serialization.register_component<OverAlignedPersistentComponent, OverAlignedPersistentTraits>(schema, "OverAligned");
+    ecs::Registry::Snapshot loaded = ecs::read_persistent_snapshot(full_stream, schema, serialization);
     ecs::Registry restored;
     restored.restore_snapshot(loaded);
 
@@ -643,18 +749,18 @@ TEST_CASE("persistent snapshot codecs pass aligned quantized values to traits") 
 
     OverAlignedPersistentTraits::all_aligned = true;
     std::stringstream delta_stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_delta_snapshot(delta_stream, source.create_delta_snapshot(baseline), baseline, codecs);
-    ecs::Registry::DeltaSnapshot delta = ecs::read_persistent_delta_snapshot(delta_stream, restored, baseline, codecs);
+    ecs::write_persistent_delta_snapshot(delta_stream, source.create_delta_snapshot(baseline), baseline, serialization);
+    ecs::Registry::DeltaSnapshot delta = ecs::read_persistent_delta_snapshot(delta_stream, restored, baseline, serialization);
     restored.restore_delta_snapshot(delta);
 
     REQUIRE(restored.get<OverAlignedPersistentComponent>(entity).value == 11);
     REQUIRE(OverAlignedPersistentTraits::all_aligned);
 }
 
-TEST_CASE("persistent delta tombstones do not call component codecs") {
-    ecs::SnapshotPersistenceCodecs codecs;
+TEST_CASE("persistent delta tombstones do not call component serialization") {
+    ecs::ComponentSerializationRegistry serialization;
     ecs::Registry source;
-    codecs.register_component<Position, CountingPositionTraits>(source, "Position");
+    serialization.register_component<Position, CountingPositionTraits>(source, "Position");
 
     const ecs::Entity removed = source.create();
     REQUIRE(source.add<Position>(removed, Position{2, 2}) != nullptr);
@@ -664,12 +770,12 @@ TEST_CASE("persistent delta tombstones do not call component codecs") {
 
     CountingPositionTraits::serialize_calls = 0;
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_delta_snapshot(stream, source.create_delta_snapshot(baseline), baseline, codecs);
+    ecs::write_persistent_delta_snapshot(stream, source.create_delta_snapshot(baseline), baseline, serialization);
 
     REQUIRE(CountingPositionTraits::serialize_calls == 0);
 }
 
-TEST_CASE("persistent snapshots reject missing codecs and duplicate component names") {
+TEST_CASE("persistent snapshots reject missing serialization and duplicate component names") {
     ecs::Registry registry;
     registry.register_component<Position>("Position");
     REQUIRE_THROWS_AS(registry.register_component<Velocity>("Position"), std::logic_error);
@@ -677,22 +783,22 @@ TEST_CASE("persistent snapshots reject missing codecs and duplicate component na
     const ecs::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{1, 2}) != nullptr);
 
-    ecs::SnapshotPersistenceCodecs codecs;
+    ecs::ComponentSerializationRegistry serialization;
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    REQUIRE_THROWS_AS(ecs::write_persistent_snapshot(stream, registry.create_snapshot(), codecs), std::logic_error);
+    REQUIRE_THROWS_AS(ecs::write_persistent_snapshot(stream, registry.create_snapshot(), serialization), std::logic_error);
 }
 
 TEST_CASE("persistent snapshot frame bit length supports skipping frames") {
-    ecs::SnapshotPersistenceCodecs codecs;
+    ecs::ComponentSerializationRegistry serialization;
     ecs::Registry source;
-    codecs.register_component<Position, CountingPositionTraits>(source, "Position");
+    serialization.register_component<Position, CountingPositionTraits>(source, "Position");
     const ecs::Entity entity = source.create();
     REQUIRE(source.add<Position>(entity, Position{1, 1}) != nullptr);
 
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_snapshot(stream, source.create_snapshot(), codecs);
+    ecs::write_persistent_snapshot(stream, source.create_snapshot(), serialization);
     source.write<Position>(entity).x = 9;
-    ecs::write_persistent_snapshot(stream, source.create_snapshot(), codecs);
+    ecs::write_persistent_snapshot(stream, source.create_snapshot(), serialization);
 
     const std::string bytes = stream.str();
     REQUIRE(bytes.size() >= 20U);
@@ -708,47 +814,47 @@ TEST_CASE("persistent snapshot frame bit length supports skipping frames") {
     REQUIRE(second_offset < bytes.size());
 
     std::stringstream second(bytes.substr(second_offset), std::ios::in | std::ios::out | std::ios::binary);
-    ecs::Registry::Snapshot loaded = ecs::read_persistent_snapshot(second, source, codecs);
+    ecs::Registry::Snapshot loaded = ecs::read_persistent_snapshot(second, source, serialization);
     ecs::Registry restored;
     restored.restore_snapshot(loaded);
     REQUIRE(restored.get<Position>(entity).x == 9);
 }
 
-TEST_CASE("persistent snapshot read rejects unread codec payload bits") {
-    ecs::SnapshotPersistenceCodecs writer_codecs;
+TEST_CASE("persistent snapshot read rejects unread serialization payload bits") {
+    ecs::ComponentSerializationRegistry writer_serialization;
     ecs::Registry source;
-    writer_codecs.register_component<Position, CountingPositionTraits>(source, "Position");
+    writer_serialization.register_component<Position, CountingPositionTraits>(source, "Position");
     const ecs::Entity entity = source.create();
     REQUIRE(source.add<Position>(entity, Position{1, 2}) != nullptr);
 
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_snapshot(stream, source.create_snapshot(), writer_codecs);
+    ecs::write_persistent_snapshot(stream, source.create_snapshot(), writer_serialization);
 
-    ecs::SnapshotPersistenceCodecs reader_codecs;
+    ecs::ComponentSerializationRegistry reader_serialization;
     ecs::Registry schema;
-    reader_codecs.register_component<Position, UnreadPositionTraits>(schema, "Position");
+    reader_serialization.register_component<Position, UnreadPositionTraits>(schema, "Position");
 
-    REQUIRE_THROWS_AS(ecs::read_persistent_snapshot(stream, schema, reader_codecs), std::runtime_error);
+    REQUIRE_THROWS_AS(ecs::read_persistent_snapshot(stream, schema, reader_serialization), std::runtime_error);
 }
 
 TEST_CASE("persistent snapshot reads reject truncated frames") {
-    ecs::SnapshotPersistenceCodecs codecs;
+    ecs::ComponentSerializationRegistry serialization;
     ecs::Registry source;
-    codecs.register_component<Position, CountingPositionTraits>(source, "Position");
+    serialization.register_component<Position, CountingPositionTraits>(source, "Position");
 
     const ecs::Entity entity = source.create();
     REQUIRE(source.add<Position>(entity, Position{3, 4}) != nullptr);
 
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_snapshot(stream, source.create_snapshot(), codecs);
+    ecs::write_persistent_snapshot(stream, source.create_snapshot(), serialization);
     std::string bytes = stream.str();
     REQUIRE(bytes.size() > 8U);
     bytes.pop_back();
 
     ecs::Registry schema;
-    codecs.register_component<Position, CountingPositionTraits>(schema, "Position");
+    serialization.register_component<Position, CountingPositionTraits>(schema, "Position");
     std::stringstream truncated(bytes, std::ios::in | std::ios::out | std::ios::binary);
-    REQUIRE_THROWS_AS(ecs::read_persistent_snapshot(truncated, schema, codecs), std::runtime_error);
+    REQUIRE_THROWS_AS(ecs::read_persistent_snapshot(truncated, schema, serialization), std::runtime_error);
 }
 
 TEST_CASE("delta snapshots restore dirty values additions removals and destroyed entities") {

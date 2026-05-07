@@ -340,11 +340,11 @@ std::string text = registry.debug_print(entity, position_type);
 - `Registry::Snapshot Registry::Snapshot::read_native(std::istream& in)`
 - `void Registry::DeltaSnapshot::write_native(std::ostream& out, const SnapshotIoOptions& options = {}) const`
 - `Registry::DeltaSnapshot Registry::DeltaSnapshot::read_native(std::istream& in)`
-- `ecs::SnapshotPersistenceCodecs::register_component<T, Traits>(Registry& registry, std::string name = {})`
-- `void ecs::write_persistent_snapshot(std::ostream& out, const Registry::Snapshot& snapshot, const SnapshotPersistenceCodecs& codecs, const SnapshotIoOptions& options = {})`
-- `Registry::Snapshot ecs::read_persistent_snapshot(std::istream& in, const Registry& schema, const SnapshotPersistenceCodecs& codecs)`
-- `void ecs::write_persistent_delta_snapshot(std::ostream& out, const Registry::DeltaSnapshot& snapshot, const Registry::Snapshot& baseline, const SnapshotPersistenceCodecs& codecs, const SnapshotIoOptions& options = {})`
-- `Registry::DeltaSnapshot ecs::read_persistent_delta_snapshot(std::istream& in, const Registry& schema, const Registry::Snapshot& baseline, const SnapshotPersistenceCodecs& codecs)`
+- `ecs::ComponentSerializationRegistry::register_component<T, Traits>(Registry& registry, std::string name = {})`
+- `void ecs::write_persistent_snapshot(std::ostream& out, const Registry::Snapshot& snapshot, const ComponentSerializationRegistry& serialization, const SnapshotIoOptions& options = {})`
+- `Registry::Snapshot ecs::read_persistent_snapshot(std::istream& in, const Registry& schema, const ComponentSerializationRegistry& serialization)`
+- `void ecs::write_persistent_delta_snapshot(std::ostream& out, const Registry::DeltaSnapshot& snapshot, const Registry::Snapshot& baseline, const ComponentSerializationRegistry& serialization, const SnapshotIoOptions& options = {})`
+- `Registry::DeltaSnapshot ecs::read_persistent_delta_snapshot(std::istream& in, const Registry& schema, const Registry::Snapshot& baseline, const ComponentSerializationRegistry& serialization)`
 - `Registry::View<Components...> Registry::view<Components...>()`
 - `Registry::JobView<Components...> Registry::job<Components...>(int order)`
 - `void Registry::set_job_thread_executor(JobThreadExecutor executor)`
@@ -399,7 +399,7 @@ In-memory snapshots are created with `Registry::create_snapshot()` / `create_del
 
 Reading and writing snapshots means serializing an existing snapshot object to or from a stream/bit buffer. `Snapshot::write_native()` / `read_native()` and `DeltaSnapshot::write_native()` / `read_native()` serialize the native in-memory snapshot binary format; `write()` / `read()` remain compatibility wrappers. That native format is useful for local transient I/O but is not a durable or portable disk format. On full native snapshot restore, typed C++ component bindings are rebuilt by matching the current process's registered component type names to restored component names; serialized typed cache slots are not trusted as stable type identities.
 
-Persistent snapshots are separate disk frames written with `write_persistent_snapshot()` and `write_persistent_delta_snapshot()`. Persistent frames identify components by unique non-empty component names, dedupe those names in a per-frame name table, store the frame length in bits before the frame body for skipping, and use `SnapshotComponentTraits<T>`/`SnapshotPersistenceCodecs` to quantize and serialize present component values through `ecs::BitBuffer`. Component removals and destroyed-entity tombstones are encoded by the snapshot system, not by component codecs. Persistent reads require a schema registry with matching component names and registered codecs, then return normal snapshot objects for `Registry::restore_snapshot()` or `Registry::restore_delta_snapshot()`.
+Persistent snapshots are separate disk frames written with `write_persistent_snapshot()` and `write_persistent_delta_snapshot()`. Persistent frames identify components by unique non-empty component names, dedupe those names in a per-frame name table, store the frame length in bits before the frame body for skipping, and use `ComponentSerializationTraits<T>`/`ComponentSerializationRegistry` to quantize and serialize present component values through `ecs::BitBuffer`. Component removals and destroyed-entity tombstones are encoded by the snapshot system, not by component serialization. Persistent reads require a schema registry with matching component names and registered serialization, then return normal snapshot objects for `Registry::restore_snapshot()` or `Registry::restore_delta_snapshot()`.
 
 Registered job callbacks are not part of snapshots. Internal bookkeeping entities are tagged with `Registry::system_tag()` and excluded from snapshot payloads.
 

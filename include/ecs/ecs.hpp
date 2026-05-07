@@ -47,7 +47,7 @@ namespace ecs {
 template <typename T>
 struct is_singleton_component : std::false_type {};
 
-class SnapshotPersistenceCodecs;
+class ComponentSerializationRegistry;
 class PersistentSnapshotAccess;
 
 namespace detail {
@@ -298,14 +298,47 @@ struct SnapshotComponentOptions {
     std::vector<Entity> exclude_components;
 };
 
+class Registry;
+
+struct ComponentSerializationContext {
+    void* userContext = nullptr;
+};
+
+struct ComponentSerializationOps {
+    using QuantizeFn = void (*)(const void*, std::uint8_t*);
+    using DequantizeFn = void (*)(const std::uint8_t*, void*);
+    using PushToRegistryFn = bool (*)(Registry&, Entity, const std::uint8_t*);
+    using SerializeFn = void (*)(
+        const std::uint8_t*,
+        const std::uint8_t*,
+        BitBuffer&,
+        ComponentSerializationContext*);
+    using DeserializeFn = bool (*)(
+        BitBuffer&,
+        const std::uint8_t*,
+        std::uint8_t*,
+        ComponentSerializationContext*);
+
+    std::string name;
+    Entity component;
+    std::size_t component_size = 0;
+    std::size_t quantized_size = 0;
+    QuantizeFn quantize = nullptr;
+    DequantizeFn dequantize = nullptr;
+    PushToRegistryFn push_to_registry = nullptr;
+    SerializeFn serialize = nullptr;
+    DeserializeFn deserialize = nullptr;
+    bool uses_context = false;
+};
+
 template <typename T>
-struct SnapshotComponentTraits {
+struct ComponentSerializationTraits {
     using Quantized = T;
 
     static Quantized quantize(const T& value) {
         static_assert(
             std::is_trivially_copyable<T>::value,
-            "default SnapshotComponentTraits require a trivially copyable component");
+            "default ComponentSerializationTraits require a trivially copyable component");
         return value;
     }
 
@@ -316,14 +349,14 @@ struct SnapshotComponentTraits {
     static void serialize(const Quantized* /*baseline*/, const Quantized& current, BitBuffer& out) {
         static_assert(
             std::is_trivially_copyable<Quantized>::value,
-            "default SnapshotComponentTraits serialization requires a trivially copyable quantized state");
+            "default ComponentSerializationTraits serialization requires a trivially copyable quantized state");
         out.push_bytes(reinterpret_cast<const char*>(&current), sizeof(Quantized));
     }
 
     static bool deserialize(BitBuffer& in, const Quantized* /*baseline*/, Quantized& out) {
         static_assert(
             std::is_trivially_copyable<Quantized>::value,
-            "default SnapshotComponentTraits deserialization requires a trivially copyable quantized state");
+            "default ComponentSerializationTraits deserialization requires a trivially copyable quantized state");
         in.read_bytes(reinterpret_cast<char*>(&out), sizeof(Quantized));
         return true;
     }
@@ -337,8 +370,6 @@ struct JobThreadTask {
 };
 
 using JobThreadExecutor = std::function<void(const std::vector<JobThreadTask>&)>;
-
-class Registry;
 
 class JobGraph {
 public:
@@ -780,6 +811,75 @@ public:
 
     void* write(Entity entity, Entity component);
 
+    template <typename T>
+    bool clear_dirty(Entity entity) {
+        require_runtime_registry_access_allowed("clear_dirty");
+        return dirty_clear<T>(entity);
+    }
+
+    template <typename T, typename std::enable_if<is_singleton_component<T>::value, int>::type = 0>
+    bool clear_dirty() {
+        require_runtime_registry_access_allowed("clear_dirty");
+        return dirty_clear<T>();
+    }
+
+    bool clear_dirty(Entity entity, Entity component) {
+        require_runtime_registry_access_allowed("clear_dirty");
+        return dirty_clear(entity, component);
+    }
+
+    template <typename T>
+    bool is_dirty(Entity entity) const {
+        require_runtime_registry_access_allowed("is_dirty");
+        return dirty_is<T>(entity);
+    }
+
+    template <typename T, typename std::enable_if<is_singleton_component<T>::value, int>::type = 0>
+    bool is_dirty() const {
+        require_runtime_registry_access_allowed("is_dirty");
+        return dirty_is<T>();
+    }
+
+    bool is_dirty(Entity entity, Entity component) const {
+        require_runtime_registry_access_allowed("is_dirty");
+        return dirty_is(entity, component);
+    }
+
+    template <typename T>
+    void clear_all_dirty() {
+        require_runtime_registry_access_allowed("clear_all_dirty");
+        dirty_clear_all(registered_component<T>());
+    }
+
+    void clear_all_dirty(Entity component) {
+        require_runtime_registry_access_allowed("clear_all_dirty");
+        dirty_clear_all(component);
+    }
+
+    template <typename T, typename Fn>
+    void each_dirty(Fn&& fn) const {
+        require_runtime_registry_access_allowed("each_dirty");
+        dirty_each<T>(std::forward<Fn>(fn));
+    }
+
+    template <typename Fn>
+    void each_dirty(Entity component, Fn&& fn) const {
+        require_runtime_registry_access_allowed("each_dirty");
+        dirty_each(component, std::forward<Fn>(fn));
+    }
+
+    template <typename T, typename Fn>
+    void each_removed(Fn&& fn) const {
+        require_runtime_registry_access_allowed("each_removed");
+        dirty_each_removed<T>(std::forward<Fn>(fn));
+    }
+
+    template <typename Fn>
+    void each_removed(Entity component, Fn&& fn) const {
+        require_runtime_registry_access_allowed("each_removed");
+        dirty_each_removed(component, std::forward<Fn>(fn));
+    }
+
     template <typename T, typename std::enable_if<detail::is_tag_query<T>::value, int>::type = 0>
     bool has(Entity entity) const {
         require_runtime_registry_access_allowed("has");
@@ -842,14 +942,14 @@ public:
         const Registry* registry_ = nullptr;
     };
 
-    class DirtyFrame {
+    class DirtyFrameScope {
     public:
-        DirtyFrame(const DirtyFrame&) = delete;
-        DirtyFrame& operator=(const DirtyFrame&) = delete;
-        DirtyFrame(DirtyFrame&& other) noexcept : registry_(other.registry_) {
+        DirtyFrameScope(const DirtyFrameScope&) = delete;
+        DirtyFrameScope& operator=(const DirtyFrameScope&) = delete;
+        DirtyFrameScope(DirtyFrameScope&& other) noexcept : registry_(other.registry_) {
             other.registry_ = nullptr;
         }
-        DirtyFrame& operator=(DirtyFrame&& other) noexcept {
+        DirtyFrameScope& operator=(DirtyFrameScope&& other) noexcept {
             if (this != &other) {
                 clear();
                 registry_ = other.registry_;
@@ -857,7 +957,7 @@ public:
             }
             return *this;
         }
-        ~DirtyFrame() {
+        ~DirtyFrameScope() {
             clear();
         }
 
@@ -867,7 +967,7 @@ public:
 
     private:
         friend class Registry;
-        explicit DirtyFrame(Registry& registry) : registry_(&registry) {}
+        explicit DirtyFrameScope(Registry& registry) : registry_(&registry) {}
 
         void clear() {
             if (registry_ != nullptr) {
@@ -912,7 +1012,8 @@ public:
     }
 
 private:
-    friend class SnapshotPersistenceCodecs;
+    friend class ComponentSerializationRegistry;
+    friend class RegistryDirtyFrameBroadcaster;
     friend class PersistentSnapshotAccess;
     static constexpr std::size_t npos_type_id = std::numeric_limits<std::size_t>::max();
     static constexpr std::size_t default_min_entities_per_thread = 1024;
@@ -931,9 +1032,9 @@ private:
 #endif
     }
 
-    DirtyFrame begin_dirty_frame() {
+    DirtyFrameScope dirty_scope() {
         require_runtime_registry_access_allowed("begin_dirty_frame");
-        return DirtyFrame(*this);
+        return DirtyFrameScope(*this);
     }
 
     bool dirty_clear(Entity entity, Entity component);
@@ -1302,23 +1403,23 @@ private:
     friend void write_persistent_snapshot(
         std::ostream& out,
         const Registry::Snapshot& snapshot,
-        const SnapshotPersistenceCodecs& codecs,
+        const ComponentSerializationRegistry& serialization,
         const SnapshotComponentOptions& options);
     friend Registry::Snapshot read_persistent_snapshot(
         std::istream& in,
         const Registry& schema,
-        const SnapshotPersistenceCodecs& codecs);
+        const ComponentSerializationRegistry& serialization);
     friend void write_persistent_delta_snapshot(
         std::ostream& out,
         const Registry::DeltaSnapshot& snapshot,
         const Registry::Snapshot& baseline,
-        const SnapshotPersistenceCodecs& codecs,
+        const ComponentSerializationRegistry& serialization,
         const SnapshotComponentOptions& options);
     friend Registry::DeltaSnapshot read_persistent_delta_snapshot(
         std::istream& in,
         const Registry& schema,
         const Registry::Snapshot& baseline,
-        const SnapshotPersistenceCodecs& codecs);
+        const ComponentSerializationRegistry& serialization);
 
     struct JobRecord {
         Entity entity;
@@ -1713,23 +1814,23 @@ private:
     friend void write_persistent_snapshot(
         std::ostream& out,
         const Registry::Snapshot& snapshot,
-        const SnapshotPersistenceCodecs& codecs,
+        const ComponentSerializationRegistry& serialization,
         const SnapshotComponentOptions& options);
     friend Registry::Snapshot read_persistent_snapshot(
         std::istream& in,
         const Registry& schema,
-        const SnapshotPersistenceCodecs& codecs);
+        const ComponentSerializationRegistry& serialization);
     friend void write_persistent_delta_snapshot(
         std::ostream& out,
         const Registry::DeltaSnapshot& snapshot,
         const Registry::Snapshot& baseline,
-        const SnapshotPersistenceCodecs& codecs,
+        const ComponentSerializationRegistry& serialization,
         const SnapshotComponentOptions& options);
     friend Registry::DeltaSnapshot read_persistent_delta_snapshot(
         std::istream& in,
         const Registry& schema,
         const Registry::Snapshot& baseline,
-        const SnapshotPersistenceCodecs& codecs);
+        const ComponentSerializationRegistry& serialization);
 
     std::vector<std::uint64_t> entities_;
     std::uint32_t free_head_ = invalid_index;
@@ -1765,13 +1866,13 @@ private:
         std::ostream& out,
         const Registry::DeltaSnapshot& snapshot,
         const Registry::Snapshot& baseline,
-        const SnapshotPersistenceCodecs& codecs,
+        const ComponentSerializationRegistry& serialization,
         const SnapshotComponentOptions& options);
     friend Registry::DeltaSnapshot read_persistent_delta_snapshot(
         std::istream& in,
         const Registry& schema,
         const Registry::Snapshot& baseline,
-        const SnapshotPersistenceCodecs& codecs);
+        const ComponentSerializationRegistry& serialization);
 
     std::vector<std::uint64_t> entities_;
     std::uint32_t free_head_ = invalid_index;
@@ -1782,68 +1883,184 @@ private:
     std::uint64_t state_token_ = 0;
 };
 
-class SnapshotPersistenceCodecs {
+namespace detail {
+
+template <typename Traits, typename Quantized, typename = void>
+struct has_context_component_serialize : std::false_type {};
+
+template <typename Traits, typename Quantized>
+struct has_context_component_serialize<
+    Traits,
+    Quantized,
+    std::void_t<decltype(Traits::serialize(
+        static_cast<const Quantized*>(nullptr),
+        std::declval<const Quantized&>(),
+        std::declval<BitBuffer&>(),
+        std::declval<ComponentSerializationContext&>()))>> : std::true_type {};
+
+template <typename Traits, typename Quantized, typename = void>
+struct has_context_component_deserialize : std::false_type {};
+
+template <typename Traits, typename Quantized>
+struct has_context_component_deserialize<
+    Traits,
+    Quantized,
+    std::void_t<decltype(Traits::deserialize(
+        std::declval<BitBuffer&>(),
+        static_cast<const Quantized*>(nullptr),
+        std::declval<Quantized&>(),
+        std::declval<ComponentSerializationContext&>()))>> : std::true_type {};
+
+template <typename Traits, typename Quantized>
+void serialize_component_quantized(
+    const Quantized* previous,
+    const Quantized& current,
+    BitBuffer& out,
+    ComponentSerializationContext* context) {
+    if constexpr (has_context_component_serialize<Traits, Quantized>::value) {
+        ComponentSerializationContext empty_context;
+        Traits::serialize(previous, current, out, context != nullptr ? *context : empty_context);
+    } else {
+        (void)context;
+        Traits::serialize(previous, current, out);
+    }
+}
+
+template <typename Traits, typename Quantized>
+bool deserialize_component_quantized(
+    BitBuffer& in,
+    const Quantized* previous,
+    Quantized& out,
+    ComponentSerializationContext* context) {
+    if constexpr (has_context_component_deserialize<Traits, Quantized>::value) {
+        ComponentSerializationContext empty_context;
+        return Traits::deserialize(in, previous, out, context != nullptr ? *context : empty_context);
+    } else {
+        (void)context;
+        return Traits::deserialize(in, previous, out);
+    }
+}
+
+}  // namespace detail
+
+template <typename T, typename Traits = ComponentSerializationTraits<T>>
+ComponentSerializationOps make_component_serialization_ops(std::string name = {}) {
+    using Quantized = typename Traits::Quantized;
+    static_assert(
+        std::is_trivially_copyable<Quantized>::value,
+        "component serialization quantized state must be trivially copyable");
+    static_assert(
+        std::is_copy_constructible<T>::value,
+        "component serialization components must be copy constructible when decoded");
+
+    ComponentSerializationOps ops;
+    ops.name = std::move(name);
+    ops.component_size = sizeof(T);
+    ops.quantized_size = sizeof(Quantized);
+    ops.quantize = [](const void* value, std::uint8_t* out) {
+        const Quantized quantized = Traits::quantize(*static_cast<const T*>(value));
+        std::memcpy(out, &quantized, sizeof(Quantized));
+    };
+    ops.dequantize = [](const std::uint8_t* quantized_bytes, void* out) {
+        Quantized quantized{};
+        std::memcpy(&quantized, quantized_bytes, sizeof(Quantized));
+        *static_cast<T*>(out) = Traits::dequantize(quantized);
+    };
+    ops.push_to_registry = [](Registry& registry, Entity entity, const std::uint8_t* quantized_bytes) {
+        Quantized quantized{};
+        std::memcpy(&quantized, quantized_bytes, sizeof(Quantized));
+        if constexpr (is_singleton_component<T>::value) {
+            (void)entity;
+            registry.write<T>() = Traits::dequantize(quantized);
+            return true;
+        } else {
+            return registry.add<T>(entity, Traits::dequantize(quantized)) != nullptr;
+        }
+    };
+    ops.serialize = [](
+        const std::uint8_t* previous_bytes,
+        const std::uint8_t* current_bytes,
+        BitBuffer& out,
+        ComponentSerializationContext* context) {
+        Quantized current{};
+        std::memcpy(&current, current_bytes, sizeof(Quantized));
+
+        Quantized previous{};
+        const Quantized* previous_ptr = nullptr;
+        if (previous_bytes != nullptr) {
+            std::memcpy(&previous, previous_bytes, sizeof(Quantized));
+            previous_ptr = &previous;
+        }
+
+        detail::serialize_component_quantized<Traits, Quantized>(previous_ptr, current, out, context);
+    };
+    ops.deserialize = [](
+        BitBuffer& in,
+        const std::uint8_t* previous_bytes,
+        std::uint8_t* out,
+        ComponentSerializationContext* context) {
+        Quantized previous{};
+        const Quantized* previous_ptr = nullptr;
+        if (previous_bytes != nullptr) {
+            std::memcpy(&previous, previous_bytes, sizeof(Quantized));
+            previous_ptr = &previous;
+        }
+
+        Quantized quantized{};
+        if (!detail::deserialize_component_quantized<Traits, Quantized>(in, previous_ptr, quantized, context)) {
+            return false;
+        }
+        std::memcpy(out, &quantized, sizeof(Quantized));
+        return true;
+    };
+    ops.uses_context =
+        detail::has_context_component_serialize<Traits, Quantized>::value ||
+        detail::has_context_component_deserialize<Traits, Quantized>::value;
+    return ops;
+}
+
+class ComponentSerializationRegistry {
 public:
-    template <typename T, typename Traits = SnapshotComponentTraits<T>>
+    template <typename T, typename Traits = ComponentSerializationTraits<T>>
     Entity register_component(Registry& registry, std::string name = {}) {
         using Quantized = typename Traits::Quantized;
-        static_assert(
-            std::is_trivially_copyable<Quantized>::value,
-            "persistent snapshot quantized state must be trivially copyable");
-        static_assert(
-            std::is_copy_constructible<T>::value,
-            "persistent snapshot components must be copy constructible when decoded");
-
+        std::string component_name = name;
         const Entity component = registry.register_component<T>(std::move(name));
         const auto* record_info = registry.component_info(component);
         if (record_info == nullptr || record_info->tag) {
-            throw std::logic_error("persistent snapshot codecs cannot be registered for tags");
+            throw std::logic_error("component serialization cannot be registered for tags");
         }
         const auto found_record = registry.component_catalog_.records.find(Registry::entity_index(component));
         if (found_record == registry.component_catalog_.records.end() || found_record->second.name.empty()) {
-            throw std::logic_error("persistent snapshot codecs require a non-empty component name");
+            throw std::logic_error("component serialization requires a non-empty component name");
         }
 
-        Codec codec;
-        codec.component = component;
-        codec.component_size = sizeof(T);
-        codec.quantized_size = sizeof(Quantized);
-        codec.quantize = [](const void* value) {
-            const Quantized quantized = Traits::quantize(*static_cast<const T*>(value));
-            return copy_to_bytes(quantized);
-        };
-        codec.serialize = [](const std::vector<unsigned char>* baseline, const std::vector<unsigned char>& current, BitBuffer& out) {
-            const Quantized current_value = bytes_to_value<Quantized>(current);
-            if (baseline == nullptr) {
-                Traits::serialize(nullptr, current_value, out);
-                return;
-            }
-            const Quantized previous_value = bytes_to_value<Quantized>(*baseline);
-            Traits::serialize(&previous_value, current_value, out);
-        };
-        codec.deserialize = [](BitBuffer& in, const std::vector<unsigned char>* baseline, std::vector<unsigned char>& out) {
-            Quantized quantized{};
-            if (baseline == nullptr) {
-                if (!Traits::deserialize(in, nullptr, quantized)) {
-                    return false;
-                }
-            } else {
-                const Quantized previous_value = bytes_to_value<Quantized>(*baseline);
-                if (!Traits::deserialize(in, &previous_value, quantized)) {
-                    return false;
-                }
-            }
-            out = copy_to_bytes(quantized);
-            return true;
-        };
-        codec.emplace = [](Registry::TypeErasedStorage& storage, std::uint32_t index, const std::vector<unsigned char>& quantized) {
-            const Quantized quantized_value = bytes_to_value<Quantized>(quantized);
+        Entry entry;
+        entry.ops = make_component_serialization_ops<T, Traits>(component_name);
+        entry.ops.component = component;
+        entry.emplace = [](Registry::TypeErasedStorage& storage, std::uint32_t index, const std::uint8_t* quantized) {
+            Quantized quantized_value{};
+            std::memcpy(&quantized_value, quantized, sizeof(Quantized));
             const T value = Traits::dequantize(quantized_value);
             storage.emplace_or_replace_copy(index, &value);
         };
 
-        codecs_[found_record->second.name] = std::move(codec);
+        entries_[found_record->second.name] = std::move(entry);
         return component;
+    }
+
+    const ComponentSerializationOps* find(std::string const& name) const {
+        const auto found = entries_.find(name);
+        return found == entries_.end() ? nullptr : &found->second.ops;
+    }
+
+    const ComponentSerializationOps* find(Entity component) const {
+        for (const auto& entry : entries_) {
+            if (entry.second.ops.component == component) {
+                return &entry.second.ops;
+            }
+        }
+        return nullptr;
     }
 
 private:
@@ -1851,84 +2068,144 @@ private:
     friend void write_persistent_snapshot(
         std::ostream& out,
         const Registry::Snapshot& snapshot,
-        const SnapshotPersistenceCodecs& codecs,
+        const ComponentSerializationRegistry& serialization,
         const SnapshotComponentOptions& options);
     friend Registry::Snapshot read_persistent_snapshot(
         std::istream& in,
         const Registry& schema,
-        const SnapshotPersistenceCodecs& codecs);
+        const ComponentSerializationRegistry& serialization);
     friend void write_persistent_delta_snapshot(
         std::ostream& out,
         const Registry::DeltaSnapshot& snapshot,
         const Registry::Snapshot& baseline,
-        const SnapshotPersistenceCodecs& codecs,
+        const ComponentSerializationRegistry& serialization,
         const SnapshotComponentOptions& options);
     friend Registry::DeltaSnapshot read_persistent_delta_snapshot(
         std::istream& in,
         const Registry& schema,
         const Registry::Snapshot& baseline,
-        const SnapshotPersistenceCodecs& codecs);
+        const ComponentSerializationRegistry& serialization);
 
-    struct Codec {
-        Entity component;
-        std::size_t component_size = 0;
-        std::size_t quantized_size = 0;
-        std::function<std::vector<unsigned char>(const void*)> quantize;
-        std::function<void(const std::vector<unsigned char>*, const std::vector<unsigned char>&, BitBuffer&)> serialize;
-        std::function<bool(BitBuffer&, const std::vector<unsigned char>*, std::vector<unsigned char>&)> deserialize;
-        std::function<void(Registry::TypeErasedStorage&, std::uint32_t, const std::vector<unsigned char>&)> emplace;
+    struct Entry {
+        ComponentSerializationOps ops;
+        std::function<void(Registry::TypeErasedStorage&, std::uint32_t, const std::uint8_t*)> emplace;
     };
 
-    template <typename T>
-    static std::vector<unsigned char> copy_to_bytes(const T& value) {
-        static_assert(
-            std::is_trivially_copyable<T>::value,
-            "persistent snapshot byte copies require a trivially copyable value");
-        std::vector<unsigned char> bytes(sizeof(T));
-        if (!bytes.empty()) {
-            std::memcpy(bytes.data(), &value, sizeof(T));
-        }
-        return bytes;
-    }
-
-    template <typename T>
-    static T bytes_to_value(const std::vector<unsigned char>& bytes) {
-        static_assert(
-            std::is_trivially_copyable<T>::value,
-            "persistent snapshot byte copies require a trivially copyable value");
-        if (bytes.size() != sizeof(T)) {
-            throw std::runtime_error("persistent snapshot quantized payload has invalid size");
-        }
-        T value{};
-        if (!bytes.empty()) {
-            std::memcpy(&value, bytes.data(), sizeof(T));
-        }
-        return value;
-    }
-
-    std::unordered_map<std::string, Codec> codecs_;
+    std::unordered_map<std::string, Entry> entries_;
 };
 
 void write_persistent_snapshot(
     std::ostream& out,
     const Registry::Snapshot& snapshot,
-    const SnapshotPersistenceCodecs& codecs,
+    const ComponentSerializationRegistry& serialization,
     const SnapshotComponentOptions& options = {});
 Registry::Snapshot read_persistent_snapshot(
     std::istream& in,
     const Registry& schema,
-    const SnapshotPersistenceCodecs& codecs);
+    const ComponentSerializationRegistry& serialization);
 void write_persistent_delta_snapshot(
     std::ostream& out,
     const Registry::DeltaSnapshot& snapshot,
     const Registry::Snapshot& baseline,
-    const SnapshotPersistenceCodecs& codecs,
+    const ComponentSerializationRegistry& serialization,
     const SnapshotComponentOptions& options = {});
 Registry::DeltaSnapshot read_persistent_delta_snapshot(
     std::istream& in,
     const Registry& schema,
     const Registry::Snapshot& baseline,
-    const SnapshotPersistenceCodecs& codecs);
+    const ComponentSerializationRegistry& serialization);
+
+struct RegistryDirtyFrame {
+    Registry& registry;
+    Registry::DirtyView dirty;
+};
+
+class RegistryDirtyFrameBroadcastListener {
+public:
+    virtual ~RegistryDirtyFrameBroadcastListener() = default;
+    virtual void on_registry_dirty_frame(const RegistryDirtyFrame& frame) = 0;
+};
+
+class RegistryDirtyFrameBroadcastSubscription {
+public:
+    RegistryDirtyFrameBroadcastSubscription() = default;
+    RegistryDirtyFrameBroadcastSubscription(const RegistryDirtyFrameBroadcastSubscription&) = delete;
+    RegistryDirtyFrameBroadcastSubscription& operator=(const RegistryDirtyFrameBroadcastSubscription&) = delete;
+    RegistryDirtyFrameBroadcastSubscription(RegistryDirtyFrameBroadcastSubscription&& other) noexcept;
+    RegistryDirtyFrameBroadcastSubscription& operator=(RegistryDirtyFrameBroadcastSubscription&& other) noexcept;
+    ~RegistryDirtyFrameBroadcastSubscription();
+
+    void reset();
+    bool active() const noexcept;
+
+private:
+    friend class RegistryDirtyFrameBroadcaster;
+
+    struct Entry {
+        std::uint64_t id = 0;
+        RegistryDirtyFrameBroadcastListener* listener = nullptr;
+    };
+
+    struct State {
+        std::uint64_t next_id = 1;
+        std::vector<Entry> consumers;
+    };
+
+    RegistryDirtyFrameBroadcastSubscription(std::shared_ptr<State> state, std::uint64_t id);
+
+    std::weak_ptr<State> state_;
+    std::uint64_t id_ = 0;
+};
+
+class RegistryDirtyFrameBroadcaster {
+public:
+    RegistryDirtyFrameBroadcaster();
+
+    RegistryDirtyFrameBroadcastSubscription subscribe(RegistryDirtyFrameBroadcastListener& listener);
+    void broadcast(Registry& registry);
+
+private:
+    void remove_unsubscribed();
+
+    std::shared_ptr<RegistryDirtyFrameBroadcastSubscription::State> listeners_;
+};
+
+enum class DirtySnapshotFrameKind : std::uint32_t {
+    Full = 1,
+    Delta = 2
+};
+
+struct DirtySnapshotFrame {
+    Registry* registry = nullptr;
+    DirtySnapshotFrameKind kind = DirtySnapshotFrameKind::Full;
+    const Registry::Snapshot* full = nullptr;
+    const Registry::DeltaSnapshot* delta = nullptr;
+};
+
+struct DirtySnapshotTrackerOptions {
+    SnapshotComponentOptions component_options;
+    std::uint64_t full_snapshot_interval_dirty_frames = 60;
+    std::function<void(const DirtySnapshotFrame&)> write;
+};
+
+class DirtySnapshotTracker final : public RegistryDirtyFrameBroadcastListener {
+public:
+    explicit DirtySnapshotTracker(DirtySnapshotTrackerOptions options = {});
+    ~DirtySnapshotTracker();
+
+    DirtySnapshotTracker(const DirtySnapshotTracker&) = delete;
+    DirtySnapshotTracker& operator=(const DirtySnapshotTracker&) = delete;
+    DirtySnapshotTracker(DirtySnapshotTracker&&) noexcept;
+    DirtySnapshotTracker& operator=(DirtySnapshotTracker&&) noexcept;
+
+    void on_registry_dirty_frame(const RegistryDirtyFrame& frame) override;
+
+private:
+    DirtySnapshotTrackerOptions options_;
+    std::uint64_t dirty_frame_count_ = 0;
+    std::unique_ptr<Registry::Snapshot> last_full_;
+    std::unique_ptr<Registry::DeltaSnapshot> last_delta_;
+};
 
 template <typename... Components>
 class Registry::View {

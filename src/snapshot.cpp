@@ -601,34 +601,36 @@ static PersistentComponentSelection select_persistent_components(
     return selection;
 }
 
-static const SnapshotPersistenceCodecs::Codec* persistent_codec_for(
-    const SnapshotPersistenceCodecs& codecs,
+static const ComponentSerializationRegistry::Entry* persistent_serialization_for(
+    const ComponentSerializationRegistry& serialization,
     const Registry::ComponentRecord& record) {
     if (record.info.tag) {
         return nullptr;
     }
-    const auto found = codecs.codecs_.find(record.name);
-    if (found == codecs.codecs_.end()) {
-        throw std::logic_error("persistent snapshot component is missing a codec: " + record.name);
+    const auto found = serialization.entries_.find(record.name);
+    if (found == serialization.entries_.end()) {
+        throw std::logic_error("persistent snapshot component is missing serialization: " + record.name);
     }
     return &found->second;
 }
 
 static std::vector<unsigned char> quantized_value(
-    const SnapshotPersistenceCodecs::Codec& codec,
+    const ComponentSerializationOps& ops,
     const Registry::TypeErasedStorage& storage,
     std::uint32_t entity_index) {
     const void* value = storage.get(entity_index);
     if (value == nullptr) {
         throw std::logic_error("persistent snapshot baseline value is missing");
     }
-    return codec.quantize(value);
+    std::vector<unsigned char> quantized(ops.quantized_size);
+    ops.quantize(value, quantized.data());
+    return quantized;
 }
 
 static std::vector<unsigned char> baseline_quantized(
     const Registry::Snapshot* baseline,
     const Registry::ComponentRecord& record,
-    const SnapshotPersistenceCodecs::Codec& codec,
+    const ComponentSerializationOps& ops,
     std::uint32_t entity_index) {
     if (baseline == nullptr) {
         return {};
@@ -638,7 +640,7 @@ static std::vector<unsigned char> baseline_quantized(
         !found_storage->second->contains_index(entity_index)) {
         return {};
     }
-    return quantized_value(codec, *found_storage->second, entity_index);
+    return quantized_value(ops, *found_storage->second, entity_index);
 }
 
 static void write_entities(BitBuffer& body, const std::vector<std::uint64_t>& entities) {
@@ -706,7 +708,7 @@ static void write_persistent_storages(
     const std::unordered_map<std::uint32_t, Registry::ComponentRecord>& components,
     const std::unordered_map<std::uint32_t, std::unique_ptr<Registry::TypeErasedStorage>>& storages,
     const Registry::Snapshot* baseline,
-    const SnapshotPersistenceCodecs& codecs,
+    const ComponentSerializationRegistry& serialization,
     const PersistentComponentSelection& selection) {
     detail::write_bits(body, static_cast<std::uint64_t>(selection.storage_indices.size()), 32U);
     for (std::uint32_t component_index : selection.storage_indices) {
@@ -716,7 +718,7 @@ static void write_persistent_storages(
         if (found_name == selection.name_indices.end()) {
             throw std::logic_error("persistent snapshot component name table is incomplete");
         }
-        const SnapshotPersistenceCodecs::Codec* codec = persistent_codec_for(codecs, record);
+        const ComponentSerializationRegistry::Entry* serialization_entry = persistent_serialization_for(serialization, record);
 
         detail::write_bits(body, found_name->second, 32U);
         detail::write_bits(body, record.info.tag ? 1U : 0U, 1U);
@@ -727,11 +729,17 @@ static void write_persistent_storages(
             detail::write_bits(body, entity_index, 32U);
             detail::write_bits(body, storage.is_dirty(entity_index) ? 1U : 0U, 1U);
             if (!record.info.tag) {
-                const std::vector<unsigned char> current = codec->quantize(storage.get_dense(dense));
+                const ComponentSerializationOps& ops = serialization_entry->ops;
+                std::vector<unsigned char> current(ops.quantized_size);
+                ops.quantize(storage.get_dense(dense), current.data());
                 const std::vector<unsigned char> previous =
-                    baseline_quantized(baseline, record, *codec, entity_index);
+                    baseline_quantized(baseline, record, ops, entity_index);
                 BitBuffer payload;
-                codec->serialize(previous.empty() ? nullptr : &previous, current, payload);
+                ops.serialize(
+                    previous.empty() ? nullptr : previous.data(),
+                    current.data(),
+                    payload,
+                    nullptr);
                 write_payload(body, payload);
             }
         }
@@ -749,13 +757,13 @@ static std::unique_ptr<Registry::TypeErasedStorage> read_persistent_storage(
     const Registry::ComponentRecord& record,
     std::uint32_t singleton_index,
     const Registry::Snapshot* baseline,
-    const SnapshotPersistenceCodecs& codecs,
+    const ComponentSerializationRegistry& serialization,
     bool encoded_tag,
     bool encoded_singleton) {
     if (record.info.tag != encoded_tag || record.singleton != encoded_singleton) {
         throw std::runtime_error("persistent snapshot component metadata does not match schema");
     }
-    const SnapshotPersistenceCodecs::Codec* codec = persistent_codec_for(codecs, record);
+    const ComponentSerializationRegistry::Entry* serialization_entry = persistent_serialization_for(serialization, record);
     auto storage = std::make_unique<Registry::TypeErasedStorage>(record);
     const auto dense_count = detail::read_bits(body, 32U);
     for (std::uint64_t dense = 0; dense < dense_count; ++dense) {
@@ -768,16 +776,18 @@ static std::unique_ptr<Registry::TypeErasedStorage> read_persistent_storage(
             storage->emplace_or_replace_tag(entity_index);
         } else {
             BitBuffer payload = read_payload(body);
+            const ComponentSerializationOps& ops = serialization_entry->ops;
             const std::vector<unsigned char> previous =
-                baseline_quantized(baseline, record, *codec, entity_index);
+                baseline_quantized(baseline, record, ops, entity_index);
             std::vector<unsigned char> quantized;
-            if (!codec->deserialize(payload, previous.empty() ? nullptr : &previous, quantized)) {
+            quantized.resize(ops.quantized_size);
+            if (!ops.deserialize(payload, previous.empty() ? nullptr : previous.data(), quantized.data(), nullptr)) {
                 throw std::runtime_error("persistent snapshot component deserializer failed: " + record.name);
             }
             if (payload.remaining_bits() != 0U) {
                 throw std::runtime_error("persistent snapshot component payload was not fully consumed: " + record.name);
             }
-            codec->emplace(*storage, entity_index, quantized);
+            serialization_entry->emplace(*storage, entity_index, quantized.data());
         }
         if (dirty == 0U) {
             storage->clear_dirty(entity_index);
@@ -798,7 +808,7 @@ static void read_persistent_storages(
     const std::vector<std::string>& names,
     const Registry& schema,
     const Registry::Snapshot* baseline,
-    const SnapshotPersistenceCodecs& codecs,
+    const ComponentSerializationRegistry& serialization,
     std::unordered_map<std::uint32_t, Registry::ComponentRecord>& components,
     std::unordered_map<std::uint32_t, std::unique_ptr<Registry::TypeErasedStorage>>& storages) {
     const auto storage_count = detail::read_bits(body, 32U);
@@ -822,7 +832,7 @@ static void read_persistent_storages(
             record,
             Registry::entity_index(schema.component_catalog_.singleton_entity),
             baseline,
-            codecs,
+            serialization,
             encoded_tag,
             encoded_singleton);
     }
@@ -833,7 +843,7 @@ static void read_persistent_storages(
 void write_persistent_snapshot(
     std::ostream& out,
     const Registry::Snapshot& snapshot,
-    const SnapshotPersistenceCodecs& codecs,
+    const ComponentSerializationRegistry& serialization,
     const SnapshotComponentOptions& options) {
     const auto selection =
         PersistentSnapshotAccess::select_persistent_components(
@@ -853,7 +863,7 @@ void write_persistent_snapshot(
         snapshot.components_,
         snapshot.storages_,
         nullptr,
-        codecs,
+        serialization,
         selection);
     detail::write_frame(out, detail::persistent_full_kind, body);
 }
@@ -861,7 +871,7 @@ void write_persistent_snapshot(
 Registry::Snapshot read_persistent_snapshot(
     std::istream& in,
     const Registry& schema,
-    const SnapshotPersistenceCodecs& codecs) {
+    const ComponentSerializationRegistry& serialization) {
     BitBuffer body = detail::read_frame(in, detail::persistent_full_kind);
     Registry::Snapshot result = schema.create_snapshot();
     result.state_token_ = detail::read_bits(body, 64U);
@@ -889,7 +899,7 @@ Registry::Snapshot read_persistent_snapshot(
         names,
         schema,
         nullptr,
-        codecs,
+        serialization,
         result.components_,
         result.storages_);
     if (body.remaining_bits() != 0U) {
@@ -902,7 +912,7 @@ void write_persistent_delta_snapshot(
     std::ostream& out,
     const Registry::DeltaSnapshot& snapshot,
     const Registry::Snapshot& baseline,
-    const SnapshotPersistenceCodecs& codecs,
+    const ComponentSerializationRegistry& serialization,
     const SnapshotComponentOptions& options) {
     const auto selection =
         PersistentSnapshotAccess::select_persistent_components(
@@ -922,7 +932,7 @@ void write_persistent_delta_snapshot(
         snapshot.components_,
         snapshot.storages_,
         &baseline,
-        codecs,
+        serialization,
         selection);
     detail::write_frame(out, detail::persistent_delta_kind, body);
 }
@@ -931,7 +941,7 @@ Registry::DeltaSnapshot read_persistent_delta_snapshot(
     std::istream& in,
     const Registry& schema,
     const Registry::Snapshot& baseline,
-    const SnapshotPersistenceCodecs& codecs) {
+    const ComponentSerializationRegistry& serialization) {
     BitBuffer body = detail::read_frame(in, detail::persistent_delta_kind);
     Registry::DeltaSnapshot result;
     result.state_token_ = detail::read_bits(body, 64U);
@@ -945,13 +955,135 @@ Registry::DeltaSnapshot read_persistent_delta_snapshot(
         names,
         schema,
         &baseline,
-        codecs,
+        serialization,
         result.components_,
         result.storages_);
     if (body.remaining_bits() != 0U) {
         throw std::runtime_error("persistent delta snapshot frame was not fully consumed");
     }
     return result;
+}
+
+RegistryDirtyFrameBroadcastSubscription::RegistryDirtyFrameBroadcastSubscription(
+    std::shared_ptr<State> state,
+    std::uint64_t id)
+    : state_(std::move(state)),
+      id_(id) {}
+
+RegistryDirtyFrameBroadcastSubscription::RegistryDirtyFrameBroadcastSubscription(
+    RegistryDirtyFrameBroadcastSubscription&& other) noexcept
+    : state_(std::move(other.state_)),
+      id_(other.id_) {
+    other.id_ = 0;
+}
+
+RegistryDirtyFrameBroadcastSubscription& RegistryDirtyFrameBroadcastSubscription::operator=(
+    RegistryDirtyFrameBroadcastSubscription&& other) noexcept {
+    if (this != &other) {
+        reset();
+        state_ = std::move(other.state_);
+        id_ = other.id_;
+        other.id_ = 0;
+    }
+    return *this;
+}
+
+RegistryDirtyFrameBroadcastSubscription::~RegistryDirtyFrameBroadcastSubscription() {
+    reset();
+}
+
+void RegistryDirtyFrameBroadcastSubscription::reset() {
+    auto state = state_.lock();
+    if (state == nullptr || id_ == 0) {
+        return;
+    }
+    for (Entry& entry : state->consumers) {
+        if (entry.id == id_) {
+            entry.listener = nullptr;
+            break;
+        }
+    }
+    id_ = 0;
+    state_.reset();
+}
+
+bool RegistryDirtyFrameBroadcastSubscription::active() const noexcept {
+    return id_ != 0 && !state_.expired();
+}
+
+RegistryDirtyFrameBroadcaster::RegistryDirtyFrameBroadcaster()
+    : listeners_(std::make_shared<RegistryDirtyFrameBroadcastSubscription::State>()) {}
+
+RegistryDirtyFrameBroadcastSubscription RegistryDirtyFrameBroadcaster::subscribe(
+    RegistryDirtyFrameBroadcastListener& listener) {
+    const std::uint64_t id = listeners_->next_id++;
+    listeners_->consumers.push_back(RegistryDirtyFrameBroadcastSubscription::Entry{id, &listener});
+    return RegistryDirtyFrameBroadcastSubscription(listeners_, id);
+}
+
+void RegistryDirtyFrameBroadcaster::broadcast(Registry& registry) {
+    const auto dirty_scope = registry.dirty_scope();
+    const RegistryDirtyFrame dirty_frame{registry, dirty_scope.view()};
+    for (const RegistryDirtyFrameBroadcastSubscription::Entry& entry : listeners_->consumers) {
+        if (entry.listener != nullptr) {
+            entry.listener->on_registry_dirty_frame(dirty_frame);
+        }
+    }
+    remove_unsubscribed();
+}
+
+void RegistryDirtyFrameBroadcaster::remove_unsubscribed() {
+    listeners_->consumers.erase(
+        std::remove_if(
+            listeners_->consumers.begin(),
+            listeners_->consumers.end(),
+            [](const RegistryDirtyFrameBroadcastSubscription::Entry& entry) {
+                return entry.listener == nullptr;
+            }),
+        listeners_->consumers.end());
+}
+
+DirtySnapshotTracker::DirtySnapshotTracker(DirtySnapshotTrackerOptions options)
+    : options_(std::move(options)) {}
+
+DirtySnapshotTracker::~DirtySnapshotTracker() = default;
+
+DirtySnapshotTracker::DirtySnapshotTracker(DirtySnapshotTracker&&) noexcept = default;
+
+DirtySnapshotTracker& DirtySnapshotTracker::operator=(DirtySnapshotTracker&&) noexcept = default;
+
+void DirtySnapshotTracker::on_registry_dirty_frame(const RegistryDirtyFrame& frame) {
+    if (!options_.write) {
+        return;
+    }
+
+    ++dirty_frame_count_;
+    const std::uint64_t full_interval = options_.full_snapshot_interval_dirty_frames;
+    const bool write_full =
+        last_full_ == nullptr ||
+        full_interval == 0U ||
+        dirty_frame_count_ % full_interval == 0U;
+    if (write_full) {
+        auto snapshot = std::make_unique<Registry::Snapshot>(frame.registry.create_snapshot());
+        options_.write(DirtySnapshotFrame{
+            &frame.registry,
+            DirtySnapshotFrameKind::Full,
+            snapshot.get(),
+            nullptr});
+        last_full_ = std::move(snapshot);
+        last_delta_.reset();
+        return;
+    }
+
+    auto delta = last_delta_ != nullptr
+        ? std::make_unique<Registry::DeltaSnapshot>(frame.registry.create_delta_snapshot(*last_delta_))
+        : std::make_unique<Registry::DeltaSnapshot>(frame.registry.create_delta_snapshot(*last_full_));
+    options_.write(DirtySnapshotFrame{
+        &frame.registry,
+        DirtySnapshotFrameKind::Delta,
+        nullptr,
+        delta.get()});
+    last_delta_ = std::move(delta);
 }
 
 Registry::Snapshot Registry::create_snapshot() const {
