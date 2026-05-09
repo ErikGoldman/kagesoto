@@ -532,7 +532,7 @@ Registry::DeltaSnapshot Registry::DeltaSnapshot::read_native(std::istream& in) {
     DeltaSnapshot snapshot;
     Entity singleton_entity;
     Entity system_tag;
-    std::array<Entity, 7> primitive_types{};
+    std::array<Entity, 8> primitive_types{};
     std::vector<Entity> typed_components;
     std::vector<std::unique_ptr<Registry::GroupRecord>> groups;
     read_snapshot_header(

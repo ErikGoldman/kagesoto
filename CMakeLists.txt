@@ -23,6 +23,7 @@ option(ECS_BUILD_EXAMPLE "Build the example executable" ${ecs_is_top_level})
 option(ECS_BUILD_TESTING "Build ECS tests" ${ecs_build_testing_default})
 option(ECS_BUILD_BENCHMARKS "Build Google Benchmark suites" OFF)
 option(ECS_ENABLE_COVERAGE "Build ECS targets with coverage instrumentation" OFF)
+option(ECS_ENABLE_DEBUG_SERVER "Build the optional ECS local debug GraphQL server" OFF)
 option(ECS_INSTALL "Install ECS library and CMake package files" ${ecs_is_top_level})
 
 if(ECS_ENABLE_COVERAGE AND NOT ECS_BUILD_TESTING)
@@ -42,6 +43,15 @@ set(ecs_sources
     src/storage.cpp
 )
 
+if(ECS_ENABLE_DEBUG_SERVER)
+    list(APPEND ecs_public_headers
+        include/ecs/debug_server.hpp
+    )
+    list(APPEND ecs_sources
+        src/debug_server.cpp
+    )
+endif()
+
 set(ecs_test_sources
     src/ecs_bit_buffer.test.cpp
     src/ecs_groups.test.cpp
@@ -57,6 +67,12 @@ set(ecs_test_sources
     src/ecs_views_iteration.test.cpp
 )
 
+if(ECS_ENABLE_DEBUG_SERVER)
+    list(APPEND ecs_test_sources
+        src/ecs_debug_server.test.cpp
+    )
+endif()
+
 add_library(ecs STATIC)
 
 target_sources(ecs
@@ -68,6 +84,10 @@ target_sources(ecs
 add_library(ecs::ecs ALIAS ecs)
 
 target_compile_features(ecs PUBLIC cxx_std_17)
+
+if(ECS_ENABLE_DEBUG_SERVER)
+    target_compile_definitions(ecs PUBLIC ECS_ENABLE_DEBUG_SERVER=1)
+endif()
 
 target_include_directories(ecs
     PUBLIC

@@ -4,6 +4,7 @@ namespace ecs {
 
 Registry::Registry() {
     register_system_tag();
+    register_job_tag();
     register_primitive_types();
 }
 
@@ -34,10 +35,20 @@ Entity Registry::system_tag() const {
     return component_catalog_.system_tag;
 }
 
+Entity Registry::job_tag() const {
+    return component_catalog_.job_tag;
+}
+
 const ComponentInfo* Registry::component_info(Entity component) const {
     require_runtime_registry_access_allowed("component_info");
     const ComponentRecord* record = find_component_record(component);
     return record != nullptr ? &record->info : nullptr;
+}
+
+std::string Registry::component_name(Entity component) const {
+    require_runtime_registry_access_allowed("component_name");
+    const ComponentRecord* record = find_component_record(component);
+    return record != nullptr ? record->name : std::string{};
 }
 
 const std::vector<ComponentField>* Registry::component_fields(Entity component) const {
@@ -207,6 +218,141 @@ std::string Registry::debug_print(Entity entity, Entity component) const {
 
     out << "}";
     return out.str();
+}
+
+std::vector<EntityComponentInfo> Registry::components(Entity entity) const {
+    require_runtime_registry_access_allowed("components");
+    std::vector<EntityComponentInfo> result;
+    if (!alive(entity)) {
+        return result;
+    }
+
+    for (const auto& entry : component_catalog_.records) {
+        const ComponentRecord& record = entry.second;
+        if (record.singleton) {
+            continue;
+        }
+        const Entity storage_entity = entity;
+        if (!alive(storage_entity)) {
+            continue;
+        }
+
+        const TypeErasedStorage* storage = find_storage(record.entity);
+        const std::uint32_t index = entity_index(storage_entity);
+        if (storage == nullptr || !storage->contains_index(index)) {
+            continue;
+        }
+
+        EntityComponentInfo info;
+        info.component = record.entity;
+        info.name = record.name;
+        info.info = record.info;
+        info.singleton = record.singleton;
+        info.dirty = storage->is_dirty(index);
+        info.debug_value = debug_print(entity, record.entity);
+        result.push_back(std::move(info));
+    }
+
+    std::sort(result.begin(), result.end(), [](const EntityComponentInfo& lhs, const EntityComponentInfo& rhs) {
+        return lhs.component.value < rhs.component.value;
+    });
+    return result;
+}
+
+std::vector<EntityComponentInfo> Registry::singleton_components() const {
+    require_runtime_registry_access_allowed("singleton_components");
+    std::vector<EntityComponentInfo> result;
+    const Entity singleton = component_catalog_.singleton_entity;
+    if (!singleton || !alive(singleton)) {
+        return result;
+    }
+
+    for (const auto& entry : component_catalog_.records) {
+        const ComponentRecord& record = entry.second;
+        if (!record.singleton) {
+            continue;
+        }
+
+        const TypeErasedStorage* storage = find_storage(record.entity);
+        const std::uint32_t index = entity_index(singleton);
+        if (storage == nullptr || !storage->contains_index(index)) {
+            continue;
+        }
+
+        EntityComponentInfo info;
+        info.component = record.entity;
+        info.name = record.name;
+        info.info = record.info;
+        info.singleton = true;
+        info.dirty = storage->is_dirty(index);
+        info.debug_value = debug_print(singleton, record.entity);
+        result.push_back(std::move(info));
+    }
+
+    std::sort(result.begin(), result.end(), [](const EntityComponentInfo& lhs, const EntityComponentInfo& rhs) {
+        return lhs.component.value < rhs.component.value;
+    });
+    return result;
+}
+
+Entity Registry::singleton_storage_entity() const {
+    require_runtime_registry_access_allowed("singleton_storage_entity");
+    return component_catalog_.singleton_entity;
+}
+
+std::optional<JobInfo> Registry::job_info(Entity job) const {
+    require_runtime_registry_access_allowed("job_info");
+    const auto found = job_registry_.index_by_entity.find(job.value);
+    if (found == job_registry_.index_by_entity.end() || found->second >= job_registry_.jobs.size()) {
+        return std::nullopt;
+    }
+
+    const JobRecord& record = job_registry_.jobs[found->second];
+    JobInfo info;
+    info.entity = record.entity;
+    info.name = record.name;
+    info.order = record.order;
+    info.structural = record.structural;
+    info.single_thread = record.single_thread;
+    info.max_threads = record.max_threads;
+    info.min_entities_per_thread = record.min_entities_per_thread;
+    info.reads.reserve(record.reads.size());
+    for (std::uint32_t component : record.reads) {
+        const auto component_record = component_catalog_.records.find(component);
+        if (component_record != component_catalog_.records.end()) {
+            info.reads.push_back(component_record->second.entity);
+        }
+    }
+    info.writes.reserve(record.writes.size());
+    for (std::uint32_t component : record.writes) {
+        const auto component_record = component_catalog_.records.find(component);
+        if (component_record != component_catalog_.records.end()) {
+            info.writes.push_back(component_record->second.entity);
+        }
+    }
+    return info;
+}
+
+std::vector<Entity> Registry::job_matching_entities(Entity job) const {
+    require_runtime_registry_access_allowed("job_matching_entities");
+    const auto found = job_registry_.index_by_entity.find(job.value);
+    if (found == job_registry_.index_by_entity.end() || found->second >= job_registry_.jobs.size()) {
+        return {};
+    }
+
+    std::vector<Entity> result;
+    const std::vector<std::uint32_t> indices = job_registry_.jobs[found->second].collect_indices(
+        const_cast<Registry&>(*this));
+    result.reserve(indices.size());
+    for (std::uint32_t index : indices) {
+        if (index < entity_store_.slots.size()) {
+            Entity entity{entity_store_.slots[index]};
+            if (alive(entity)) {
+                result.push_back(entity);
+            }
+        }
+    }
+    return result;
 }
 
 std::size_t Registry::next_type_id() {
@@ -487,6 +633,9 @@ void Registry::unregister_component_entity(Entity component) {
             primitive = Entity{};
         }
     }
+    if (component_catalog_.job_tag == component) {
+        component_catalog_.job_tag = Entity{};
+    }
 
     component_catalog_.records.erase(component_index);
 }
@@ -506,6 +655,8 @@ void Registry::register_primitive_types() {
         register_primitive("f32", sizeof(float), alignof(float), PrimitiveKind::F32);
     component_catalog_.primitive_types[static_cast<std::size_t>(PrimitiveType::F64)] =
         register_primitive("f64", sizeof(double), alignof(double), PrimitiveKind::F64);
+    component_catalog_.primitive_types[static_cast<std::size_t>(PrimitiveType::String)] =
+        register_primitive("string", sizeof(char), alignof(char), PrimitiveKind::String);
 }
 
 Entity Registry::register_primitive(std::string name, std::size_t size, std::size_t alignment, PrimitiveKind kind) {
@@ -536,11 +687,31 @@ void Registry::register_system_tag() {
     add_system_tag(component_catalog_.system_tag);
 }
 
+void Registry::register_job_tag() {
+    ComponentDesc desc;
+    desc.name = "ecs.job";
+    desc.size = 0;
+    desc.alignment = 1;
+
+    ComponentLifecycle lifecycle;
+    lifecycle.trivially_copyable = true;
+
+    component_catalog_.job_tag = register_component_impl(std::move(desc), lifecycle, true, false, true, npos_type_id);
+    add_system_tag(component_catalog_.job_tag);
+}
+
 void Registry::add_system_tag(Entity entity) {
     if (!component_catalog_.system_tag || !alive(entity)) {
         return;
     }
     storage_for(component_catalog_.system_tag).emplace_or_replace_tag(entity_index(entity));
+}
+
+void Registry::add_job_tag(Entity entity) {
+    if (!component_catalog_.job_tag || !alive(entity)) {
+        return;
+    }
+    storage_for(component_catalog_.job_tag).emplace_or_replace_tag(entity_index(entity));
 }
 
 void Registry::canonicalize_components(std::vector<std::uint32_t>& components) {
@@ -570,6 +741,7 @@ void Registry::append_unique_component(std::vector<std::uint32_t>& components, s
 
 Entity Registry::add_job(
     int order,
+    std::string name,
     JobAccessMetadata metadata,
     std::function<void(Registry&)> run,
     std::function<std::vector<std::uint32_t>(Registry&)> collect_indices,
@@ -588,6 +760,7 @@ Entity Registry::add_job(
     }
     const Entity entity = create();
     add_system_tag(entity);
+    add_job_tag(entity);
     job_registry_.schedule_cache_valid = false;
     job_registry_.graph_cache_valid = false;
     job_registry_.ordered_indices_cache_valid = false;
@@ -595,6 +768,7 @@ Entity Registry::add_job(
     job_registry_.index_by_entity[entity.value] = job_index;
     job_registry_.jobs.push_back(JobRecord{
         entity,
+        std::move(name),
         order,
         job_registry_.next_sequence++,
         std::move(metadata.reads),
@@ -684,17 +858,19 @@ void Registry::merge_current_system_entities(std::vector<std::uint64_t>& entitie
 
 void Registry::restore_internal_bookkeeping_tags() {
     add_system_tag(component_catalog_.system_tag);
+    add_system_tag(component_catalog_.job_tag);
     for (Entity primitive : component_catalog_.primitive_types) {
         add_system_tag(primitive);
     }
     for (const JobRecord& job : job_registry_.jobs) {
         add_system_tag(job.entity);
+        add_job_tag(job.entity);
     }
 }
 
 void Registry::print_field(std::ostringstream& out, const unsigned char* data, const ComponentField& field) const {
     const ComponentRecord* type = find_component_record(field.type);
-    if (type == nullptr || field.count != 1) {
+    if (type == nullptr || (field.count != 1 && type->primitive != PrimitiveKind::String)) {
         out << "<unprintable>";
         return;
     }
@@ -720,6 +896,14 @@ void Registry::print_field(std::ostringstream& out, const unsigned char* data, c
         break;
     case PrimitiveKind::F64:
         out << *reinterpret_cast<const double*>(data);
+        break;
+    case PrimitiveKind::String:
+        out << "\"";
+        for (std::size_t i = 0; i < field.count && data[i] != '\0'; ++i) {
+            const unsigned char ch = data[i];
+            out << (ch >= 0x20 && ch <= 0x7e ? static_cast<char>(ch) : '?');
+        }
+        out << "\"";
         break;
     case PrimitiveKind::None:
         out << "<unprintable>";

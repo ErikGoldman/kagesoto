@@ -4,3 +4,6 @@ artifacts/
 .vs/
 gmon.out
 .idea/
+web/debugger/node_modules/
+web/debugger/dist/
+web/debugger/coverage/
