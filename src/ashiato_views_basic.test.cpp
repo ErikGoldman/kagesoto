@@ -1,16 +1,16 @@
-#include "ecs_test_support.hpp"
+#include "ashiato_test_support.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 TEST_CASE("views iterate entities that contain every requested component") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Velocity>("Velocity");
 
-    const ecs::Entity position_only = registry.create();
-    const ecs::Entity both_a = registry.create();
-    const ecs::Entity velocity_only = registry.create();
-    const ecs::Entity both_b = registry.create();
+    const ashiato::Entity position_only = registry.create();
+    const ashiato::Entity both_a = registry.create();
+    const ashiato::Entity velocity_only = registry.create();
+    const ashiato::Entity both_b = registry.create();
 
     REQUIRE(registry.add<Position>(position_only, Position{1, 1}) != nullptr);
     REQUIRE(registry.add<Position>(both_a, Position{2, 3}) != nullptr);
@@ -19,9 +19,9 @@ TEST_CASE("views iterate entities that contain every requested component") {
     REQUIRE(registry.add<Position>(both_b, Position{4, 5}) != nullptr);
     REQUIRE(registry.add<Velocity>(both_b, Velocity{3.0f, 0.0f}) != nullptr);
 
-    std::vector<ecs::Entity> visited;
+    std::vector<ashiato::Entity> visited;
     auto view = registry.view<const Position, Velocity>();
-    view.each([&](ecs::Entity entity, const Position& position, Velocity& velocity) {
+    view.each([&](ashiato::Entity entity, const Position& position, Velocity& velocity) {
         visited.push_back(entity);
         velocity.dy = static_cast<float>(position.x + position.y);
     });
@@ -34,14 +34,14 @@ TEST_CASE("views iterate entities that contain every requested component") {
 }
 
 TEST_CASE("views filter on included and excluded typed tags") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Active>("Active");
     registry.register_component<Disabled>("Disabled");
 
-    const ecs::Entity active = registry.create();
-    const ecs::Entity inactive = registry.create();
-    const ecs::Entity disabled = registry.create();
+    const ashiato::Entity active = registry.create();
+    const ashiato::Entity inactive = registry.create();
+    const ashiato::Entity disabled = registry.create();
 
     REQUIRE(registry.add<Position>(active, Position{1, 0}) != nullptr);
     REQUIRE(registry.add<Position>(inactive, Position{2, 0}) != nullptr);
@@ -50,43 +50,43 @@ TEST_CASE("views filter on included and excluded typed tags") {
     REQUIRE(registry.add<Active>(disabled));
     REQUIRE(registry.add<Disabled>(disabled));
 
-    std::vector<ecs::Entity> visited;
+    std::vector<ashiato::Entity> visited;
     registry.view<const Position>()
         .with_tags<const Active>()
         .without_tags<const Disabled>()
-        .each([&](ecs::Entity entity, const Position& position) {
+        .each([&](ashiato::Entity entity, const Position& position) {
             visited.push_back(entity);
             REQUIRE(position.x == 1);
         });
 
-    REQUIRE(visited == std::vector<ecs::Entity>{active});
+    REQUIRE(visited == std::vector<ashiato::Entity>{active});
 }
 
 TEST_CASE("tag filter constness controls view-level tag mutation") {
-    using MutableView = decltype(std::declval<ecs::Registry::View<Position>&>().template with_tags<Active>());
-    using ConstView = decltype(std::declval<ecs::Registry::View<Position>&>().template with_tags<const Active>());
+    using MutableView = decltype(std::declval<ashiato::Registry::View<Position>&>().template with_tags<Active>());
+    using ConstView = decltype(std::declval<ashiato::Registry::View<Position>&>().template with_tags<const Active>());
     using MutableWithoutView =
-        decltype(std::declval<ecs::Registry::View<Position>&>().template without_tags<Disabled>());
+        decltype(std::declval<ashiato::Registry::View<Position>&>().template without_tags<Disabled>());
 
-    static_assert(HasRegistryView<ecs::Registry, std::tuple<Position>>::value, "components can be view drivers");
-    static_assert(!HasRegistryView<ecs::Registry, std::tuple<Active>>::value, "tags cannot be view drivers");
+    static_assert(HasRegistryView<ashiato::Registry, std::tuple<Position>>::value, "components can be view drivers");
+    static_assert(!HasRegistryView<ashiato::Registry, std::tuple<Active>>::value, "tags cannot be view drivers");
     static_assert(HasViewTagAdd<MutableView, Active>::value, "non-const with tag can be added");
     static_assert(HasViewTagRemove<MutableView, Active>::value, "non-const with tag can be removed");
     static_assert(!HasViewTagAdd<ConstView, Active>::value, "const with tag cannot be added");
     static_assert(!HasViewTagRemove<ConstView, Active>::value, "const with tag cannot be removed");
     static_assert(HasViewTagAdd<MutableWithoutView, Disabled>::value, "non-const without tag can be added");
 
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Active>("Active");
     registry.register_component<Disabled>("Disabled");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
     REQUIRE(registry.add<Active>(entity));
 
     int calls = 0;
-    registry.view<Position>().with_tags<Active>().each([&](auto& view, ecs::Entity current, Position&) {
+    registry.view<Position>().with_tags<Active>().each([&](auto& view, ashiato::Entity current, Position&) {
         REQUIRE(current == entity);
         REQUIRE(view.template has_tag<Active>(current));
         REQUIRE(view.template remove_tag<Active>(current));
@@ -98,36 +98,36 @@ TEST_CASE("tag filter constness controls view-level tag mutation") {
 }
 
 TEST_CASE("runtime tag filters support readonly view access") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
-    const ecs::Entity selected_tag = registry.register_tag("Selected");
-    const ecs::Entity hidden_tag = registry.register_tag("Hidden");
+    const ashiato::Entity selected_tag = registry.register_tag("Selected");
+    const ashiato::Entity hidden_tag = registry.register_tag("Hidden");
 
-    const ecs::Entity selected = registry.create();
-    const ecs::Entity hidden = registry.create();
+    const ashiato::Entity selected = registry.create();
+    const ashiato::Entity hidden = registry.create();
     REQUIRE(registry.add<Position>(selected, Position{1, 0}) != nullptr);
     REQUIRE(registry.add<Position>(hidden, Position{2, 0}) != nullptr);
     REQUIRE(registry.add_tag(selected, selected_tag));
     REQUIRE(registry.add_tag(hidden, selected_tag));
     REQUIRE(registry.add_tag(hidden, hidden_tag));
 
-    std::vector<ecs::Entity> readonly;
+    std::vector<ashiato::Entity> readonly;
     auto readonly_view = registry.view<const Position>().with_tags({selected_tag}).without_tags({hidden_tag});
-    readonly_view.each([&](auto& view, ecs::Entity entity, const Position&) {
+    readonly_view.each([&](auto& view, ashiato::Entity entity, const Position&) {
         REQUIRE(view.has_tag(entity, selected_tag));
         readonly.push_back(entity);
     });
-    REQUIRE(readonly == std::vector<ecs::Entity>{selected});
+    REQUIRE(readonly == std::vector<ashiato::Entity>{selected});
 }
 
 TEST_CASE("runtime tag filters refresh cached storage after view construction") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
-    const ecs::Entity selected_tag = registry.register_tag("Selected");
-    const ecs::Entity hidden_tag = registry.register_tag("Hidden");
+    const ashiato::Entity selected_tag = registry.register_tag("Selected");
+    const ashiato::Entity hidden_tag = registry.register_tag("Hidden");
 
-    const ecs::Entity selected = registry.create();
-    const ecs::Entity hidden = registry.create();
+    const ashiato::Entity selected = registry.create();
+    const ashiato::Entity hidden = registry.create();
     REQUIRE(registry.add<Position>(selected, Position{1, 0}) != nullptr);
     REQUIRE(registry.add<Position>(hidden, Position{2, 0}) != nullptr);
 
@@ -137,32 +137,32 @@ TEST_CASE("runtime tag filters refresh cached storage after view construction") 
     REQUIRE(registry.add_tag(selected, selected_tag));
     REQUIRE(registry.add_tag(hidden, hidden_tag));
 
-    std::vector<ecs::Entity> selected_entities;
-    selected_view.each([&](ecs::Entity entity, const Position&) {
+    std::vector<ashiato::Entity> selected_entities;
+    selected_view.each([&](ashiato::Entity entity, const Position&) {
         selected_entities.push_back(entity);
     });
-    REQUIRE(selected_entities == std::vector<ecs::Entity>{selected});
+    REQUIRE(selected_entities == std::vector<ashiato::Entity>{selected});
 
-    std::vector<ecs::Entity> visible_entities;
-    visible_view.each([&](ecs::Entity entity, const Position&) {
+    std::vector<ashiato::Entity> visible_entities;
+    visible_view.each([&](ashiato::Entity entity, const Position&) {
         visible_entities.push_back(entity);
     });
-    REQUIRE(visible_entities == std::vector<ecs::Entity>{selected});
+    REQUIRE(visible_entities == std::vector<ashiato::Entity>{selected});
 }
 
 TEST_CASE("runtime tag filters refresh cached storage after registry tag add") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
-    const ecs::Entity selected_tag = registry.register_tag("Selected");
+    const ashiato::Entity selected_tag = registry.register_tag("Selected");
 
-    const ecs::Entity selected = registry.create();
+    const ashiato::Entity selected = registry.create();
     REQUIRE(registry.add<Position>(selected, Position{1, 0}) != nullptr);
 
     auto selected_view = registry.view<Position>().with_tags({selected_tag});
     REQUIRE(registry.add_tag(selected, selected_tag));
 
     int calls = 0;
-    selected_view.each([&](ecs::Entity entity, Position&) {
+    selected_view.each([&](ashiato::Entity entity, Position&) {
         REQUIRE(entity == selected);
         ++calls;
     });
@@ -170,12 +170,12 @@ TEST_CASE("runtime tag filters refresh cached storage after registry tag add") {
 }
 
 TEST_CASE("access views preserve access components while filtering tags") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Velocity>("Velocity");
     registry.register_component<Active>("Active");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
     REQUIRE(registry.add<Velocity>(entity, Velocity{2.0f, 0.0f}) != nullptr);
     REQUIRE(registry.add<Active>(entity));
@@ -184,7 +184,7 @@ TEST_CASE("access views preserve access components while filtering tags") {
     registry.view<const Position>()
         .access<Velocity>()
         .with_tags<const Active>()
-        .each([&](auto& view, ecs::Entity current, const Position& position) {
+        .each([&](auto& view, ashiato::Entity current, const Position& position) {
             Velocity& velocity = view.template write<Velocity>(current);
             velocity.dx += static_cast<float>(position.x);
             ++calls;
@@ -195,11 +195,11 @@ TEST_CASE("access views preserve access components while filtering tags") {
 }
 
 TEST_CASE("views expose gated get and write access for listed components") {
-    using View = ecs::Registry::View<const Position, Velocity>;
-    using AccessView = decltype(std::declval<ecs::Registry::View<Position>&>().template access<const Velocity, Health>());
-    using ExplicitWriteView = decltype(std::declval<ecs::Registry::View<const Position>&>().template access<Position>());
-    using SingletonView = ecs::Registry::View<const Position, GameTime>;
-    using SingletonAccessView = decltype(std::declval<ecs::Registry::View<Position>&>().template access<GameTime>());
+    using View = ashiato::Registry::View<const Position, Velocity>;
+    using AccessView = decltype(std::declval<ashiato::Registry::View<Position>&>().template access<const Velocity, Health>());
+    using ExplicitWriteView = decltype(std::declval<ashiato::Registry::View<const Position>&>().template access<Position>());
+    using SingletonView = ashiato::Registry::View<const Position, GameTime>;
+    using SingletonAccessView = decltype(std::declval<ashiato::Registry::View<Position>&>().template access<GameTime>());
 
     static_assert(HasViewGet<View, Position>::value, "listed readonly component can be read");
     static_assert(HasViewGet<View, const Position>::value, "listed readonly component can be read as const");
@@ -243,21 +243,21 @@ TEST_CASE("views expose gated get and write access for listed components") {
         !HasViewNestedView<AccessView, std::tuple<Velocity>>::value,
         "nested access views cannot make readonly access components mutable");
     static_assert(
-        ecs::detail::access_components_allowed<ecs::detail::type_list<const Position>>::template with<Position>::value,
+        ashiato::detail::access_components_allowed<ashiato::detail::type_list<const Position>>::template with<Position>::value,
         "readonly iteration can overlap mutable access");
     static_assert(
-        !ecs::detail::access_components_allowed<ecs::detail::type_list<Position>>::template with<Position>::value,
+        !ashiato::detail::access_components_allowed<ashiato::detail::type_list<Position>>::template with<Position>::value,
         "mutable iteration cannot overlap mutable access");
     static_assert(
-        !ecs::detail::access_components_allowed<ecs::detail::type_list<const Position>>::template with<const Position>::
+        !ashiato::detail::access_components_allowed<ashiato::detail::type_list<const Position>>::template with<const Position>::
             value,
         "readonly iteration cannot overlap readonly access");
 
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Velocity>("Velocity");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{8, 9}) != nullptr);
     REQUIRE(registry.add<Velocity>(entity, Velocity{1.0f, 2.0f}) != nullptr);
 
@@ -272,19 +272,19 @@ TEST_CASE("views expose gated get and write access for listed components") {
 }
 
 TEST_CASE("singleton components in views are callback arguments without filtering entities") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<GameTime>("GameTime");
 
-    const ecs::Entity first = registry.create();
-    const ecs::Entity second = registry.create();
+    const ashiato::Entity first = registry.create();
+    const ashiato::Entity second = registry.create();
 
     REQUIRE(registry.add<Position>(first, Position{2, 0}) != nullptr);
     REQUIRE(registry.add<Position>(second, Position{3, 0}) != nullptr);
     registry.clear_dirty<GameTime>();
 
-    std::vector<ecs::Entity> visited;
-    registry.view<const Position, GameTime>().each([&](ecs::Entity entity, const Position& position, GameTime& time) {
+    std::vector<ashiato::Entity> visited;
+    registry.view<const Position, GameTime>().each([&](ashiato::Entity entity, const Position& position, GameTime& time) {
         visited.push_back(entity);
         time.tick += position.x;
     });
@@ -297,11 +297,11 @@ TEST_CASE("singleton components in views are callback arguments without filterin
 }
 
 TEST_CASE("singleton-only views call once with an invalid entity") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<GameTime>("GameTime");
 
     int calls = 0;
-    registry.view<GameTime>().each([&](ecs::Entity entity, GameTime& time) {
+    registry.view<GameTime>().each([&](ashiato::Entity entity, GameTime& time) {
         REQUIRE_FALSE(entity);
         time.tick = 7;
         ++calls;
@@ -312,16 +312,16 @@ TEST_CASE("singleton-only views call once with an invalid entity") {
 }
 
 TEST_CASE("mutable view iteration marks listed components dirty automatically") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{8, 9}) != nullptr);
     registry.clear_all_dirty<Position>();
     REQUIRE_FALSE(registry.is_dirty<Position>(entity));
 
     int calls = 0;
-    registry.view<Position>().each([&](ecs::Entity current, Position& position) {
+    registry.view<Position>().each([&](ashiato::Entity current, Position& position) {
         REQUIRE(current == entity);
         REQUIRE(position.x == 8);
         ++calls;
@@ -332,15 +332,15 @@ TEST_CASE("mutable view iteration marks listed components dirty automatically") 
 }
 
 TEST_CASE("views over registered components with missing storage are empty") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Velocity>("Velocity");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{1, 2}) != nullptr);
 
     int calls = 0;
-    registry.view<Position, Velocity>().each([&](ecs::Entity, Position&, Velocity&) {
+    registry.view<Position, Velocity>().each([&](ashiato::Entity, Position&, Velocity&) {
         ++calls;
     });
 
@@ -348,15 +348,15 @@ TEST_CASE("views over registered components with missing storage are empty") {
 }
 
 TEST_CASE("views can access extra components without changing iteration") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Velocity>("Velocity");
     registry.register_component<Health>("Health");
     registry.register_component<GameTime>("GameTime");
 
-    const ecs::Entity first = registry.create();
-    const ecs::Entity second = registry.create();
-    const ecs::Entity target = registry.create();
+    const ashiato::Entity first = registry.create();
+    const ashiato::Entity second = registry.create();
+    const ashiato::Entity target = registry.create();
 
     REQUIRE(registry.add<Position>(first, Position{2, 0}) != nullptr);
     REQUIRE(registry.add<Position>(second, Position{3, 0}) != nullptr);
@@ -365,7 +365,7 @@ TEST_CASE("views can access extra components without changing iteration") {
 
     int calls = 0;
     auto view = registry.view<Position>().access<const Velocity, Health, GameTime>();
-    view.each([&](auto& active_view, ecs::Entity entity, Position& position) {
+    view.each([&](auto& active_view, ashiato::Entity entity, Position& position) {
         REQUIRE(active_view.template get<Velocity>(target).dx == 4.0f);
         REQUIRE_FALSE(active_view.template contains<Health>(entity));
 
@@ -381,15 +381,15 @@ TEST_CASE("views can access extra components without changing iteration") {
 }
 
 TEST_CASE("missing access-only storage does not suppress view iteration") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Health>("Health");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{1, 2}) != nullptr);
 
     int calls = 0;
-    registry.view<Position>().access<Health>().each([&](auto& active_view, ecs::Entity current, Position&) {
+    registry.view<Position>().access<Health>().each([&](auto& active_view, ashiato::Entity current, Position&) {
         REQUIRE_FALSE(active_view.template contains<Health>(current));
         ++calls;
     });

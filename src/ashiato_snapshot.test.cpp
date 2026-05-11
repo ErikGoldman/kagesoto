@@ -1,4 +1,4 @@
-#include "ecs_test_support.hpp"
+#include "ashiato_test_support.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -22,7 +22,7 @@ struct CountingPositionTraits {
         return value;
     }
 
-    static void serialize(const Quantized* previous, const Quantized& current, ecs::BitBuffer& out) {
+    static void serialize(const Quantized* previous, const Quantized& current, ashiato::BitBuffer& out) {
         ++serialize_calls;
         if (previous == nullptr) {
             out.push_bits(current.x, 32U);
@@ -33,7 +33,7 @@ struct CountingPositionTraits {
         out.push_bits(current.y - previous->y, 16U);
     }
 
-    static bool deserialize(ecs::BitBuffer& in, const Quantized* previous, Quantized& out) {
+    static bool deserialize(ashiato::BitBuffer& in, const Quantized* previous, Quantized& out) {
         ++deserialize_calls;
         if (previous == nullptr) {
             out.x = static_cast<int>(in.read_bits(32U));
@@ -50,7 +50,7 @@ int CountingPositionTraits::serialize_calls = 0;
 int CountingPositionTraits::deserialize_calls = 0;
 
 struct UnreadPositionTraits : CountingPositionTraits {
-    static bool deserialize(ecs::BitBuffer&, const Quantized*, Quantized& out) {
+    static bool deserialize(ashiato::BitBuffer&, const Quantized*, Quantized& out) {
         out = Position{};
         return true;
     }
@@ -85,13 +85,13 @@ struct OverAlignedPersistentTraits {
         return OverAlignedPersistentComponent{static_cast<int>(value.value)};
     }
 
-    static void serialize(const Quantized* previous, const Quantized& current, ecs::BitBuffer& out) {
+    static void serialize(const Quantized* previous, const Quantized& current, ashiato::BitBuffer& out) {
         all_aligned = all_aligned && is_aligned(previous) && is_aligned(&current);
         const std::int32_t delta = previous == nullptr ? current.value : current.value - previous->value;
         out.push_bits(delta, 32U);
     }
 
-    static bool deserialize(ecs::BitBuffer& in, const Quantized* previous, Quantized& out) {
+    static bool deserialize(ashiato::BitBuffer& in, const Quantized* previous, Quantized& out) {
         all_aligned = all_aligned && is_aligned(previous) && is_aligned(&out);
         const auto delta = static_cast<std::int32_t>(in.read_bits(32U));
         out.value = previous == nullptr ? delta : previous->value + delta;
@@ -115,8 +115,8 @@ struct ContextPositionSerializationTraits {
     static void serialize(
         const Quantized*,
         const Quantized& current,
-        ecs::BitBuffer& out,
-        ecs::ComponentSerializationContext& context) {
+        ashiato::BitBuffer& out,
+        ashiato::ComponentSerializationContext& context) {
         auto* counter = static_cast<int*>(context.userContext);
         if (counter != nullptr) {
             ++(*counter);
@@ -126,10 +126,10 @@ struct ContextPositionSerializationTraits {
     }
 
     static bool deserialize(
-        ecs::BitBuffer& in,
+        ashiato::BitBuffer& in,
         const Quantized*,
         Quantized& out,
-        ecs::ComponentSerializationContext& context) {
+        ashiato::ComponentSerializationContext& context) {
         auto* counter = static_cast<int*>(context.userContext);
         if (counter != nullptr) {
             *counter += 10;
@@ -220,19 +220,19 @@ void zero_native_typed_component_table(std::string& bytes) {
 }  // namespace
 
 TEST_CASE("registry snapshots restore entities components metadata groups singletons and dirty bits") {
-    ecs::Registry registry;
-    const ecs::Entity position_component = registry.register_component<Position>("Position");
+    ashiato::Registry registry;
+    const ashiato::Entity position_component = registry.register_component<Position>("Position");
     registry.register_component<Velocity>("Velocity");
-    const ecs::Entity game_time_component = registry.register_component<GameTime>("GameTime");
+    const ashiato::Entity game_time_component = registry.register_component<GameTime>("GameTime");
 
     REQUIRE(registry.set_component_fields(
         position_component,
-        {ecs::ComponentField{"x", offsetof(Position, x), registry.primitive_type(ecs::PrimitiveType::I32), 1}}));
+        {ashiato::ComponentField{"x", offsetof(Position, x), registry.primitive_type(ashiato::PrimitiveType::I32), 1}}));
 
     registry.declare_owned_group<Position, Velocity>();
 
-    const ecs::Entity kept = registry.create();
-    const ecs::Entity removed_before_snapshot = registry.create();
+    const ashiato::Entity kept = registry.create();
+    const ashiato::Entity removed_before_snapshot = registry.create();
     REQUIRE(registry.add<Position>(kept, Position{1, 2}) != nullptr);
     REQUIRE(registry.add<Velocity>(kept, Velocity{3.0f, 4.0f}) != nullptr);
     REQUIRE(registry.clear_dirty<Position>(kept));
@@ -241,8 +241,8 @@ TEST_CASE("registry snapshots restore entities components metadata groups single
 
     auto snapshot = registry.create_snapshot();
 
-    const ecs::Entity reused_after_snapshot = registry.create();
-    REQUIRE(ecs::Registry::entity_index(reused_after_snapshot) == ecs::Registry::entity_index(removed_before_snapshot));
+    const ashiato::Entity reused_after_snapshot = registry.create();
+    REQUIRE(ashiato::Registry::entity_index(reused_after_snapshot) == ashiato::Registry::entity_index(removed_before_snapshot));
     REQUIRE(registry.add<Position>(reused_after_snapshot, Position{9, 9}) != nullptr);
     REQUIRE(registry.remove<Velocity>(kept));
     registry.write<Position>(kept).x = 42;
@@ -265,25 +265,25 @@ TEST_CASE("registry snapshots restore entities components metadata groups single
     REQUIRE(registry.is_dirty<GameTime>());
     REQUIRE_THROWS_AS(registry.component<Health>(), std::logic_error);
 
-    const std::vector<ecs::ComponentField>* fields = registry.component_fields(position_component);
+    const std::vector<ashiato::ComponentField>* fields = registry.component_fields(position_component);
     REQUIRE(fields != nullptr);
     REQUIRE(fields->size() == 1);
     REQUIRE((*fields)[0].name == "x");
 
-    std::vector<ecs::Entity> grouped;
-    registry.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+    std::vector<ashiato::Entity> grouped;
+    registry.view<Position, Velocity>().each([&](ashiato::Entity entity, Position&, Velocity&) {
         grouped.push_back(entity);
     });
-    REQUIRE(grouped == std::vector<ecs::Entity>{kept});
+    REQUIRE(grouped == std::vector<ashiato::Entity>{kept});
 
-    const ecs::Entity reused_after_restore = registry.create();
+    const ashiato::Entity reused_after_restore = registry.create();
     REQUIRE(reused_after_restore == reused_after_snapshot);
 }
 
 TEST_CASE("registry snapshots restore tag presence and dirty bits") {
-    ecs::Registry registry;
-    const ecs::Entity active_tag = registry.register_component<Active>("Active");
-    const ecs::Entity entity = registry.create();
+    ashiato::Registry registry;
+    const ashiato::Entity active_tag = registry.register_component<Active>("Active");
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Active>(entity));
     REQUIRE(registry.clear_dirty<Active>(entity));
 
@@ -300,10 +300,10 @@ TEST_CASE("registry snapshots restore tag presence and dirty bits") {
 }
 
 TEST_CASE("registry snapshots deep copy copyable non-trivial component storage") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<CopyableName>("CopyableName");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<CopyableName>(entity, CopyableName{"before"}) != nullptr);
 
     auto snapshot = registry.create_snapshot();
@@ -318,24 +318,24 @@ TEST_CASE("registry snapshots deep copy copyable non-trivial component storage")
 }
 
 TEST_CASE("registry snapshots reject move-only non-trivial component storage") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<std::unique_ptr<int>>("OwnedInt");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<std::unique_ptr<int>>(entity, new int(5)) != nullptr);
 
     REQUIRE_THROWS_AS(registry.create_snapshot(), std::logic_error);
 }
 
 TEST_CASE("restoring a registry snapshot leaves registered jobs unchanged") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
 
     int calls = 0;
-    registry.job<Position>(0).each([&](ecs::Registry::View<Position>& view, ecs::Entity current, Position&) {
+    registry.job<Position>(0).each([&](ashiato::Registry::View<Position>& view, ashiato::Entity current, Position&) {
         ++calls;
         view.write<Position>(current).x += 1;
     });
@@ -351,14 +351,14 @@ TEST_CASE("restoring a registry snapshot leaves registered jobs unchanged") {
 }
 
 TEST_CASE("registry snapshots exclude system-tagged job bookkeeping entities") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
 
     int calls = 0;
-    const ecs::Entity job = registry.job<Position>(0).each([&](ecs::Entity, Position&) {
+    const ashiato::Entity job = registry.job<Position>(0).each([&](ashiato::Entity, Position&) {
         ++calls;
     });
     REQUIRE(registry.add<Position>(job, Position{99, 0}) != nullptr);
@@ -376,25 +376,25 @@ TEST_CASE("registry snapshots exclude system-tagged job bookkeeping entities") {
     REQUIRE(registry.get<Position>(entity).x == 1);
     REQUIRE_FALSE(registry.contains<Position>(job));
 
-    const ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
+    const ashiato::JobSchedule schedule = ashiato::Orchestrator(registry).schedule();
     REQUIRE(schedule.stages.size() == 1);
-    REQUIRE(schedule.stages[0].jobs == std::vector<ecs::Entity>{job});
+    REQUIRE(schedule.stages[0].jobs == std::vector<ashiato::Entity>{job});
 
     registry.run_jobs();
     REQUIRE(calls == 1);
 }
 
 TEST_CASE("registry full snapshots write read and restore from in-memory snapshot native format") {
-    ecs::Registry source;
-    const ecs::Entity position_component = source.register_component<Position>("Position");
+    ashiato::Registry source;
+    const ashiato::Entity position_component = source.register_component<Position>("Position");
     source.register_component<Velocity>("Velocity");
     source.register_component<Active>("Active");
     source.register_component<GameTime>("GameTime");
     REQUIRE(source.set_component_fields(
         position_component,
-        {ecs::ComponentField{"x", offsetof(Position, x), source.primitive_type(ecs::PrimitiveType::I32), 1}}));
+        {ashiato::ComponentField{"x", offsetof(Position, x), source.primitive_type(ashiato::PrimitiveType::I32), 1}}));
 
-    const ecs::Entity entity = source.create();
+    const ashiato::Entity entity = source.create();
     REQUIRE(source.add<Position>(entity, Position{3, 4}) != nullptr);
     REQUIRE(source.add<Velocity>(entity, Velocity{1.5f, 2.5f}) != nullptr);
     REQUIRE(source.add<Active>(entity));
@@ -404,8 +404,8 @@ TEST_CASE("registry full snapshots write read and restore from in-memory snapsho
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
     source.create_snapshot().write(stream);
 
-    ecs::Registry::Snapshot loaded = ecs::Registry::Snapshot::read(stream);
-    ecs::Registry restored;
+    ashiato::Registry::Snapshot loaded = ashiato::Registry::Snapshot::read(stream);
+    ashiato::Registry restored;
     restored.restore_snapshot(loaded);
 
     REQUIRE(restored.alive(entity));
@@ -422,13 +422,13 @@ TEST_CASE("registry full snapshots write read and restore from in-memory snapsho
 }
 
 TEST_CASE("native snapshot restore rebinds typed components by registered names") {
-    ecs::Registry source;
-    const ecs::Entity position_component =
+    ashiato::Registry source;
+    const ashiato::Entity position_component =
         source.register_component<NativeRebindPosition>("NativeRebindPosition");
-    const ecs::Entity velocity_component =
+    const ashiato::Entity velocity_component =
         source.register_component<NativeRebindVelocity>("NativeRebindVelocity");
 
-    const ecs::Entity entity = source.create();
+    const ashiato::Entity entity = source.create();
     REQUIRE(source.add<NativeRebindPosition>(entity, NativeRebindPosition{11}) != nullptr);
     REQUIRE(source.add<NativeRebindVelocity>(entity, NativeRebindVelocity{22}) != nullptr);
 
@@ -438,8 +438,8 @@ TEST_CASE("native snapshot restore rebinds typed components by registered names"
     zero_native_typed_component_table(bytes);
 
     std::stringstream patched(bytes, std::ios::in | std::ios::out | std::ios::binary);
-    ecs::Registry::Snapshot loaded = ecs::Registry::Snapshot::read_native(patched);
-    ecs::Registry restored;
+    ashiato::Registry::Snapshot loaded = ashiato::Registry::Snapshot::read_native(patched);
+    ashiato::Registry restored;
     restored.restore_snapshot(loaded);
 
     REQUIRE(restored.component<NativeRebindPosition>() == position_component);
@@ -449,14 +449,14 @@ TEST_CASE("native snapshot restore rebinds typed components by registered names"
 }
 
 TEST_CASE("registry delta snapshots write read and restore from in-memory snapshot native format") {
-    ecs::Registry source;
+    ashiato::Registry source;
     source.register_component<Position>("Position");
     source.register_component<Velocity>("Velocity");
     source.register_component<Active>("Active");
 
-    const ecs::Entity updated = source.create();
-    const ecs::Entity removed_component = source.create();
-    const ecs::Entity destroyed = source.create();
+    const ashiato::Entity updated = source.create();
+    const ashiato::Entity removed_component = source.create();
+    const ashiato::Entity destroyed = source.create();
     REQUIRE(source.add<Position>(updated, Position{1, 1}) != nullptr);
     REQUIRE(source.add<Velocity>(updated, Velocity{1.0f, 1.0f}) != nullptr);
     REQUIRE(source.add<Position>(removed_component, Position{2, 2}) != nullptr);
@@ -468,7 +468,7 @@ TEST_CASE("registry delta snapshots write read and restore from in-memory snapsh
     source.clear_all_dirty<Active>();
 
     auto baseline = source.create_snapshot();
-    ecs::Registry replay;
+    ashiato::Registry replay;
     replay.register_component<Position>("Position");
     replay.register_component<Velocity>("Velocity");
     replay.register_component<Active>("Active");
@@ -481,7 +481,7 @@ TEST_CASE("registry delta snapshots write read and restore from in-memory snapsh
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
     source.create_delta_snapshot(baseline).write(stream);
 
-    ecs::Registry::DeltaSnapshot loaded = ecs::Registry::DeltaSnapshot::read(stream);
+    ashiato::Registry::DeltaSnapshot loaded = ashiato::Registry::DeltaSnapshot::read(stream);
     replay.restore_delta_snapshot(loaded);
 
     REQUIRE(replay.get<Position>(updated).x == 10);
@@ -495,21 +495,21 @@ TEST_CASE("registry delta snapshots write read and restore from in-memory snapsh
 }
 
 TEST_CASE("registry in-memory snapshot native format component filters include and exclude storage") {
-    ecs::Registry source;
+    ashiato::Registry source;
     source.register_component<Position>("Position");
     source.register_component<Velocity>("Velocity");
 
-    const ecs::Entity entity = source.create();
+    const ashiato::Entity entity = source.create();
     REQUIRE(source.add<Position>(entity, Position{8, 9}) != nullptr);
     REQUIRE(source.add<Velocity>(entity, Velocity{3.0f, 4.0f}) != nullptr);
 
-    ecs::SnapshotComponentOptions options;
+    ashiato::SnapshotComponentOptions options;
     options.include_components.push_back(source.component<Position>());
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
     source.create_snapshot().write(stream, options);
 
-    ecs::Registry restored;
-    restored.restore_snapshot(ecs::Registry::Snapshot::read(stream));
+    ashiato::Registry restored;
+    restored.restore_snapshot(ashiato::Registry::Snapshot::read(stream));
 
     REQUIRE(restored.contains<Position>(entity));
     REQUIRE(restored.get<Position>(entity).x == 8);
@@ -517,18 +517,18 @@ TEST_CASE("registry in-memory snapshot native format component filters include a
 }
 
 TEST_CASE("registry in-memory snapshot native format rejects selected non-trivial component storage") {
-    ecs::Registry source;
+    ashiato::Registry source;
     source.register_component<Position>("Position");
     source.register_component<CopyableName>("CopyableName");
 
-    const ecs::Entity entity = source.create();
+    const ashiato::Entity entity = source.create();
     REQUIRE(source.add<Position>(entity, Position{1, 2}) != nullptr);
     REQUIRE(source.add<CopyableName>(entity, CopyableName{"not raw serializable"}) != nullptr);
 
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
     REQUIRE_THROWS_AS(source.create_snapshot().write(stream), std::logic_error);
 
-    ecs::SnapshotComponentOptions options;
+    ashiato::SnapshotComponentOptions options;
     options.include_components.push_back(source.component<Position>());
     std::stringstream filtered(std::ios::in | std::ios::out | std::ios::binary);
     REQUIRE_NOTHROW(source.create_snapshot().write(filtered, options));
@@ -537,27 +537,27 @@ TEST_CASE("registry in-memory snapshot native format rejects selected non-trivia
 TEST_CASE("registry in-memory snapshot native format read rejects invalid headers") {
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
     stream.write("bad", 3);
-    REQUIRE_THROWS_AS(ecs::Registry::Snapshot::read(stream), std::runtime_error);
+    REQUIRE_THROWS_AS(ashiato::Registry::Snapshot::read(stream), std::runtime_error);
 }
 
 TEST_CASE("registry in-memory delta and native snapshot reads reject invalid headers") {
     std::stringstream delta_stream(std::ios::in | std::ios::out | std::ios::binary);
     delta_stream.write("bad", 3);
-    REQUIRE_THROWS_AS(ecs::Registry::DeltaSnapshot::read(delta_stream), std::runtime_error);
+    REQUIRE_THROWS_AS(ashiato::Registry::DeltaSnapshot::read(delta_stream), std::runtime_error);
 
     std::stringstream native_stream(std::ios::in | std::ios::out | std::ios::binary);
     native_stream.write("bad", 3);
-    REQUIRE_THROWS_AS(ecs::Registry::Snapshot::read_native(native_stream), std::runtime_error);
+    REQUIRE_THROWS_AS(ashiato::Registry::Snapshot::read_native(native_stream), std::runtime_error);
 
     std::stringstream native_delta_stream(std::ios::in | std::ios::out | std::ios::binary);
     native_delta_stream.write("bad", 3);
-    REQUIRE_THROWS_AS(ecs::Registry::DeltaSnapshot::read_native(native_delta_stream), std::runtime_error);
+    REQUIRE_THROWS_AS(ashiato::Registry::DeltaSnapshot::read_native(native_delta_stream), std::runtime_error);
 }
 
 TEST_CASE("registry in-memory snapshot reads reject truncated payloads") {
-    ecs::Registry source;
+    ashiato::Registry source;
     source.register_component<Position>("Position");
-    const ecs::Entity entity = source.create();
+    const ashiato::Entity entity = source.create();
     REQUIRE(source.add<Position>(entity, Position{1, 2}) != nullptr);
 
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
@@ -567,25 +567,25 @@ TEST_CASE("registry in-memory snapshot reads reject truncated payloads") {
     bytes.resize(bytes.size() - 3U);
 
     std::stringstream truncated(bytes, std::ios::in | std::ios::out | std::ios::binary);
-    REQUIRE_THROWS_AS(ecs::Registry::Snapshot::read(truncated), std::runtime_error);
+    REQUIRE_THROWS_AS(ashiato::Registry::Snapshot::read(truncated), std::runtime_error);
 }
 
 TEST_CASE("persistent full snapshots use component serialization and restore through schema names") {
-    ecs::ComponentSerializationRegistry serialization;
-    ecs::Registry source;
+    ashiato::ComponentSerializationRegistry serialization;
+    ashiato::Registry source;
     serialization.register_component<Position, CountingPositionTraits>(source, "Position");
     serialization.register_component<Velocity>(source, "Velocity");
     serialization.register_component<GameTime>(source, "GameTime");
     source.register_component<Active>("Active");
 
-    const ecs::Entity entity = source.create();
+    const ashiato::Entity entity = source.create();
     REQUIRE(source.add<Position>(entity, Position{3, 4}) != nullptr);
     REQUIRE(source.add<Velocity>(entity, Velocity{1.5f, 2.5f}) != nullptr);
     REQUIRE(source.add<Active>(entity));
     REQUIRE(source.clear_dirty<Position>(entity));
     source.write<GameTime>().tick = 77;
 
-    ecs::Registry schema;
+    ashiato::Registry schema;
     serialization.register_component<Position, CountingPositionTraits>(schema, "Position");
     serialization.register_component<Velocity>(schema, "Velocity");
     serialization.register_component<GameTime>(schema, "GameTime");
@@ -594,10 +594,10 @@ TEST_CASE("persistent full snapshots use component serialization and restore thr
     CountingPositionTraits::serialize_calls = 0;
     CountingPositionTraits::deserialize_calls = 0;
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_snapshot(stream, source.create_snapshot(), serialization);
+    ashiato::write_persistent_snapshot(stream, source.create_snapshot(), serialization);
 
-    ecs::Registry::Snapshot loaded = ecs::read_persistent_snapshot(stream, schema, serialization);
-    ecs::Registry restored;
+    ashiato::Registry::Snapshot loaded = ashiato::read_persistent_snapshot(stream, schema, serialization);
+    ashiato::Registry restored;
     restored.restore_snapshot(loaded);
 
     REQUIRE(restored.alive(entity));
@@ -612,16 +612,16 @@ TEST_CASE("persistent full snapshots use component serialization and restore thr
 }
 
 TEST_CASE("component serialization ops use raw quantized bytes and user context") {
-    ecs::ComponentSerializationOps ops =
-        ecs::make_component_serialization_ops<Position, ContextPositionSerializationTraits>("Position");
+    ashiato::ComponentSerializationOps ops =
+        ashiato::make_component_serialization_ops<Position, ContextPositionSerializationTraits>("Position");
 
     Position source{7, 9};
     std::array<std::uint8_t, sizeof(Position)> quantized{};
     ops.quantize(&source, quantized.data());
 
     int context_calls = 0;
-    ecs::ComponentSerializationContext context{&context_calls};
-    ecs::BitBuffer payload;
+    ashiato::ComponentSerializationContext context{&context_calls};
+    ashiato::BitBuffer payload;
     ops.serialize(nullptr, quantized.data(), payload, &context);
     REQUIRE(context_calls == 1);
 
@@ -636,17 +636,17 @@ TEST_CASE("component serialization ops use raw quantized bytes and user context"
 }
 
 TEST_CASE("dirty snapshot tracker owns full and delta baseline cadence") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
 
-    std::vector<ecs::DirtySnapshotFrameKind> frames;
-    ecs::DirtySnapshotTrackerOptions options;
+    std::vector<ashiato::DirtySnapshotFrameKind> frames;
+    ashiato::DirtySnapshotTrackerOptions options;
     options.full_snapshot_interval_dirty_frames = 3;
-    options.write = [&](const ecs::DirtySnapshotFrame& frame) {
+    options.write = [&](const ashiato::DirtySnapshotFrame& frame) {
         frames.push_back(frame.kind);
         REQUIRE(frame.registry == &registry);
-        if (frame.kind == ecs::DirtySnapshotFrameKind::Full) {
+        if (frame.kind == ashiato::DirtySnapshotFrameKind::Full) {
             REQUIRE(frame.full != nullptr);
             REQUIRE(frame.delta == nullptr);
         } else {
@@ -655,8 +655,8 @@ TEST_CASE("dirty snapshot tracker owns full and delta baseline cadence") {
         }
     };
 
-    ecs::DirtySnapshotTracker tracker(std::move(options));
-    ecs::RegistryDirtyFrameBroadcaster broadcaster;
+    ashiato::DirtySnapshotTracker tracker(std::move(options));
+    ashiato::RegistryDirtyFrameBroadcaster broadcaster;
     auto subscription = broadcaster.subscribe(tracker);
 
     REQUIRE(registry.add<Position>(entity, Position{1, 1}) != nullptr);
@@ -671,21 +671,21 @@ TEST_CASE("dirty snapshot tracker owns full and delta baseline cadence") {
 
     REQUIRE(subscription.active());
     REQUIRE(frames.size() == 3);
-    REQUIRE(frames[0] == ecs::DirtySnapshotFrameKind::Full);
-    REQUIRE(frames[1] == ecs::DirtySnapshotFrameKind::Delta);
-    REQUIRE(frames[2] == ecs::DirtySnapshotFrameKind::Full);
+    REQUIRE(frames[0] == ashiato::DirtySnapshotFrameKind::Full);
+    REQUIRE(frames[1] == ashiato::DirtySnapshotFrameKind::Delta);
+    REQUIRE(frames[2] == ashiato::DirtySnapshotFrameKind::Full);
 }
 
 TEST_CASE("persistent delta snapshots handle values and tombstones separately from serialization") {
-    ecs::ComponentSerializationRegistry serialization;
-    ecs::Registry source;
+    ashiato::ComponentSerializationRegistry serialization;
+    ashiato::Registry source;
     serialization.register_component<Position, CountingPositionTraits>(source, "Position");
     serialization.register_component<Velocity>(source, "Velocity");
     source.register_component<Active>("Active");
 
-    const ecs::Entity updated = source.create();
-    const ecs::Entity removed = source.create();
-    const ecs::Entity destroyed = source.create();
+    const ashiato::Entity updated = source.create();
+    const ashiato::Entity removed = source.create();
+    const ashiato::Entity destroyed = source.create();
     REQUIRE(source.add<Position>(updated, Position{1, 1}) != nullptr);
     REQUIRE(source.add<Position>(removed, Position{2, 2}) != nullptr);
     REQUIRE(source.add<Velocity>(removed, Velocity{3.0f, 4.0f}) != nullptr);
@@ -696,7 +696,7 @@ TEST_CASE("persistent delta snapshots handle values and tombstones separately fr
     source.clear_all_dirty<Active>();
 
     auto baseline = source.create_snapshot();
-    ecs::Registry replay;
+    ashiato::Registry replay;
     serialization.register_component<Position, CountingPositionTraits>(replay, "Position");
     serialization.register_component<Velocity>(replay, "Velocity");
     replay.register_component<Active>("Active");
@@ -709,9 +709,9 @@ TEST_CASE("persistent delta snapshots handle values and tombstones separately fr
     CountingPositionTraits::serialize_calls = 0;
     CountingPositionTraits::deserialize_calls = 0;
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_delta_snapshot(stream, source.create_delta_snapshot(baseline), baseline, serialization);
+    ashiato::write_persistent_delta_snapshot(stream, source.create_delta_snapshot(baseline), baseline, serialization);
 
-    ecs::Registry::DeltaSnapshot loaded = ecs::read_persistent_delta_snapshot(stream, replay, baseline, serialization);
+    ashiato::Registry::DeltaSnapshot loaded = ashiato::read_persistent_delta_snapshot(stream, replay, baseline, serialization);
     replay.restore_delta_snapshot(loaded);
 
     REQUIRE(replay.get<Position>(updated).x == 10);
@@ -723,21 +723,21 @@ TEST_CASE("persistent delta snapshots handle values and tombstones separately fr
 }
 
 TEST_CASE("persistent snapshot serialization pass aligned quantized values to traits") {
-    ecs::ComponentSerializationRegistry serialization;
-    ecs::Registry source;
+    ashiato::ComponentSerializationRegistry serialization;
+    ashiato::Registry source;
     serialization.register_component<OverAlignedPersistentComponent, OverAlignedPersistentTraits>(source, "OverAligned");
 
-    const ecs::Entity entity = source.create();
+    const ashiato::Entity entity = source.create();
     REQUIRE(source.add<OverAlignedPersistentComponent>(entity, OverAlignedPersistentComponent{7}) != nullptr);
 
     OverAlignedPersistentTraits::all_aligned = true;
     std::stringstream full_stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_snapshot(full_stream, source.create_snapshot(), serialization);
+    ashiato::write_persistent_snapshot(full_stream, source.create_snapshot(), serialization);
 
-    ecs::Registry schema;
+    ashiato::Registry schema;
     serialization.register_component<OverAlignedPersistentComponent, OverAlignedPersistentTraits>(schema, "OverAligned");
-    ecs::Registry::Snapshot loaded = ecs::read_persistent_snapshot(full_stream, schema, serialization);
-    ecs::Registry restored;
+    ashiato::Registry::Snapshot loaded = ashiato::read_persistent_snapshot(full_stream, schema, serialization);
+    ashiato::Registry restored;
     restored.restore_snapshot(loaded);
 
     REQUIRE(restored.get<OverAlignedPersistentComponent>(entity).value == 7);
@@ -749,8 +749,8 @@ TEST_CASE("persistent snapshot serialization pass aligned quantized values to tr
 
     OverAlignedPersistentTraits::all_aligned = true;
     std::stringstream delta_stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_delta_snapshot(delta_stream, source.create_delta_snapshot(baseline), baseline, serialization);
-    ecs::Registry::DeltaSnapshot delta = ecs::read_persistent_delta_snapshot(delta_stream, restored, baseline, serialization);
+    ashiato::write_persistent_delta_snapshot(delta_stream, source.create_delta_snapshot(baseline), baseline, serialization);
+    ashiato::Registry::DeltaSnapshot delta = ashiato::read_persistent_delta_snapshot(delta_stream, restored, baseline, serialization);
     restored.restore_delta_snapshot(delta);
 
     REQUIRE(restored.get<OverAlignedPersistentComponent>(entity).value == 11);
@@ -758,11 +758,11 @@ TEST_CASE("persistent snapshot serialization pass aligned quantized values to tr
 }
 
 TEST_CASE("persistent delta tombstones do not call component serialization") {
-    ecs::ComponentSerializationRegistry serialization;
-    ecs::Registry source;
+    ashiato::ComponentSerializationRegistry serialization;
+    ashiato::Registry source;
     serialization.register_component<Position, CountingPositionTraits>(source, "Position");
 
-    const ecs::Entity removed = source.create();
+    const ashiato::Entity removed = source.create();
     REQUIRE(source.add<Position>(removed, Position{2, 2}) != nullptr);
     source.clear_all_dirty<Position>();
     auto baseline = source.create_snapshot();
@@ -770,35 +770,35 @@ TEST_CASE("persistent delta tombstones do not call component serialization") {
 
     CountingPositionTraits::serialize_calls = 0;
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_delta_snapshot(stream, source.create_delta_snapshot(baseline), baseline, serialization);
+    ashiato::write_persistent_delta_snapshot(stream, source.create_delta_snapshot(baseline), baseline, serialization);
 
     REQUIRE(CountingPositionTraits::serialize_calls == 0);
 }
 
 TEST_CASE("persistent snapshots reject missing serialization and duplicate component names") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     REQUIRE_THROWS_AS(registry.register_component<Velocity>("Position"), std::logic_error);
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{1, 2}) != nullptr);
 
-    ecs::ComponentSerializationRegistry serialization;
+    ashiato::ComponentSerializationRegistry serialization;
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    REQUIRE_THROWS_AS(ecs::write_persistent_snapshot(stream, registry.create_snapshot(), serialization), std::logic_error);
+    REQUIRE_THROWS_AS(ashiato::write_persistent_snapshot(stream, registry.create_snapshot(), serialization), std::logic_error);
 }
 
 TEST_CASE("persistent snapshot frame bit length supports skipping frames") {
-    ecs::ComponentSerializationRegistry serialization;
-    ecs::Registry source;
+    ashiato::ComponentSerializationRegistry serialization;
+    ashiato::Registry source;
     serialization.register_component<Position, CountingPositionTraits>(source, "Position");
-    const ecs::Entity entity = source.create();
+    const ashiato::Entity entity = source.create();
     REQUIRE(source.add<Position>(entity, Position{1, 1}) != nullptr);
 
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_snapshot(stream, source.create_snapshot(), serialization);
+    ashiato::write_persistent_snapshot(stream, source.create_snapshot(), serialization);
     source.write<Position>(entity).x = 9;
-    ecs::write_persistent_snapshot(stream, source.create_snapshot(), serialization);
+    ashiato::write_persistent_snapshot(stream, source.create_snapshot(), serialization);
 
     const std::string bytes = stream.str();
     REQUIRE(bytes.size() >= 20U);
@@ -814,59 +814,59 @@ TEST_CASE("persistent snapshot frame bit length supports skipping frames") {
     REQUIRE(second_offset < bytes.size());
 
     std::stringstream second(bytes.substr(second_offset), std::ios::in | std::ios::out | std::ios::binary);
-    ecs::Registry::Snapshot loaded = ecs::read_persistent_snapshot(second, source, serialization);
-    ecs::Registry restored;
+    ashiato::Registry::Snapshot loaded = ashiato::read_persistent_snapshot(second, source, serialization);
+    ashiato::Registry restored;
     restored.restore_snapshot(loaded);
     REQUIRE(restored.get<Position>(entity).x == 9);
 }
 
 TEST_CASE("persistent snapshot read rejects unread serialization payload bits") {
-    ecs::ComponentSerializationRegistry writer_serialization;
-    ecs::Registry source;
+    ashiato::ComponentSerializationRegistry writer_serialization;
+    ashiato::Registry source;
     writer_serialization.register_component<Position, CountingPositionTraits>(source, "Position");
-    const ecs::Entity entity = source.create();
+    const ashiato::Entity entity = source.create();
     REQUIRE(source.add<Position>(entity, Position{1, 2}) != nullptr);
 
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_snapshot(stream, source.create_snapshot(), writer_serialization);
+    ashiato::write_persistent_snapshot(stream, source.create_snapshot(), writer_serialization);
 
-    ecs::ComponentSerializationRegistry reader_serialization;
-    ecs::Registry schema;
+    ashiato::ComponentSerializationRegistry reader_serialization;
+    ashiato::Registry schema;
     reader_serialization.register_component<Position, UnreadPositionTraits>(schema, "Position");
 
-    REQUIRE_THROWS_AS(ecs::read_persistent_snapshot(stream, schema, reader_serialization), std::runtime_error);
+    REQUIRE_THROWS_AS(ashiato::read_persistent_snapshot(stream, schema, reader_serialization), std::runtime_error);
 }
 
 TEST_CASE("persistent snapshot reads reject truncated frames") {
-    ecs::ComponentSerializationRegistry serialization;
-    ecs::Registry source;
+    ashiato::ComponentSerializationRegistry serialization;
+    ashiato::Registry source;
     serialization.register_component<Position, CountingPositionTraits>(source, "Position");
 
-    const ecs::Entity entity = source.create();
+    const ashiato::Entity entity = source.create();
     REQUIRE(source.add<Position>(entity, Position{3, 4}) != nullptr);
 
     std::stringstream stream(std::ios::in | std::ios::out | std::ios::binary);
-    ecs::write_persistent_snapshot(stream, source.create_snapshot(), serialization);
+    ashiato::write_persistent_snapshot(stream, source.create_snapshot(), serialization);
     std::string bytes = stream.str();
     REQUIRE(bytes.size() > 8U);
     bytes.pop_back();
 
-    ecs::Registry schema;
+    ashiato::Registry schema;
     serialization.register_component<Position, CountingPositionTraits>(schema, "Position");
     std::stringstream truncated(bytes, std::ios::in | std::ios::out | std::ios::binary);
-    REQUIRE_THROWS_AS(ecs::read_persistent_snapshot(truncated, schema, serialization), std::runtime_error);
+    REQUIRE_THROWS_AS(ashiato::read_persistent_snapshot(truncated, schema, serialization), std::runtime_error);
 }
 
 TEST_CASE("delta snapshots restore dirty values additions removals and destroyed entities") {
-    ecs::Registry source;
+    ashiato::Registry source;
     source.register_component<Position>("Position");
     source.register_component<Velocity>("Velocity");
     source.register_component<Health>("Health");
     source.declare_owned_group<Position, Velocity>();
 
-    const ecs::Entity updated = source.create();
-    const ecs::Entity removed_component = source.create();
-    const ecs::Entity destroyed = source.create();
+    const ashiato::Entity updated = source.create();
+    const ashiato::Entity removed_component = source.create();
+    const ashiato::Entity destroyed = source.create();
     REQUIRE(source.add<Position>(updated, Position{1, 1}) != nullptr);
     REQUIRE(source.add<Velocity>(updated, Velocity{1.0f, 1.0f}) != nullptr);
     REQUIRE(source.add<Position>(removed_component, Position{2, 2}) != nullptr);
@@ -878,7 +878,7 @@ TEST_CASE("delta snapshots restore dirty values additions removals and destroyed
     source.clear_all_dirty<Health>();
 
     auto baseline = source.create_snapshot();
-    ecs::Registry replay;
+    ashiato::Registry replay;
     replay.register_component<Position>("Position");
     replay.register_component<Velocity>("Velocity");
     replay.register_component<Health>("Health");
@@ -886,7 +886,7 @@ TEST_CASE("delta snapshots restore dirty values additions removals and destroyed
     replay.restore_snapshot(baseline);
 
     source.write<Position>(updated).x = 10;
-    const ecs::Entity added = source.create();
+    const ashiato::Entity added = source.create();
     REQUIRE(source.add<Position>(added, Position{4, 4}) != nullptr);
     REQUIRE(source.add<Velocity>(added, Velocity{4.0f, 4.0f}) != nullptr);
     REQUIRE(source.remove<Velocity>(removed_component));
@@ -912,8 +912,8 @@ TEST_CASE("delta snapshots restore dirty values additions removals and destroyed
     REQUIRE(replay.is_dirty<Position>(added));
     REQUIRE(replay.is_dirty<Velocity>(removed_component));
 
-    std::vector<ecs::Entity> grouped;
-    replay.view<Position, Velocity>().each([&](ecs::Entity entity, Position&, Velocity&) {
+    std::vector<ashiato::Entity> grouped;
+    replay.view<Position, Velocity>().each([&](ashiato::Entity entity, Position&, Velocity&) {
         grouped.push_back(entity);
     });
     REQUIRE(std::find(grouped.begin(), grouped.end(), updated) != grouped.end());
@@ -922,12 +922,12 @@ TEST_CASE("delta snapshots restore dirty values additions removals and destroyed
 }
 
 TEST_CASE("delta snapshots restore tag additions and removals") {
-    ecs::Registry source;
+    ashiato::Registry source;
     source.register_component<Position>("Position");
     source.register_component<Active>("Active");
 
-    const ecs::Entity kept = source.create();
-    const ecs::Entity removed = source.create();
+    const ashiato::Entity kept = source.create();
+    const ashiato::Entity removed = source.create();
     REQUIRE(source.add<Position>(kept, Position{1, 0}) != nullptr);
     REQUIRE(source.add<Position>(removed, Position{2, 0}) != nullptr);
     REQUIRE(source.add<Active>(removed));
@@ -935,7 +935,7 @@ TEST_CASE("delta snapshots restore tag additions and removals") {
     source.clear_all_dirty<Position>();
 
     auto baseline = source.create_snapshot();
-    ecs::Registry replay;
+    ashiato::Registry replay;
     replay.register_component<Position>("Position");
     replay.register_component<Active>("Active");
     replay.restore_snapshot(baseline);
@@ -951,20 +951,20 @@ TEST_CASE("delta snapshots restore tag additions and removals") {
     REQUIRE(replay.is_dirty<Active>(kept));
     REQUIRE(replay.is_dirty<Active>(removed));
 
-    std::vector<ecs::Entity> active_entities;
-    replay.view<const Position>().with_tags<const Active>().each([&](ecs::Entity entity, const Position&) {
+    std::vector<ashiato::Entity> active_entities;
+    replay.view<const Position>().with_tags<const Active>().each([&](ashiato::Entity entity, const Position&) {
         active_entities.push_back(entity);
     });
-    REQUIRE(active_entities == std::vector<ecs::Entity>{kept});
+    REQUIRE(active_entities == std::vector<ashiato::Entity>{kept});
 }
 
 TEST_CASE("delta snapshots restore singleton dirty values") {
-    ecs::Registry source;
+    ashiato::Registry source;
     source.register_component<GameTime>("GameTime");
     source.clear_all_dirty<GameTime>();
 
     auto baseline = source.create_snapshot();
-    ecs::Registry replay;
+    ashiato::Registry replay;
     replay.register_component<GameTime>("GameTime");
     replay.restore_snapshot(baseline);
 
@@ -977,18 +977,18 @@ TEST_CASE("delta snapshots restore singleton dirty values") {
 }
 
 TEST_CASE("delta snapshots exclude system-tagged job bookkeeping entities") {
-    ecs::Registry source;
+    ashiato::Registry source;
     source.register_component<Position>("Position");
 
-    const ecs::Entity entity = source.create();
+    const ashiato::Entity entity = source.create();
     REQUIRE(source.add<Position>(entity, Position{1, 0}) != nullptr);
 
-    const ecs::Entity job = source.job<Position>(0).each([](ecs::Entity, Position&) {});
+    const ashiato::Entity job = source.job<Position>(0).each([](ashiato::Entity, Position&) {});
     REQUIRE(source.add<Position>(job, Position{99, 0}) != nullptr);
     source.clear_all_dirty<Position>();
 
     auto baseline = source.create_snapshot();
-    ecs::Registry replay;
+    ashiato::Registry replay;
     replay.register_component<Position>("Position");
     replay.restore_snapshot(baseline);
 
@@ -1004,10 +1004,10 @@ TEST_CASE("delta snapshots exclude system-tagged job bookkeeping entities") {
 }
 
 TEST_CASE("delta restore validates baseline token component metadata and removal state") {
-    ecs::Registry source;
+    ashiato::Registry source;
     source.register_component<Position>("Position");
     source.register_component<Velocity>("Velocity");
-    const ecs::Entity entity = source.create();
+    const ashiato::Entity entity = source.create();
     REQUIRE(source.add<Position>(entity, Position{1, 1}) != nullptr);
     REQUIRE(source.add<Velocity>(entity, Velocity{1.0f, 1.0f}) != nullptr);
     source.clear_all_dirty<Position>();
@@ -1018,18 +1018,18 @@ TEST_CASE("delta restore validates baseline token component metadata and removal
     REQUIRE(source.remove<Velocity>(entity));
     auto delta = source.create_delta_snapshot(baseline);
 
-    ecs::Registry wrong_baseline;
+    ashiato::Registry wrong_baseline;
     wrong_baseline.register_component<Position>("Position");
     wrong_baseline.register_component<Velocity>("Velocity");
     REQUIRE_THROWS_AS(wrong_baseline.restore_delta_snapshot(delta), std::logic_error);
 
-    ecs::Registry missing_component;
+    ashiato::Registry missing_component;
     missing_component.register_component<Position>("Position");
     missing_component.restore_snapshot(baseline);
     REQUIRE(missing_component.destroy(missing_component.component<Velocity>()));
     REQUIRE_THROWS_AS(missing_component.restore_delta_snapshot(delta), std::logic_error);
 
-    ecs::Registry missing_removed_value;
+    ashiato::Registry missing_removed_value;
     missing_removed_value.register_component<Position>("Position");
     missing_removed_value.register_component<Velocity>("Velocity");
     missing_removed_value.restore_snapshot(baseline);
@@ -1038,11 +1038,11 @@ TEST_CASE("delta restore validates baseline token component metadata and removal
 }
 
 TEST_CASE("delta snapshots reject dirty move-only non-trivial component storage") {
-    ecs::Registry source;
+    ashiato::Registry source;
     source.register_component<std::unique_ptr<int>>("OwnedInt");
     auto baseline = source.create_snapshot();
 
-    const ecs::Entity entity = source.create();
+    const ashiato::Entity entity = source.create();
     REQUIRE(source.add<std::unique_ptr<int>>(entity, new int(1)) != nullptr);
 
     REQUIRE_THROWS_AS(source.create_delta_snapshot(baseline), std::logic_error);

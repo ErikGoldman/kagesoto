@@ -1,6 +1,6 @@
-#include "ecs/ecs.hpp"
+#include "ashiato/ashiato.hpp"
 
-namespace ecs {
+namespace ashiato {
 
 namespace {
 
@@ -44,12 +44,12 @@ JobThreadTask make_guarded_job_task(
     auto run_state = std::make_shared<JobTaskRunState>();
     task.run = [run = std::move(task.run), batch, run_state, &first_exception, &exception_mutex]() mutable {
         if (batch->closed.load(std::memory_order_acquire)) {
-            throw_job_executor_contract_violation(batch, "ecs job task cannot run after the executor returns");
+            throw_job_executor_contract_violation(batch, "ashiato job task cannot run after the executor returns");
         }
 
         bool expected = false;
         if (!run_state->started.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            throw_job_executor_contract_violation(batch, "ecs job task cannot run more than once");
+            throw_job_executor_contract_violation(batch, "ashiato job task cannot run more than once");
         }
 
         batch->started.fetch_add(1, std::memory_order_acq_rel);
@@ -66,11 +66,11 @@ JobThreadTask make_guarded_job_task(
 void close_and_validate_job_task_batch(const std::shared_ptr<JobTaskBatchState>& batch) {
     batch->closed.store(true, std::memory_order_release);
     if (batch->contract_violated.load(std::memory_order_acquire)) {
-        throw std::logic_error("ecs job executor violated the task execution contract");
+        throw std::logic_error("ashiato job executor violated the task execution contract");
     }
     if (batch->started.load(std::memory_order_acquire) != batch->expected ||
         batch->finished.load(std::memory_order_acquire) != batch->expected) {
-        throw std::logic_error("ecs job executor must run every task to completion before returning");
+        throw std::logic_error("ashiato job executor must run every task to completion before returning");
     }
 }
 
@@ -504,4 +504,4 @@ void Registry::run_jobs_for_entities(const std::vector<Entity>& entities, RunJob
     cached_all_jobs_graph().tick_for_entities(*this, entities, options);
 }
 
-}  // namespace ecs
+}  // namespace ashiato

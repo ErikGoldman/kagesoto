@@ -21,7 +21,7 @@ Configure a `RelWithDebInfo` benchmark build:
 cmake -S . -B build-bench \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DBUILD_TESTING=ON \
-  -DECS_BUILD_BENCHMARKS=ON
+  -DASHIATO_BUILD_BENCHMARKS=ON
 ```
 
 Build the benchmark target:

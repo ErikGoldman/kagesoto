@@ -1,13 +1,13 @@
-add_executable(ecs_example
+add_executable(ashiato_example
     main.cpp
 )
 
-target_link_libraries(ecs_example PRIVATE ecs::ecs)
+target_link_libraries(ashiato_example PRIVATE ashiato::ashiato)
 
 find_package(X11 QUIET)
 find_package(OpenGL QUIET)
 
-set(ecs_can_build_raylib_examples OFF)
+set(ashiato_can_build_raylib_examples OFF)
 if(X11_FOUND
         AND OpenGL_FOUND
         AND OPENGL_INCLUDE_DIR
@@ -19,11 +19,11 @@ if(X11_FOUND
         AND X11_Xcursor_LIB
         AND X11_Xi_INCLUDE_PATH
         AND X11_Xi_LIB)
-    set(ecs_can_build_raylib_examples ON)
+    set(ashiato_can_build_raylib_examples ON)
 endif()
 
-if(NOT ecs_can_build_raylib_examples)
-    message(WARNING "Skipping ecs_balls_3d_example because raylib's X11/OpenGL development dependencies are missing")
+if(NOT ashiato_can_build_raylib_examples)
+    message(WARNING "Skipping ashiato_balls_3d_example because raylib's X11/OpenGL development dependencies are missing")
     return()
 endif()
 
@@ -40,12 +40,12 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(raylib)
 
-add_executable(ecs_balls_3d_example
+add_executable(ashiato_balls_3d_example
     balls_3d.cpp
 )
 
-target_link_libraries(ecs_balls_3d_example
+target_link_libraries(ashiato_balls_3d_example
     PRIVATE
-        ecs::ecs
+        ashiato::ashiato
         raylib
 )

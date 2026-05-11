@@ -1,6 +1,6 @@
-#include "ecs/ecs.hpp"
-#if ECS_ENABLE_DEBUG_SERVER
-#include "ecs/debug_server.hpp"
+#include "ashiato/ashiato.hpp"
+#if ASHIATO_ENABLE_DEBUG_SERVER
+#include "ashiato/debug_server.hpp"
 #endif
 
 #include <raylib.h>
@@ -47,8 +47,8 @@ struct SimulationStep {
 
 struct RewindFrame {
     std::uint64_t frame = 0;
-    std::optional<ecs::Registry::Snapshot> checkpoint;
-    std::optional<ecs::Registry::DeltaSnapshot> delta;
+    std::optional<ashiato::Registry::Snapshot> checkpoint;
+    std::optional<ashiato::Registry::DeltaSnapshot> delta;
 };
 
 constexpr int screen_width = 1280;
@@ -62,10 +62,10 @@ constexpr std::uint16_t default_debug_port = 8080;
 
 }  // namespace
 
-namespace ecs {
+namespace ashiato {
 template <>
 struct is_singleton_component<SimulationStep> : std::true_type {};
-}  // namespace ecs
+}  // namespace ashiato
 
 namespace {
 
@@ -81,50 +81,50 @@ Color to_raylib_color(const BallColor& color) {
     return Color{channel(color.r), channel(color.g), channel(color.b), channel(color.a)};
 }
 
-void register_components(ecs::Registry& registry) {
-    const ecs::Entity f32 = registry.primitive_type(ecs::PrimitiveType::F32);
-    const ecs::Entity u32 = registry.primitive_type(ecs::PrimitiveType::U32);
-    const ecs::Entity position = registry.register_component<Position3>("Position3");
-    const ecs::Entity velocity = registry.register_component<Velocity3>("Velocity3");
-    const ecs::Entity radius = registry.register_component<Radius>("Radius");
-    const ecs::Entity ball_color = registry.register_component<BallColor>("BallColor");
+void register_components(ashiato::Registry& registry) {
+    const ashiato::Entity f32 = registry.primitive_type(ashiato::PrimitiveType::F32);
+    const ashiato::Entity u32 = registry.primitive_type(ashiato::PrimitiveType::U32);
+    const ashiato::Entity position = registry.register_component<Position3>("Position3");
+    const ashiato::Entity velocity = registry.register_component<Velocity3>("Velocity3");
+    const ashiato::Entity radius = registry.register_component<Radius>("Radius");
+    const ashiato::Entity ball_color = registry.register_component<BallColor>("BallColor");
     registry.register_component<Glow>("Glow");
-    const ecs::Entity simulation_step = registry.register_component<SimulationStep>("SimulationStep");
+    const ashiato::Entity simulation_step = registry.register_component<SimulationStep>("SimulationStep");
 
     const bool position_fields = registry.set_component_fields(
         position,
         {
-            ecs::ComponentField{"x", offsetof(Position3, value) + offsetof(Vector3, x), f32, 1},
-            ecs::ComponentField{"y", offsetof(Position3, value) + offsetof(Vector3, y), f32, 1},
-            ecs::ComponentField{"z", offsetof(Position3, value) + offsetof(Vector3, z), f32, 1},
+            ashiato::ComponentField{"x", offsetof(Position3, value) + offsetof(Vector3, x), f32, 1},
+            ashiato::ComponentField{"y", offsetof(Position3, value) + offsetof(Vector3, y), f32, 1},
+            ashiato::ComponentField{"z", offsetof(Position3, value) + offsetof(Vector3, z), f32, 1},
         });
     const bool velocity_fields = registry.set_component_fields(
         velocity,
         {
-            ecs::ComponentField{"x", offsetof(Velocity3, value) + offsetof(Vector3, x), f32, 1},
-            ecs::ComponentField{"y", offsetof(Velocity3, value) + offsetof(Vector3, y), f32, 1},
-            ecs::ComponentField{"z", offsetof(Velocity3, value) + offsetof(Vector3, z), f32, 1},
+            ashiato::ComponentField{"x", offsetof(Velocity3, value) + offsetof(Vector3, x), f32, 1},
+            ashiato::ComponentField{"y", offsetof(Velocity3, value) + offsetof(Vector3, y), f32, 1},
+            ashiato::ComponentField{"z", offsetof(Velocity3, value) + offsetof(Vector3, z), f32, 1},
         });
     const bool radius_fields =
-        registry.set_component_fields(radius, {ecs::ComponentField{"value", offsetof(Radius, value), f32, 1}});
+        registry.set_component_fields(radius, {ashiato::ComponentField{"value", offsetof(Radius, value), f32, 1}});
     const bool color_fields = registry.set_component_fields(
         ball_color,
         {
-            ecs::ComponentField{"r", offsetof(BallColor, r), u32, 1},
-            ecs::ComponentField{"g", offsetof(BallColor, g), u32, 1},
-            ecs::ComponentField{"b", offsetof(BallColor, b), u32, 1},
-            ecs::ComponentField{"a", offsetof(BallColor, a), u32, 1},
+            ashiato::ComponentField{"r", offsetof(BallColor, r), u32, 1},
+            ashiato::ComponentField{"g", offsetof(BallColor, g), u32, 1},
+            ashiato::ComponentField{"b", offsetof(BallColor, b), u32, 1},
+            ashiato::ComponentField{"a", offsetof(BallColor, a), u32, 1},
         });
     const bool simulation_step_fields =
-        registry.set_component_fields(simulation_step, {ecs::ComponentField{"dt", offsetof(SimulationStep, dt), f32, 1}});
+        registry.set_component_fields(simulation_step, {ashiato::ComponentField{"dt", offsetof(SimulationStep, dt), f32, 1}});
     if (!position_fields || !velocity_fields || !radius_fields || !color_fields || !simulation_step_fields) {
         throw std::runtime_error("failed to register balls debug component fields");
     }
 }
 
-void register_simulation_jobs(ecs::Registry& registry) {
+void register_simulation_jobs(ashiato::Registry& registry) {
     registry.job<Position3, Velocity3, const Radius, const SimulationStep>(0).name("Move balls").each(
-        [](ecs::Entity, Position3& position, Velocity3& velocity, const Radius& radius, const SimulationStep& step) {
+        [](ashiato::Entity, Position3& position, Velocity3& velocity, const Radius& radius, const SimulationStep& step) {
             const float min_bound = -world_half_size + radius.value;
             const float max_bound = world_half_size - radius.value;
 
@@ -145,7 +145,7 @@ void register_simulation_jobs(ecs::Registry& registry) {
         });
 
     registry.job<BallColor, const SimulationStep>(1).name("Animate glow").with_tags<Glow>().each(
-        [](ecs::Entity, BallColor& color, const SimulationStep& step) {
+        [](ashiato::Entity, BallColor& color, const SimulationStep& step) {
             const auto shift = [dt = step.dt](std::uint32_t value, float rate) {
                 return static_cast<std::uint32_t>(std::fmod(static_cast<float>(value) + rate * dt, 255.0f));
             };
@@ -155,7 +155,7 @@ void register_simulation_jobs(ecs::Registry& registry) {
         });
 }
 
-void populate_world(ecs::Registry& registry) {
+void populate_world(ashiato::Registry& registry) {
     std::mt19937 rng(0x5EED);
     std::uniform_real_distribution<float> position_dist(-world_half_size + 0.7f, world_half_size - 0.7f);
     std::uniform_real_distribution<float> velocity_dist(-3.2f, 3.2f);
@@ -163,7 +163,7 @@ void populate_world(ecs::Registry& registry) {
     std::uniform_int_distribution<int> color_dist(80, 255);
 
     for (int i = 0; i < ball_count; ++i) {
-        const ecs::Entity entity = registry.create();
+        const ashiato::Entity entity = registry.create();
         const float radius = radius_dist(rng);
         Vector3 velocity{velocity_dist(rng), velocity_dist(rng), velocity_dist(rng)};
         if (Vector3LengthSqr(velocity) < 0.5f) {
@@ -192,29 +192,29 @@ void populate_world(ecs::Registry& registry) {
     registry.clear_all_dirty<BallColor>();
 }
 
-void simulate(ecs::Registry& registry, float dt) {
+void simulate(ashiato::Registry& registry, float dt) {
     registry.write<SimulationStep>().dt = dt;
     registry.run_jobs();
 }
 
-class RewindTimeline final : public ecs::RegistryDirtyFrameBroadcastListener {
+class RewindTimeline final : public ashiato::RegistryDirtyFrameBroadcastListener {
 public:
     void set_next_capture_frame(std::uint64_t frame) {
         next_capture_frame_ = frame;
     }
 
-    void on_registry_dirty_frame(const ecs::RegistryDirtyFrame& frame) override {
+    void on_registry_dirty_frame(const ashiato::RegistryDirtyFrame& frame) override {
         capture(frame.registry, next_capture_frame_);
     }
 
-    void capture_checkpoint(ecs::Registry& registry, std::uint64_t frame) {
+    void capture_checkpoint(ashiato::Registry& registry, std::uint64_t frame) {
         RewindFrame record;
         record.frame = frame;
         record.checkpoint.emplace(registry.create_snapshot());
         push(std::move(record));
     }
 
-    void capture_delta(ecs::Registry& registry, const RewindFrame& baseline, std::uint64_t frame) {
+    void capture_delta(ashiato::Registry& registry, const RewindFrame& baseline, std::uint64_t frame) {
         RewindFrame record;
         record.frame = frame;
         if (baseline.checkpoint.has_value()) {
@@ -225,7 +225,7 @@ public:
         push(std::move(record));
     }
 
-    void capture(ecs::Registry& registry, std::uint64_t frame) {
+    void capture(ashiato::Registry& registry, std::uint64_t frame) {
         if (size_ == 0 || frame % checkpoint_interval == 0) {
             capture_checkpoint(registry, frame);
             return;
@@ -234,7 +234,7 @@ public:
         capture_delta(registry, at(size_ - 1), frame);
     }
 
-    bool restore(ecs::Registry& registry, std::size_t frame_index) const {
+    bool restore(ashiato::Registry& registry, std::size_t frame_index) const {
         if (frame_index >= size_) {
             return false;
         }
@@ -310,15 +310,15 @@ private:
     std::uint64_t next_capture_frame_ = 0;
 };
 
-void sync_display_from_live(ecs::Registry& live, ecs::Registry& display) {
+void sync_display_from_live(ashiato::Registry& live, ashiato::Registry& display) {
     display.restore_snapshot(live.create_snapshot());
 }
 
-void draw_world(ecs::Registry& registry) {
+void draw_world(ashiato::Registry& registry) {
     DrawCubeWires(Vector3{0.0f, 0.0f, 0.0f}, world_half_size * 2.0f, world_half_size * 2.0f, world_half_size * 2.0f, GRAY);
 
     registry.view<const Position3, const Radius, const BallColor>().each(
-        [](ecs::Entity, const Position3& position, const Radius& radius, const BallColor& color) {
+        [](ashiato::Entity, const Position3& position, const Radius& radius, const BallColor& color) {
             DrawSphere(position.value, radius.value, to_raylib_color(color));
         });
 }
@@ -385,16 +385,16 @@ ExampleOptions parse_options(int argc, char** argv) {
 int main(int argc, char** argv) {
     const ExampleOptions options = parse_options(argc, argv);
 
-    ecs::Registry live;
+    ashiato::Registry live;
     register_components(live);
     register_simulation_jobs(live);
     populate_world(live);
 
-#if ECS_ENABLE_DEBUG_SERVER
-    ecs::DebugServer debug_server(
+#if ASHIATO_ENABLE_DEBUG_SERVER
+    ashiato::DebugServer debug_server(
         live,
         "balls 3d",
-        ecs::DebugServerOptions{
+        ashiato::DebugServerOptions{
             options.debug_server,
             "127.0.0.1",
             options.debug_port,
@@ -402,35 +402,35 @@ int main(int argc, char** argv) {
     const std::optional<std::uint16_t> debug_port =
         debug_server.enabled() ? std::optional<std::uint16_t>{debug_server.port()} : std::nullopt;
     if (debug_server.enabled()) {
-        std::vector<ecs::Entity> debug_named_entities;
-        live.view<>().each([&](ecs::Entity entity) {
+        std::vector<ashiato::Entity> debug_named_entities;
+        live.view<>().each([&](ashiato::Entity entity) {
             if (live.is_user_entity(entity)) {
                 debug_named_entities.push_back(entity);
             }
         });
-        for (ecs::Entity entity : debug_named_entities) {
-            live.add<ecs::DebugName>(entity, ecs::DebugName{"ball"});
+        for (ashiato::Entity entity : debug_named_entities) {
+            live.add<ashiato::DebugName>(entity, ashiato::DebugName{"ball"});
         }
     }
 #else
     if (options.debug_server) {
-        std::fprintf(stderr, "ecs_balls_3d_example was built without ECS_ENABLE_DEBUG_SERVER=ON\n");
+        std::fprintf(stderr, "ashiato_balls_3d_example was built without ASHIATO_ENABLE_DEBUG_SERVER=ON\n");
     }
     const std::optional<std::uint16_t> debug_port = std::nullopt;
 #endif
 
-    ecs::Registry display;
+    ashiato::Registry display;
     register_components(display);
 
     RewindTimeline timeline;
-    ecs::RegistryDirtyFrameBroadcaster dirty_frame_broadcaster;
+    ashiato::RegistryDirtyFrameBroadcaster dirty_frame_broadcaster;
     auto timeline_dirty_subscription = dirty_frame_broadcaster.subscribe(timeline);
     std::uint64_t generated_frame = 0;
     timeline.capture(live, generated_frame);
     std::size_t cursor = timeline.newest_index();
     timeline.restore(display, cursor);
 
-    InitWindow(screen_width, screen_height, "ECS 3D balls rewind debugger");
+    InitWindow(screen_width, screen_height, "Ashiato ECS 3D balls rewind debugger");
     SetTargetFPS(60);
 
     Camera3D camera{};
@@ -444,7 +444,7 @@ int main(int argc, char** argv) {
     float accumulator = 0.0f;
 
     while (!WindowShouldClose()) {
-#if ECS_ENABLE_DEBUG_SERVER
+#if ASHIATO_ENABLE_DEBUG_SERVER
         debug_server.poll();
 #endif
         UpdateCamera(&camera, CAMERA_ORBITAL);

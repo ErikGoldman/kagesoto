@@ -1,130 +1,130 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(ECS
+project(Ashiato
     VERSION 0.1.0
-    DESCRIPTION "Simple ECS library using paged sparse arrays"
+    DESCRIPTION "Simple Ashiato ECS library using paged sparse arrays"
     LANGUAGES CXX
 )
 
 if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
-    set(ecs_is_top_level ON)
+    set(ashiato_is_top_level ON)
 else()
-    set(ecs_is_top_level OFF)
+    set(ashiato_is_top_level OFF)
 endif()
 
-if(ecs_is_top_level)
+if(ashiato_is_top_level)
     include(CTest)
-    set(ecs_build_testing_default ${BUILD_TESTING})
+    set(ashiato_build_testing_default ${BUILD_TESTING})
 else()
-    set(ecs_build_testing_default OFF)
+    set(ashiato_build_testing_default OFF)
 endif()
 
-option(ECS_BUILD_EXAMPLE "Build the example executable" ${ecs_is_top_level})
-option(ECS_BUILD_TESTING "Build ECS tests" ${ecs_build_testing_default})
-option(ECS_BUILD_BENCHMARKS "Build Google Benchmark suites" OFF)
-option(ECS_ENABLE_COVERAGE "Build ECS targets with coverage instrumentation" OFF)
-option(ECS_ENABLE_DEBUG_SERVER "Build the optional ECS local debug GraphQL server" OFF)
-option(ECS_INSTALL "Install ECS library and CMake package files" ${ecs_is_top_level})
+option(ASHIATO_BUILD_EXAMPLE "Build the example executable" ${ashiato_is_top_level})
+option(ASHIATO_BUILD_TESTING "Build Ashiato ECS tests" ${ashiato_build_testing_default})
+option(ASHIATO_BUILD_BENCHMARKS "Build Google Benchmark suites" OFF)
+option(ASHIATO_ENABLE_COVERAGE "Build Ashiato ECS targets with coverage instrumentation" OFF)
+option(ASHIATO_ENABLE_DEBUG_SERVER "Build the optional Ashiato ECS local debug GraphQL server" OFF)
+option(ASHIATO_INSTALL "Install Ashiato ECS library and CMake package files" ${ashiato_is_top_level})
 
-if(ECS_ENABLE_COVERAGE AND NOT ECS_BUILD_TESTING)
-    message(FATAL_ERROR "ECS_ENABLE_COVERAGE requires ECS_BUILD_TESTING=ON")
+if(ASHIATO_ENABLE_COVERAGE AND NOT ASHIATO_BUILD_TESTING)
+    message(FATAL_ERROR "ASHIATO_ENABLE_COVERAGE requires ASHIATO_BUILD_TESTING=ON")
 endif()
 
-set(ecs_public_headers
-    include/ecs/bit_buffer.hpp
-    include/ecs/ecs.hpp
+set(ashiato_public_headers
+    include/ashiato/bit_buffer.hpp
+    include/ashiato/ashiato.hpp
 )
 
-set(ecs_sources
-    src/ecs.cpp
+set(ashiato_sources
+    src/ashiato.cpp
     src/groups.cpp
     src/jobs.cpp
     src/snapshot.cpp
     src/storage.cpp
 )
 
-if(ECS_ENABLE_DEBUG_SERVER)
-    list(APPEND ecs_public_headers
-        include/ecs/debug_server.hpp
+if(ASHIATO_ENABLE_DEBUG_SERVER)
+    list(APPEND ashiato_public_headers
+        include/ashiato/debug_server.hpp
     )
-    list(APPEND ecs_sources
+    list(APPEND ashiato_sources
         src/debug_server.cpp
     )
 endif()
 
-set(ecs_test_sources
-    src/ecs_bit_buffer.test.cpp
-    src/ecs_groups.test.cpp
-    src/ecs_job_callbacks.test.cpp
-    src/ecs_job_graph.test.cpp
-    src/ecs_job_threading.test.cpp
-    src/ecs_jobs_basic.test.cpp
-    src/ecs_metadata.test.cpp
-    src/ecs_registry.test.cpp
-    src/ecs_snapshot.test.cpp
-    src/ecs_storage.test.cpp
-    src/ecs_views_basic.test.cpp
-    src/ecs_views_iteration.test.cpp
+set(ashiato_test_sources
+    src/ashiato_bit_buffer.test.cpp
+    src/ashiato_groups.test.cpp
+    src/ashiato_job_callbacks.test.cpp
+    src/ashiato_job_graph.test.cpp
+    src/ashiato_job_threading.test.cpp
+    src/ashiato_jobs_basic.test.cpp
+    src/ashiato_metadata.test.cpp
+    src/ashiato_registry.test.cpp
+    src/ashiato_snapshot.test.cpp
+    src/ashiato_storage.test.cpp
+    src/ashiato_views_basic.test.cpp
+    src/ashiato_views_iteration.test.cpp
 )
 
-if(ECS_ENABLE_DEBUG_SERVER)
-    list(APPEND ecs_test_sources
-        src/ecs_debug_server.test.cpp
+if(ASHIATO_ENABLE_DEBUG_SERVER)
+    list(APPEND ashiato_test_sources
+        src/ashiato_debug_server.test.cpp
     )
 endif()
 
-add_library(ecs STATIC)
+add_library(ashiato STATIC)
 
-target_sources(ecs
+target_sources(ashiato
     PRIVATE
-        ${ecs_sources}
-        ${ecs_public_headers}
+        ${ashiato_sources}
+        ${ashiato_public_headers}
 )
 
-add_library(ecs::ecs ALIAS ecs)
+add_library(ashiato::ashiato ALIAS ashiato)
 
-target_compile_features(ecs PUBLIC cxx_std_17)
+target_compile_features(ashiato PUBLIC cxx_std_17)
 
-if(ECS_ENABLE_DEBUG_SERVER)
-    target_compile_definitions(ecs PUBLIC ECS_ENABLE_DEBUG_SERVER=1)
+if(ASHIATO_ENABLE_DEBUG_SERVER)
+    target_compile_definitions(ashiato PUBLIC ASHIATO_ENABLE_DEBUG_SERVER=1)
 endif()
 
-target_include_directories(ecs
+target_include_directories(ashiato
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
 
-set_target_properties(ecs PROPERTIES
+set_target_properties(ashiato PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
-if(ECS_ENABLE_COVERAGE)
+if(ASHIATO_ENABLE_COVERAGE)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        message(FATAL_ERROR "ECS_ENABLE_COVERAGE requires GCC or Clang")
+        message(FATAL_ERROR "ASHIATO_ENABLE_COVERAGE requires GCC or Clang")
     endif()
 
-    function(ecs_enable_coverage target_name)
+    function(ashiato_enable_coverage target_name)
         target_compile_options(${target_name} PRIVATE -O0 -g --coverage)
         target_link_options(${target_name} PRIVATE --coverage)
     endfunction()
 
-    ecs_enable_coverage(ecs)
+    ashiato_enable_coverage(ashiato)
 endif()
 
 if(MSVC)
-    target_compile_options(ecs PRIVATE /W4)
+    target_compile_options(ashiato PRIVATE /W4)
 else()
-    target_compile_options(ecs PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(ashiato PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-if(ECS_INSTALL)
+if(ASHIATO_INSTALL)
     include(GNUInstallDirs)
     include(CMakePackageConfigHelpers)
 
-    install(TARGETS ecs
-        EXPORT ecsTargets
+    install(TARGETS ashiato
+        EXPORT ashiatoTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -135,42 +135,42 @@ if(ECS_INSTALL)
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
 
-    set(ecs_package_config_dir ${CMAKE_INSTALL_LIBDIR}/cmake/ecs)
+    set(ashiato_package_config_dir ${CMAKE_INSTALL_LIBDIR}/cmake/ashiato)
 
-    install(EXPORT ecsTargets
-        FILE ecsTargets.cmake
-        NAMESPACE ecs::
-        DESTINATION ${ecs_package_config_dir}
+    install(EXPORT ashiatoTargets
+        FILE ashiatoTargets.cmake
+        NAMESPACE ashiato::
+        DESTINATION ${ashiato_package_config_dir}
     )
 
     configure_package_config_file(
-        cmake/ecsConfig.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/ecsConfig.cmake
-        INSTALL_DESTINATION ${ecs_package_config_dir}
+        cmake/AshiatoConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/AshiatoConfig.cmake
+        INSTALL_DESTINATION ${ashiato_package_config_dir}
     )
 
     write_basic_package_version_file(
-        ${CMAKE_CURRENT_BINARY_DIR}/ecsConfigVersion.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/AshiatoConfigVersion.cmake
         VERSION ${PROJECT_VERSION}
         COMPATIBILITY SameMajorVersion
     )
 
     install(FILES
-        ${CMAKE_CURRENT_BINARY_DIR}/ecsConfig.cmake
-        ${CMAKE_CURRENT_BINARY_DIR}/ecsConfigVersion.cmake
-        DESTINATION ${ecs_package_config_dir}
+        ${CMAKE_CURRENT_BINARY_DIR}/AshiatoConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/AshiatoConfigVersion.cmake
+        DESTINATION ${ashiato_package_config_dir}
     )
 endif()
 
-if(ECS_BUILD_EXAMPLE)
+if(ASHIATO_BUILD_EXAMPLE)
     add_subdirectory(examples)
 endif()
 
-if(ECS_BUILD_TESTING OR ECS_BUILD_BENCHMARKS)
+if(ASHIATO_BUILD_TESTING OR ASHIATO_BUILD_BENCHMARKS)
     include(FetchContent)
 endif()
 
-if(ECS_BUILD_TESTING)
+if(ASHIATO_BUILD_TESTING)
 
     FetchContent_Declare(
         Catch2
@@ -182,44 +182,44 @@ if(ECS_BUILD_TESTING)
 
     include(Catch)
 
-    add_executable(ecs_tests)
+    add_executable(ashiato_tests)
 
-    target_sources(ecs_tests
+    target_sources(ashiato_tests
         PRIVATE
-            ${ecs_test_sources}
+            ${ashiato_test_sources}
     )
 
-    target_link_libraries(ecs_tests
+    target_link_libraries(ashiato_tests
         PRIVATE
-            ecs::ecs
+            ashiato::ashiato
             Catch2::Catch2WithMain
     )
 
-    if(ECS_ENABLE_COVERAGE)
-        ecs_enable_coverage(ecs_tests)
+    if(ASHIATO_ENABLE_COVERAGE)
+        ashiato_enable_coverage(ashiato_tests)
 
-        find_program(ECS_GCOV_EXECUTABLE gcov REQUIRED)
+        find_program(ASHIATO_GCOV_EXECUTABLE gcov REQUIRED)
 
         add_custom_target(coverage
             COMMAND ${CMAKE_CTEST_COMMAND} --test-dir ${CMAKE_BINARY_DIR} --output-on-failure
             COMMAND ${CMAKE_COMMAND}
-                -DECS_SOURCE_DIR=${CMAKE_SOURCE_DIR}
-                -DECS_BINARY_DIR=${CMAKE_BINARY_DIR}
-                -DECS_GCOV_EXECUTABLE=${ECS_GCOV_EXECUTABLE}
-                -DECS_COVERAGE_OUTPUT_DIR=${CMAKE_BINARY_DIR}/coverage
-                -P ${CMAKE_SOURCE_DIR}/cmake/ecs_coverage_report.cmake
-            DEPENDS ecs_tests
+                -DASHIATO_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -DASHIATO_BINARY_DIR=${CMAKE_BINARY_DIR}
+                -DASHIATO_GCOV_EXECUTABLE=${ASHIATO_GCOV_EXECUTABLE}
+                -DASHIATO_COVERAGE_OUTPUT_DIR=${CMAKE_BINARY_DIR}/coverage
+                -P ${CMAKE_SOURCE_DIR}/cmake/ashiato_coverage_report.cmake
+            DEPENDS ashiato_tests
             USES_TERMINAL
             COMMENT "Running tests and generating gcov coverage stats"
         )
     endif()
 
-    add_custom_target(tests DEPENDS ecs_tests)
+    add_custom_target(tests DEPENDS ashiato_tests)
 
-    catch_discover_tests(ecs_tests)
+    catch_discover_tests(ashiato_tests)
 endif()
 
-if(ECS_BUILD_BENCHMARKS)
+if(ASHIATO_BUILD_BENCHMARKS)
     set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
     set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
     set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)

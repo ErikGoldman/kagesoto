@@ -1,13 +1,13 @@
-#include "ecs_test_support.hpp"
+#include "ashiato_test_support.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 TEST_CASE("dirty component iteration exposes current values and removal tombstones") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
-    const ecs::Entity first = registry.create();
-    const ecs::Entity second = registry.create();
-    const ecs::Entity destroyed = registry.create();
+    const ashiato::Entity first = registry.create();
+    const ashiato::Entity second = registry.create();
+    const ashiato::Entity destroyed = registry.create();
 
     REQUIRE(registry.add<Position>(first, Position{1, 2}) != nullptr);
     REQUIRE(registry.add<Position>(second, Position{3, 4}) != nullptr);
@@ -18,32 +18,32 @@ TEST_CASE("dirty component iteration exposes current values and removal tombston
     REQUIRE(registry.remove<Position>(second));
     REQUIRE(registry.destroy(destroyed));
 
-    std::vector<ecs::Entity> dirty_entities;
+    std::vector<ashiato::Entity> dirty_entities;
     std::vector<Position> dirty_values;
-    registry.each_dirty<Position>([&](ecs::Entity entity, const void* value) {
+    registry.each_dirty<Position>([&](ashiato::Entity entity, const void* value) {
         dirty_entities.push_back(entity);
         dirty_values.push_back(*static_cast<const Position*>(value));
     });
 
-    REQUIRE(dirty_entities == std::vector<ecs::Entity>{first});
+    REQUIRE(dirty_entities == std::vector<ashiato::Entity>{first});
     REQUIRE(dirty_values.size() == 1);
     REQUIRE(dirty_values[0].x == 7);
     REQUIRE(dirty_values[0].y == 8);
 
-    std::vector<ecs::Registry::ComponentRemoval> removals;
-    registry.each_removed<Position>([&](ecs::Registry::ComponentRemoval removal) {
+    std::vector<ashiato::Registry::ComponentRemoval> removals;
+    registry.each_removed<Position>([&](ashiato::Registry::ComponentRemoval removal) {
         removals.push_back(removal);
     });
 
     REQUIRE(removals.size() == 2);
     auto second_removal = std::find_if(removals.begin(), removals.end(), [&](const auto& removal) {
-        return removal.entity_index == ecs::Registry::entity_index(second);
+        return removal.entity_index == ashiato::Registry::entity_index(second);
     });
     REQUIRE(second_removal != removals.end());
     REQUIRE_FALSE(second_removal->entity_destroyed);
 
     auto destroyed_removal = std::find_if(removals.begin(), removals.end(), [&](const auto& removal) {
-        return removal.entity_index == ecs::Registry::entity_index(destroyed);
+        return removal.entity_index == ashiato::Registry::entity_index(destroyed);
     });
     REQUIRE(destroyed_removal != removals.end());
     REQUIRE(destroyed_removal->entity_destroyed);
@@ -52,10 +52,10 @@ TEST_CASE("dirty component iteration exposes current values and removal tombston
 
     int dirty_count = 0;
     int removal_count = 0;
-    registry.each_dirty<Position>([&](ecs::Entity, const void*) {
+    registry.each_dirty<Position>([&](ashiato::Entity, const void*) {
         ++dirty_count;
     });
-    registry.each_removed<Position>([&](ecs::Registry::ComponentRemoval) {
+    registry.each_removed<Position>([&](ashiato::Registry::ComponentRemoval) {
         ++removal_count;
     });
     REQUIRE(dirty_count == 0);
@@ -63,15 +63,15 @@ TEST_CASE("dirty component iteration exposes current values and removal tombston
 }
 
 TEST_CASE("runtime components use component entities and the shared write path") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
 
-    ecs::ComponentDesc desc;
+    ashiato::ComponentDesc desc;
     desc.name = "Velocity";
     desc.size = sizeof(Velocity);
     desc.alignment = alignof(Velocity);
-    const ecs::Entity velocity_component = registry.register_component(std::move(desc));
+    const ashiato::Entity velocity_component = registry.register_component(std::move(desc));
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     const Velocity initial{1.5f, 2.5f};
 
     void* added = registry.add(entity, velocity_component, &initial);
@@ -89,16 +89,16 @@ TEST_CASE("runtime components use component entities and the shared write path")
 }
 
 TEST_CASE("runtime component APIs reject tag/component mixups and invalid entities") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
 
-    ecs::ComponentDesc desc;
+    ashiato::ComponentDesc desc;
     desc.name = "Velocity";
     desc.size = sizeof(Velocity);
     desc.alignment = alignof(Velocity);
-    const ecs::Entity velocity_component = registry.register_component(std::move(desc));
-    const ecs::Entity visible = registry.register_tag("Visible");
-    const ecs::Entity entity = registry.create();
-    const ecs::Entity invalid{};
+    const ashiato::Entity velocity_component = registry.register_component(std::move(desc));
+    const ashiato::Entity visible = registry.register_tag("Visible");
+    const ashiato::Entity entity = registry.create();
+    const ashiato::Entity invalid{};
     const Velocity value{1.0f, 2.0f};
 
     REQUIRE_THROWS_AS(registry.add(entity, visible, nullptr), std::logic_error);
@@ -120,15 +120,15 @@ TEST_CASE("runtime component APIs reject tag/component mixups and invalid entiti
 }
 
 TEST_CASE("runtime component add replaces existing values and zero-initializes null payloads") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
 
-    ecs::ComponentDesc desc;
+    ashiato::ComponentDesc desc;
     desc.name = "Velocity";
     desc.size = sizeof(Velocity);
     desc.alignment = alignof(Velocity);
-    const ecs::Entity velocity_component = registry.register_component(std::move(desc));
+    const ashiato::Entity velocity_component = registry.register_component(std::move(desc));
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     Velocity first{1.0f, 2.0f};
     Velocity second{3.0f, 4.0f};
 
@@ -149,22 +149,22 @@ TEST_CASE("runtime component add replaces existing values and zero-initializes n
 }
 
 TEST_CASE("runtime ensure creates zeroed components and returns existing storage") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
 
-    ecs::ComponentDesc desc;
+    ashiato::ComponentDesc desc;
     desc.name = "Velocity";
     desc.size = sizeof(Velocity);
     desc.alignment = alignof(Velocity);
-    const ecs::Entity velocity_component = registry.register_component(std::move(desc));
+    const ashiato::Entity velocity_component = registry.register_component(std::move(desc));
 
-    const ecs::Entity invalid{};
+    const ashiato::Entity invalid{};
     REQUIRE(registry.ensure(invalid, velocity_component) == nullptr);
 
-    const ecs::Entity stale = registry.create();
+    const ashiato::Entity stale = registry.create();
     REQUIRE(registry.destroy(stale));
     REQUIRE(registry.ensure(stale, velocity_component) == nullptr);
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     Velocity* ensured = static_cast<Velocity*>(registry.ensure(entity, velocity_component));
     REQUIRE(ensured != nullptr);
     REQUIRE(ensured->dx == 0.0f);
@@ -181,9 +181,9 @@ TEST_CASE("runtime ensure creates zeroed components and returns existing storage
 }
 
 TEST_CASE("runtime ensure uses singleton storage for singleton component entities") {
-    ecs::Registry registry;
-    const ecs::Entity game_time_component = registry.register_component<GameTime>("GameTime");
-    const ecs::Entity entity = registry.create();
+    ashiato::Registry registry;
+    const ashiato::Entity game_time_component = registry.register_component<GameTime>("GameTime");
+    const ashiato::Entity entity = registry.create();
 
     REQUIRE(registry.clear_dirty<GameTime>());
 
@@ -196,9 +196,9 @@ TEST_CASE("runtime ensure uses singleton storage for singleton component entitie
 }
 
 TEST_CASE("runtime byte add rejects non-trivial typed components") {
-    ecs::Registry registry;
-    const ecs::Entity tracker_component = registry.register_component<Tracker>("Tracker");
-    const ecs::Entity entity = registry.create();
+    ashiato::Registry registry;
+    const ashiato::Entity tracker_component = registry.register_component<Tracker>("Tracker");
+    const ashiato::Entity entity = registry.create();
     TrackerCounts counts;
     Tracker value{counts, 1};
 
@@ -206,9 +206,9 @@ TEST_CASE("runtime byte add rejects non-trivial typed components") {
 }
 
 TEST_CASE("runtime tag dirty state follows add remove and clear operations") {
-    ecs::Registry registry;
-    const ecs::Entity visible = registry.register_tag("Visible");
-    const ecs::Entity entity = registry.create();
+    ashiato::Registry registry;
+    const ashiato::Entity visible = registry.register_tag("Visible");
+    const ashiato::Entity entity = registry.create();
 
     REQUIRE(registry.add_tag(entity, visible));
     REQUIRE(registry.has(entity, visible));
@@ -228,11 +228,11 @@ TEST_CASE("runtime tag dirty state follows add remove and clear operations") {
 }
 
 TEST_CASE("dirty bits move with components in dense storage") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
 
-    const ecs::Entity first = registry.create();
-    const ecs::Entity second = registry.create();
+    const ashiato::Entity first = registry.create();
+    const ashiato::Entity second = registry.create();
 
     REQUIRE(registry.add<Position>(first, Position{1, 1}) != nullptr);
     REQUIRE(registry.add<Position>(second, Position{2, 2}) != nullptr);
@@ -250,11 +250,11 @@ TEST_CASE("dirty bits move with components in dense storage") {
 }
 
 TEST_CASE("dirty bits are preserved for clean moved components during dense removal") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
 
-    const ecs::Entity first = registry.create();
-    const ecs::Entity second = registry.create();
+    const ashiato::Entity first = registry.create();
+    const ashiato::Entity second = registry.create();
 
     REQUIRE(registry.add<Position>(first, Position{1, 1}) != nullptr);
     REQUIRE(registry.add<Position>(second, Position{2, 2}) != nullptr);
@@ -268,12 +268,12 @@ TEST_CASE("dirty bits are preserved for clean moved components during dense remo
 }
 
 TEST_CASE("non-trivial components are constructed, moved, and destroyed explicitly") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Tracker>("Tracker");
     TrackerCounts counts;
 
-    const ecs::Entity first = registry.create();
-    const ecs::Entity second = registry.create();
+    const ashiato::Entity first = registry.create();
+    const ashiato::Entity second = registry.create();
 
     REQUIRE(registry.add<Tracker>(first, counts, 1) != nullptr);
     REQUIRE(registry.add<Tracker>(second, counts, 2) != nullptr);
@@ -289,11 +289,11 @@ TEST_CASE("non-trivial components are constructed, moved, and destroyed explicit
 }
 
 TEST_CASE("non-trivial component replacement destroys the old value") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Tracker>("Tracker");
     TrackerCounts counts;
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Tracker>(entity, counts, 1) != nullptr);
     REQUIRE(registry.get<Tracker>(entity).value == 1);
 
@@ -309,14 +309,14 @@ TEST_CASE("non-trivial component replacement destroys the old value") {
 
 TEST_CASE("non-trivial storage growth and middle removal preserve live values") {
     TrackerCounts counts;
-    std::vector<ecs::Entity> entities;
+    std::vector<ashiato::Entity> entities;
 
     {
-        ecs::Registry registry;
+        ashiato::Registry registry;
         registry.register_component<Tracker>("Tracker");
 
         for (int i = 0; i < 10; ++i) {
-            const ecs::Entity entity = registry.create();
+            const ashiato::Entity entity = registry.create();
             entities.push_back(entity);
             REQUIRE(registry.add<Tracker>(entity, counts, i) != nullptr);
         }
@@ -339,20 +339,20 @@ TEST_CASE("non-trivial storage growth and middle removal preserve live values") 
 }
 
 TEST_CASE("moved registries retain entities components metadata singletons and dirty bits") {
-    ecs::Registry source;
-    const ecs::Entity position_component = source.register_component<Position>("Position");
-    const ecs::Entity game_time_component = source.register_component<GameTime>("GameTime");
-    const ecs::Entity entity = source.create();
+    ashiato::Registry source;
+    const ashiato::Entity position_component = source.register_component<Position>("Position");
+    const ashiato::Entity game_time_component = source.register_component<GameTime>("GameTime");
+    const ashiato::Entity entity = source.create();
 
     REQUIRE(source.add<Position>(entity, Position{5, 6}) != nullptr);
     REQUIRE(source.clear_dirty<Position>(entity));
     (void)source.write<Position>(entity);
     REQUIRE(source.set_component_fields(
         position_component,
-        {ecs::ComponentField{"x", offsetof(Position, x), source.primitive_type(ecs::PrimitiveType::I32), 1}}));
+        {ashiato::ComponentField{"x", offsetof(Position, x), source.primitive_type(ashiato::PrimitiveType::I32), 1}}));
     source.write<GameTime>().tick = 12;
 
-    ecs::Registry moved(std::move(source));
+    ashiato::Registry moved(std::move(source));
 
     REQUIRE(moved.alive(entity));
     REQUIRE(moved.component<Position>() == position_component);
@@ -363,19 +363,19 @@ TEST_CASE("moved registries retain entities components metadata singletons and d
     REQUIRE(moved.get<GameTime>().tick == 12);
     REQUIRE(moved.is_dirty<GameTime>());
 
-    const std::vector<ecs::ComponentField>* fields = moved.component_fields(position_component);
+    const std::vector<ashiato::ComponentField>* fields = moved.component_fields(position_component);
     REQUIRE(fields != nullptr);
     REQUIRE(fields->size() == 1);
     REQUIRE((*fields)[0].name == "x");
 }
 
 TEST_CASE("move-assigned registries retain dirty tombstones and tag storage") {
-    ecs::Registry source;
+    ashiato::Registry source;
     source.register_component<Position>("Position");
     source.register_component<Active>("Active");
 
-    const ecs::Entity removed = source.create();
-    const ecs::Entity tagged = source.create();
+    const ashiato::Entity removed = source.create();
+    const ashiato::Entity tagged = source.create();
     REQUIRE(source.add<Position>(removed, Position{1, 2}) != nullptr);
     REQUIRE(source.add<Active>(tagged));
     source.clear_all_dirty<Position>();
@@ -384,7 +384,7 @@ TEST_CASE("move-assigned registries retain dirty tombstones and tag storage") {
     REQUIRE(source.remove<Position>(removed));
     REQUIRE(source.add<Active>(removed));
 
-    ecs::Registry destination;
+    ashiato::Registry destination;
     destination.register_component<Velocity>("Velocity");
     destination = std::move(source);
 

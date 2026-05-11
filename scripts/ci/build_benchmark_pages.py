@@ -72,7 +72,7 @@ def write_index_html(path: Path, history: dict) -> None:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kagesoko ECS Benchmarks</title>
+<title>Ashiato ECS Benchmarks</title>
 <style>
 :root {{
   color-scheme: light dark;
@@ -153,7 +153,7 @@ a {{ color: var(--accent); }}
 </head>
 <body>
 <main>
-<h1>Kagesoko ECS Benchmarks</h1>
+<h1>Ashiato ECS Benchmarks</h1>
 <p>Characteristic benchmark results are stored per commit and summarized here over time.</p>
 <div class="toolbar">
   <label>Filter <input id="filter" type="search" placeholder="benchmark name"></label>

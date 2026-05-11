@@ -47,9 +47,9 @@ jobs:
         run: >
           cmake -S . -B build-coverage
           -DCMAKE_BUILD_TYPE=Debug
-          -DECS_BUILD_EXAMPLE=OFF
-          -DECS_BUILD_TESTING=ON
-          -DECS_ENABLE_COVERAGE=ON
+          -DASHIATO_BUILD_EXAMPLE=OFF
+          -DASHIATO_BUILD_TESTING=ON
+          -DASHIATO_ENABLE_COVERAGE=ON
 
       - name: Build, test, and collect coverage
         id: coverage
@@ -121,9 +121,9 @@ jobs:
         run: >
           cmake -S . -B build-benchmarks
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          -DECS_BUILD_EXAMPLE=OFF
-          -DECS_BUILD_TESTING=OFF
-          -DECS_BUILD_BENCHMARKS=ON
+          -DASHIATO_BUILD_EXAMPLE=OFF
+          -DASHIATO_BUILD_TESTING=OFF
+          -DASHIATO_BUILD_BENCHMARKS=ON
 
       - name: Build benchmarks
         run: cmake --build build-benchmarks --target basic_operations_benchmark

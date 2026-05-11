@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ecs/bit_buffer.hpp"
+#include "ashiato/bit_buffer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -31,19 +31,19 @@
 #include <utility>
 #include <vector>
 
-namespace kage::sync {
+namespace ashiato::sync {
 class ReplicationServer;
 }
 
-#ifndef ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#ifndef ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
 #ifdef NDEBUG
-#define ECS_RUNTIME_REGISTRY_ACCESS_CHECKING 0
+#define ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING 0
 #else
-#define ECS_RUNTIME_REGISTRY_ACCESS_CHECKING 1
+#define ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING 1
 #endif
 #endif
 
-namespace ecs {
+namespace ashiato {
 
 template <typename T>
 struct is_singleton_component : std::false_type {};
@@ -165,7 +165,7 @@ struct requested_components_allowed<type_list<AvailableComponents...>> {
               (contains_accessible_component<RequestedComponents, AvailableComponents...>::value && ...)> {};
 };
 
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
 inline thread_local std::size_t registry_access_forbidden_depth = 0;
 inline thread_local std::size_t registry_access_allowed_depth = 0;
 
@@ -414,7 +414,7 @@ namespace detail {
 
 template <typename Callback, typename View, typename... Args>
 void invoke_job_view_callback(Callback& callback, View& view, Entity entity, Args&&... args) {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
     RegistryAccessForbiddenScope scope;
 #endif
     if constexpr (std::is_invocable<Callback&, View&, Entity, Args...>::value) {
@@ -426,7 +426,7 @@ void invoke_job_view_callback(Callback& callback, View& view, Entity entity, Arg
 
 template <typename Callback, typename Context, typename... Args>
 void invoke_job_context_callback(Callback& callback, Context& context, Entity entity, Args&&... args) {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
     RegistryAccessForbiddenScope scope;
 #endif
     if constexpr (std::is_invocable<Callback&, Context&, Entity, Args...>::value) {
@@ -452,7 +452,7 @@ enum class PrimitiveType {
 class Registry {
     friend class Orchestrator;
     friend class JobGraph;
-    friend class kage::sync::ReplicationServer;
+    friend class ashiato::sync::ReplicationServer;
 
 public:
     static constexpr std::uint32_t invalid_index = std::numeric_limits<std::uint32_t>::max();
@@ -522,7 +522,7 @@ public:
         }
 
         if (entity_store_.slots.size() >= invalid_index) {
-            throw std::length_error("ecs entity index space exhausted");
+            throw std::length_error("ashiato entity index space exhausted");
         }
 
         const std::uint32_t index = static_cast<std::uint32_t>(entity_store_.slots.size());
@@ -599,10 +599,10 @@ public:
         require_runtime_registry_access_allowed("register_component");
         static_assert(
             !is_singleton_component<T>::value || std::is_default_constructible<T>::value,
-            "ecs singleton components must be default constructible");
+            "ashiato singleton components must be default constructible");
         static_assert(
             std::is_trivially_copyable<T>::value || std::is_nothrow_move_constructible<T>::value,
-            "ecs non-trivially-copyable components must be nothrow move constructible");
+            "ashiato non-trivially-copyable components must be nothrow move constructible");
 
         const std::size_t id = type_id<T>();
         if (id < component_catalog_.typed_components.size() && component_catalog_.typed_components[id]) {
@@ -702,7 +702,7 @@ public:
         require_runtime_registry_access_allowed("ensure");
         const ComponentRecord& record = require_component_record(component);
         if (record.info.tag) {
-            throw std::logic_error("ecs tags cannot be ensured as writable components");
+            throw std::logic_error("ashiato tags cannot be ensured as writable components");
         }
         if (record.singleton) {
             return storage_for(component).ensure(entity_index(singleton_entity()));
@@ -799,7 +799,7 @@ public:
         require_runtime_registry_access_allowed("get");
         const ComponentRecord& record = require_component_record(component);
         if (record.info.tag) {
-            throw std::logic_error("ecs tags cannot be read as components");
+            throw std::logic_error("ashiato tags cannot be read as components");
         }
         if (record.singleton) {
             entity = component_catalog_.singleton_entity;
@@ -1049,11 +1049,11 @@ private:
     static constexpr std::size_t default_min_entities_per_thread = 1024;
 
     void require_runtime_registry_access_allowed(const char* operation) const {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
         if (detail::registry_access_forbidden()) {
-            std::string message = "ecs Registry::";
+            std::string message = "ashiato Registry::";
             message += operation;
-            message += " cannot be used inside an ecs job callback; use the callback view/context and declare";
+            message += " cannot be used inside an ashiato job callback; use the callback view/context and declare";
             message += " required components on the job with job<...>(), access_other_entities<...>(), or structural<...>()";
             throw std::logic_error(message);
         }
@@ -1200,7 +1200,7 @@ private:
         template <typename T, typename... Args>
         T* emplace_or_replace(std::uint32_t index, Args&&... args) {
             if (info_.tag) {
-                throw std::logic_error("ecs tags do not store component values");
+                throw std::logic_error("ashiato tags do not store component values");
             }
             validate_type<T>();
 
@@ -1659,7 +1659,7 @@ private:
     Entity registered_component() const {
         const std::size_t id = type_id<T>();
         if (id >= component_catalog_.typed_components.size() || !component_catalog_.typed_components[id]) {
-            throw std::logic_error("ecs component type is not registered");
+            throw std::logic_error("ashiato component type is not registered");
         }
 
         return component_catalog_.typed_components[id];
@@ -2245,9 +2245,9 @@ private:
 
 template <typename... Components>
 class Registry::View {
-    static_assert(sizeof...(Components) > 0, "ecs views require at least one component");
-    static_assert(detail::unique_components<Components...>::value, "ecs views cannot repeat component types");
-    static_assert(!detail::contains_tag_query<Components...>::value, "ecs tags must be view filters");
+    static_assert(sizeof...(Components) > 0, "ashiato views require at least one component");
+    static_assert(detail::unique_components<Components...>::value, "ashiato views cannot repeat component types");
+    static_assert(!detail::contains_tag_query<Components...>::value, "ashiato tags must be view filters");
 
 public:
     explicit View(Registry& registry)
@@ -2603,21 +2603,21 @@ private:
 
     template <typename T>
     TypeErasedStorage* storage_for_type() {
-        static_assert(has_component<T>(), "component is not part of this ecs view");
+        static_assert(has_component<T>(), "component is not part of this ashiato view");
         constexpr std::size_t position = component_position<T, Components...>();
         return storages_[position];
     }
 
     template <typename T>
     const TypeErasedStorage* storage_for_type() const {
-        static_assert(has_component<T>(), "component is not part of this ecs view");
+        static_assert(has_component<T>(), "component is not part of this ashiato view");
         constexpr std::size_t position = component_position<T, Components...>();
         return storages_[position];
     }
 
     template <typename Fn>
     void call_each(Fn& callback, Entity entity, std::uint32_t index) {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
         if (job_callback_scope_) {
             detail::RegistryAccessForbiddenScope scope;
             call_each_unchecked(callback, entity, index);
@@ -2752,7 +2752,7 @@ public:
 private:
     template <typename Fn>
     void call_each(Fn& callback, Entity entity) {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
         if (job_callback_scope_) {
             detail::RegistryAccessForbiddenScope scope;
             call_each_unchecked(callback, entity);
@@ -2780,21 +2780,21 @@ class Registry::AccessView<
     detail::type_list<IterComponents...>,
     detail::type_list<AccessComponents...>,
     detail::type_list<OptionalComponents...>> {
-    static_assert(sizeof...(IterComponents) > 0, "ecs views require at least one component");
-    static_assert(detail::unique_components<IterComponents...>::value, "ecs views cannot repeat component types");
-    static_assert(detail::unique_components<AccessComponents...>::value, "ecs access components cannot repeat types");
-    static_assert(detail::unique_components<OptionalComponents...>::value, "ecs optional components cannot repeat types");
+    static_assert(sizeof...(IterComponents) > 0, "ashiato views require at least one component");
+    static_assert(detail::unique_components<IterComponents...>::value, "ashiato views cannot repeat component types");
+    static_assert(detail::unique_components<AccessComponents...>::value, "ashiato access components cannot repeat types");
+    static_assert(detail::unique_components<OptionalComponents...>::value, "ashiato optional components cannot repeat types");
     static_assert(
         detail::disjoint_from<detail::type_list<AccessComponents...>>::template with<OptionalComponents...>::value,
-        "ecs access and optional components cannot repeat types");
+        "ashiato access and optional components cannot repeat types");
     static_assert(
         detail::access_components_allowed<detail::type_list<IterComponents...>>::template with<AccessComponents...>::
             value,
-        "ecs access components can only repeat iterated const components as mutable access components");
+        "ashiato access components can only repeat iterated const components as mutable access components");
     static_assert(
         detail::access_components_allowed<detail::type_list<IterComponents...>>::template with<OptionalComponents...>::
             value,
-        "ecs optional components can only repeat iterated const components as mutable optional components");
+        "ashiato optional components can only repeat iterated const components as mutable optional components");
 
 public:
     AccessView(Registry& registry, std::array<TypeErasedStorage*, sizeof...(IterComponents)> iter_storages)
@@ -3222,7 +3222,7 @@ private:
             } else {
                 static_assert(
                     detail::contains_component<T, OptionalComponents...>::value,
-                    "component is not part of this ecs view");
+                    "component is not part of this ashiato view");
                 constexpr std::size_t position = component_position<T, OptionalComponents...>();
                 return optional_storages_[position];
             }
@@ -3241,7 +3241,7 @@ private:
             } else {
                 static_assert(
                     detail::contains_component<T, OptionalComponents...>::value,
-                    "component is not part of this ecs view");
+                    "component is not part of this ashiato view");
                 constexpr std::size_t position = component_position<T, OptionalComponents...>();
                 return optional_storages_[position];
             }
@@ -3254,14 +3254,14 @@ private:
                       !detail::contains_component<T, IterComponents..., AccessComponents...>::value &&
                       !detail::is_singleton_query<T>::value) {
             if (active_callback_index_ != invalid_index && active_callback_index_ != index) {
-                throw std::logic_error("ecs optional job access is limited to the entity currently being iterated");
+                throw std::logic_error("ashiato optional job access is limited to the entity currently being iterated");
             }
         }
     }
 
     template <typename Fn>
     void call_each(Fn& callback, Entity entity, std::uint32_t index) {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
         if (job_callback_scope_) {
             detail::RegistryAccessForbiddenScope scope;
             call_each_unchecked(callback, entity, index);
@@ -3327,11 +3327,11 @@ class Registry::TagFilteredView<
     detail::type_list<OptionalComponents...>,
     detail::type_list<WithTags...>,
     detail::type_list<WithoutTags...>> {
-    static_assert((!detail::is_tag_query<IterComponents>::value && ...), "ecs tags must be view filters");
-    static_assert((!detail::is_tag_query<AccessComponents>::value && ...), "ecs tags cannot be access components");
-    static_assert((!detail::is_tag_query<OptionalComponents>::value && ...), "ecs tags cannot be optional components");
-    static_assert((detail::is_tag_query<WithTags>::value && ...), "ecs with_tags types must be empty tags");
-    static_assert((detail::is_tag_query<WithoutTags>::value && ...), "ecs without_tags types must be empty tags");
+    static_assert((!detail::is_tag_query<IterComponents>::value && ...), "ashiato tags must be view filters");
+    static_assert((!detail::is_tag_query<AccessComponents>::value && ...), "ashiato tags cannot be access components");
+    static_assert((!detail::is_tag_query<OptionalComponents>::value && ...), "ashiato tags cannot be optional components");
+    static_assert((detail::is_tag_query<WithTags>::value && ...), "ashiato with_tags types must be empty tags");
+    static_assert((detail::is_tag_query<WithoutTags>::value && ...), "ashiato without_tags types must be empty tags");
 
 public:
     TagFilteredView(
@@ -3662,14 +3662,14 @@ public:
             detail::is_tag_query<T>::value && detail::contains_component<T, WithTags..., WithoutTags...>::value,
             int>::type = 0>
     bool has_tag(Entity entity) const {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
         detail::RegistryAccessAllowedScope scope;
 #endif
         return registry_->template has<detail::component_query_t<T>>(entity);
     }
 
     bool has_tag(Entity entity, Entity tag) const {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
         detail::RegistryAccessAllowedScope scope;
 #endif
         return registry_->has(entity, tag);
@@ -3681,7 +3681,7 @@ public:
             detail::is_tag_query<T>::value && detail::contains_mutable_component<T, WithTags..., WithoutTags...>::value,
             int>::type = 0>
     bool add_tag(Entity entity) {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
         detail::RegistryAccessAllowedScope scope;
 #endif
         return registry_->template add<detail::component_query_t<T>>(entity);
@@ -3693,7 +3693,7 @@ public:
             detail::is_tag_query<T>::value && detail::contains_mutable_component<T, WithTags..., WithoutTags...>::value,
             int>::type = 0>
     bool remove_tag(Entity entity) {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
         detail::RegistryAccessAllowedScope scope;
 #endif
         return registry_->template remove<detail::component_query_t<T>>(entity);
@@ -3883,7 +3883,7 @@ private:
             } else {
                 static_assert(
                     detail::contains_component<T, OptionalComponents...>::value,
-                    "component is not part of this ecs view");
+                    "component is not part of this ashiato view");
                 constexpr std::size_t position = component_position<T, OptionalComponents...>();
                 return optional_storages_[position];
             }
@@ -3902,7 +3902,7 @@ private:
             } else {
                 static_assert(
                     detail::contains_component<T, OptionalComponents...>::value,
-                    "component is not part of this ecs view");
+                    "component is not part of this ashiato view");
                 constexpr std::size_t position = component_position<T, OptionalComponents...>();
                 return optional_storages_[position];
             }
@@ -3915,14 +3915,14 @@ private:
                       !detail::contains_component<T, IterComponents..., AccessComponents...>::value &&
                       !detail::is_singleton_query<T>::value) {
             if (active_callback_index_ != invalid_index && active_callback_index_ != index) {
-                throw std::logic_error("ecs optional job access is limited to the entity currently being iterated");
+                throw std::logic_error("ashiato optional job access is limited to the entity currently being iterated");
             }
         }
     }
 
     template <typename Fn>
     void call_each(Fn& callback, Entity entity, std::uint32_t index) {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
         if (job_callback_scope_) {
             detail::RegistryAccessForbiddenScope scope;
             call_each_unchecked(callback, entity, index);
@@ -4149,7 +4149,7 @@ public:
             !detail::is_tag_query<T>::value && detail::contains_component<T, StructuralComponents...>::value,
             int>::type = 0>
     detail::component_query_t<T>* add(Entity entity, Args&&... args) {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
         detail::RegistryAccessAllowedScope scope;
 #endif
         return registry_->template add<detail::component_query_t<T>>(entity, std::forward<Args>(args)...);
@@ -4161,7 +4161,7 @@ public:
             detail::is_tag_query<T>::value && detail::contains_component<T, StructuralComponents...>::value,
             int>::type = 0>
     bool add(Entity entity) {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
         detail::RegistryAccessAllowedScope scope;
 #endif
         return registry_->template add<detail::component_query_t<T>>(entity);
@@ -4171,7 +4171,7 @@ public:
         typename T,
         typename std::enable_if<detail::contains_component<T, StructuralComponents...>::value, int>::type = 0>
     bool remove(Entity entity) {
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
         detail::RegistryAccessAllowedScope scope;
 #endif
         return registry_->template remove<detail::component_query_t<T>>(entity);
@@ -4204,7 +4204,7 @@ public:
     }
 
     JobTagFilteredView& max_threads(std::size_t count) {
-        static_assert(sizeof...(AccessComponents) == 0, "ecs access_other_entities jobs must be single threaded");
+        static_assert(sizeof...(AccessComponents) == 0, "ashiato access_other_entities jobs must be single threaded");
         threading_.max_threads = std::max<std::size_t>(count, 1);
         threading_.single_thread = false;
         return *this;
@@ -4297,7 +4297,7 @@ public:
             detail::type_list<WithTags...>,
             detail::type_list<WithoutTags...>> {
         if (!threading_.single_thread || threading_.max_threads > 1) {
-            throw std::logic_error("ecs access_other_entities jobs must be single threaded");
+            throw std::logic_error("ashiato access_other_entities jobs must be single threaded");
         }
         using NextAccess = typename detail::type_list_concat<
             detail::type_list<AccessComponents...>,
@@ -4345,7 +4345,7 @@ public:
     structural() const {
         static_assert(
             detail::unique_components<StructuralComponents...>::value,
-            "ecs structural components cannot repeat types");
+            "ashiato structural components cannot repeat types");
         return JobTagFilteredStructuralView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
@@ -4512,7 +4512,7 @@ private:
 
 template <typename... Components>
 class Registry::JobView {
-    static_assert(sizeof...(Components) > 0, "ecs jobs require at least one component");
+    static_assert(sizeof...(Components) > 0, "ashiato jobs require at least one component");
 
 public:
     JobView(Registry& registry, int order)
@@ -4569,7 +4569,7 @@ public:
     JobAccessView<detail::type_list<Components...>, detail::type_list<AccessComponents...>, detail::type_list<>>
     access_other_entities() const {
         if (!threading_.single_thread || threading_.max_threads > 1) {
-            throw std::logic_error("ecs access_other_entities jobs must be single threaded");
+            throw std::logic_error("ashiato access_other_entities jobs must be single threaded");
         }
         JobThreadingOptions threading = threading_;
         threading.single_thread = true;
@@ -4635,7 +4635,7 @@ public:
     JobStructuralView<detail::type_list<Components...>, detail::type_list<StructuralComponents...>> structural() const {
         static_assert(
             detail::unique_components<StructuralComponents...>::value,
-            "ecs structural components cannot repeat types");
+            "ashiato structural components cannot repeat types");
         return JobStructuralView<detail::type_list<Components...>, detail::type_list<StructuralComponents...>>(
             *registry_,
             order_,
@@ -4709,7 +4709,7 @@ public:
     }
 
     JobAccessView& max_threads(std::size_t count) {
-        static_assert(sizeof...(AccessComponents) == 0, "ecs access_other_entities jobs must be single threaded");
+        static_assert(sizeof...(AccessComponents) == 0, "ashiato access_other_entities jobs must be single threaded");
         threading_.max_threads = std::max<std::size_t>(count, 1);
         threading_.single_thread = false;
         return *this;
@@ -4735,7 +4735,7 @@ public:
                 detail::type_list<MoreAccessComponents...>>::type,
             detail::type_list<OptionalComponents...>> {
         if (!threading_.single_thread || threading_.max_threads > 1) {
-            throw std::logic_error("ecs access_other_entities jobs must be single threaded");
+            throw std::logic_error("ashiato access_other_entities jobs must be single threaded");
         }
         using NextAccess = typename detail::type_list_concat<
             detail::type_list<AccessComponents...>,
@@ -4811,7 +4811,7 @@ public:
     structural() const {
         static_assert(
             detail::unique_components<StructuralComponents...>::value,
-            "ecs structural components cannot repeat types");
+            "ashiato structural components cannot repeat types");
         return JobStructuralAccessView<
             detail::type_list<IterComponents...>,
             detail::type_list<AccessComponents...>,
@@ -5086,12 +5086,12 @@ private:
 template <typename... Owned>
 void Registry::declare_owned_group() {
     require_runtime_registry_access_allowed("declare_owned_group");
-    static_assert(sizeof...(Owned) > 0, "ecs owned groups require at least one component");
-    static_assert(detail::unique_components<Owned...>::value, "ecs owned groups cannot repeat component types");
-    static_assert((!detail::is_singleton_query<Owned>::value && ...), "ecs owned groups cannot own singleton components");
+    static_assert(sizeof...(Owned) > 0, "ashiato owned groups require at least one component");
+    static_assert(detail::unique_components<Owned...>::value, "ashiato owned groups cannot repeat component types");
+    static_assert((!detail::is_singleton_query<Owned>::value && ...), "ashiato owned groups cannot own singleton components");
     static_assert(
         (!std::is_const<typename std::remove_reference<Owned>::type>::value && ...),
-        "ecs owned groups cannot own const component types");
+        "ashiato owned groups cannot own const component types");
 
     (void)std::initializer_list<int>{
         (static_cast<void>(storage_for(registered_component<detail::component_query_t<Owned>>())), 0)...};
@@ -5099,4 +5099,4 @@ void Registry::declare_owned_group() {
     (void)group_for_key(key);
 }
 
-}  // namespace ecs
+}  // namespace ashiato

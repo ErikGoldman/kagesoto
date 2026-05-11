@@ -1,6 +1,6 @@
-#include "ecs/ecs.hpp"
+#include "ashiato/ashiato.hpp"
 
-namespace ecs {
+namespace ashiato {
 
 bool Registry::includes_all(const std::vector<std::uint32_t>& lhs, const std::vector<std::uint32_t>& rhs) {
     return std::includes(lhs.begin(), lhs.end(), rhs.begin(), rhs.end());
@@ -28,7 +28,7 @@ void Registry::validate_group_key(const std::vector<std::uint32_t>& key) const {
     for (std::uint32_t component : key) {
         auto found = group_index_.owned_component_groups.find(component);
         if (found != group_index_.owned_component_groups.end() && found->second->owned != key) {
-            throw std::logic_error("ecs owned components cannot be shared by distinct owned groups");
+            throw std::logic_error("ashiato owned components cannot be shared by distinct owned groups");
         }
     }
 }
@@ -143,4 +143,4 @@ void Registry::remove_from_groups_before_component_removal(std::uint32_t index, 
     leave_group(*found->second, index);
 }
 
-}  // namespace ecs
+}  // namespace ashiato

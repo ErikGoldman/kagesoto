@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ecs/ecs.hpp"
+#include "ashiato/ashiato.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -107,7 +107,7 @@ template <typename View, typename T>
 struct HasViewGet<
     View,
     T,
-    std::void_t<decltype(std::declval<View&>().template get<T>(std::declval<ecs::Entity>()))>>
+    std::void_t<decltype(std::declval<View&>().template get<T>(std::declval<ashiato::Entity>()))>>
     : std::true_type {};
 
 template <typename View, typename T, typename = void>
@@ -124,7 +124,7 @@ template <typename View, typename T>
 struct HasViewWrite<
     View,
     T,
-    std::void_t<decltype(std::declval<View&>().template write<T>(std::declval<ecs::Entity>()))>>
+    std::void_t<decltype(std::declval<View&>().template write<T>(std::declval<ashiato::Entity>()))>>
     : std::true_type {};
 
 template <typename View, typename T, typename = void>
@@ -141,7 +141,7 @@ template <typename View, typename T>
 struct HasViewTryGet<
     View,
     T,
-    std::void_t<decltype(std::declval<View&>().template try_get<T>(std::declval<ecs::Entity>()))>>
+    std::void_t<decltype(std::declval<View&>().template try_get<T>(std::declval<ashiato::Entity>()))>>
     : std::true_type {};
 
 template <typename View, typename T, typename = void>
@@ -158,7 +158,7 @@ template <typename View, typename T>
 struct HasViewContains<
     View,
     T,
-    std::void_t<decltype(std::declval<View&>().template contains<T>(std::declval<ecs::Entity>()))>>
+    std::void_t<decltype(std::declval<View&>().template contains<T>(std::declval<ashiato::Entity>()))>>
     : std::true_type {};
 
 template <typename View, typename T, typename = void>
@@ -175,7 +175,7 @@ template <typename View, typename T>
 struct HasViewTagAdd<
     View,
     T,
-    std::void_t<decltype(std::declval<View&>().template add_tag<T>(std::declval<ecs::Entity>()))>>
+    std::void_t<decltype(std::declval<View&>().template add_tag<T>(std::declval<ashiato::Entity>()))>>
     : std::true_type {};
 
 template <typename View, typename T, typename = void>
@@ -185,7 +185,7 @@ template <typename View, typename T>
 struct HasViewTagRemove<
     View,
     T,
-    std::void_t<decltype(std::declval<View&>().template remove_tag<T>(std::declval<ecs::Entity>()))>>
+    std::void_t<decltype(std::declval<View&>().template remove_tag<T>(std::declval<ashiato::Entity>()))>>
     : std::true_type {};
 
 template <typename Registry, typename T, typename = void>
@@ -209,7 +209,7 @@ template <typename Registry, typename T>
 struct HasRegistryTryGet<
     Registry,
     T,
-    std::void_t<decltype(std::declval<Registry&>().template try_get<T>(std::declval<ecs::Entity>()))>>
+    std::void_t<decltype(std::declval<Registry&>().template try_get<T>(std::declval<ashiato::Entity>()))>>
     : std::true_type {};
 
 template <typename Registry, typename T, typename = void>
@@ -219,7 +219,7 @@ template <typename Registry, typename T>
 struct HasRegistryContains<
     Registry,
     T,
-    std::void_t<decltype(std::declval<Registry&>().template contains<T>(std::declval<ecs::Entity>()))>>
+    std::void_t<decltype(std::declval<Registry&>().template contains<T>(std::declval<ashiato::Entity>()))>>
     : std::true_type {};
 
 template <typename Registry, typename T, typename = void>
@@ -229,7 +229,7 @@ template <typename Registry, typename T>
 struct HasRegistryAdd<
     Registry,
     T,
-    std::void_t<decltype(std::declval<Registry&>().template add<T>(std::declval<ecs::Entity>(), T{}))>>
+    std::void_t<decltype(std::declval<Registry&>().template add<T>(std::declval<ashiato::Entity>(), T{}))>>
     : std::true_type {};
 
 template <typename Registry, typename T, typename = void>
@@ -239,7 +239,7 @@ template <typename Registry, typename T>
 struct HasRegistryRemove<
     Registry,
     T,
-    std::void_t<decltype(std::declval<Registry&>().template remove<T>(std::declval<ecs::Entity>()))>>
+    std::void_t<decltype(std::declval<Registry&>().template remove<T>(std::declval<ashiato::Entity>()))>>
     : std::true_type {};
 
 template <typename Registry, typename Components, typename = void>
@@ -278,9 +278,9 @@ struct HasViewNestedView<
 
 }  // namespace
 
-namespace ecs {
+namespace ashiato {
 
 template <>
 struct is_singleton_component<GameTime> : std::true_type {};
 
-}  // namespace ecs
+}  // namespace ashiato

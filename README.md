@@ -1,14 +1,14 @@
-# ECS
+# Ashiato ECS
 
-[![Tests](https://img.shields.io/endpoint?url=https%3A%2F%2Ferikgoldman.github.io%2Fkagesoto%2Fci.json)](https://github.com/ErikGoldman/kagesoto/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Ferikgoldman.github.io%2Fkagesoto%2Fcoverage.json)](https://github.com/ErikGoldman/kagesoto/actions/workflows/ci.yml)
-[![Benchmarks](https://img.shields.io/badge/benchmarks-results-blue)](https://erikgoldman.github.io/kagesoto/benchmarks/)
+[![Tests](https://img.shields.io/endpoint?url=https%3A%2F%2Ferikgoldman.github.io%2Fashiato%2Fci.json)](https://github.com/ErikGoldman/ashiato/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Ferikgoldman.github.io%2Fashiato%2Fcoverage.json)](https://github.com/ErikGoldman/ashiato/actions/workflows/ci.yml)
+[![Benchmarks](https://img.shields.io/badge/benchmarks-results-blue)](https://erikgoldman.github.io/ashiato/benchmarks/)
 
-A small C++17 sparse-set ECS.
+A small C++17 sparse-set Ashiato ECS.
 
 ## Entity Handles
 
-`ecs::Entity` is a 64-bit generational id:
+`ashiato::Entity` is a 64-bit generational id:
 
 - low 32 bits: entity index
 - high 32 bits: entity version
@@ -22,7 +22,7 @@ Entity indices are opaque. Components are also entities: registering a component
 Compile-time component APIs require explicit registration. Using `add<T>`, `contains<T>`, `try_get<T>`, `get<T>`, `write<T>`, `remove<T>`, or dirty helpers before `register_component<T>()` throws `std::logic_error`.
 
 ```cpp
-#include "ecs/ecs.hpp"
+#include "ashiato/ashiato.hpp"
 
 struct Position {
     int x;
@@ -30,10 +30,10 @@ struct Position {
 };
 
 int main() {
-    ecs::Registry registry;
+    ashiato::Registry registry;
 
-    ecs::Entity position_type = registry.register_component<Position>("Position");
-    ecs::Entity entity = registry.create();
+    ashiato::Entity position_type = registry.register_component<Position>("Position");
+    ashiato::Entity entity = registry.create();
 
     registry.add<Position>(entity, Position{1, 2});
 
@@ -63,7 +63,7 @@ registry.add<Active>(entity);
 registry.view<Position>()
     .with_tags<const Active>()
     .without_tags<const Disabled>()
-    .each([](ecs::Entity entity, Position& position) {
+    .each([](ashiato::Entity entity, Position& position) {
         position.x += 1;
     });
 ```
@@ -73,11 +73,11 @@ registry.view<Position>()
 Runtime tags are registered separately:
 
 ```cpp
-ecs::Entity selected = registry.register_tag("Selected");
+ashiato::Entity selected = registry.register_tag("Selected");
 registry.add_tag(entity, selected);
 
 auto view = registry.view<Position>().with_tags({selected});
-view.each([&](auto& active_view, ecs::Entity entity, Position&) {
+view.each([&](auto& active_view, ashiato::Entity entity, Position&) {
     if (active_view.has_tag(entity, selected)) {
         // Runtime tag filters are read-only view filters.
     }
@@ -86,14 +86,14 @@ view.each([&](auto& active_view, ecs::Entity entity, Position&) {
 
 ## Singleton Components
 
-Typed components can opt into singleton storage by specializing `ecs::is_singleton_component<T>`. Singleton components are compile-time only, must be default-constructible, and are created when the component is registered.
+Typed components can opt into singleton storage by specializing `ashiato::is_singleton_component<T>`. Singleton components are compile-time only, must be default-constructible, and are created when the component is registered.
 
 ```cpp
 struct GameTime {
     int tick = 0;
 };
 
-namespace ecs {
+namespace ashiato {
 template <>
 struct is_singleton_component<GameTime> : std::true_type {};
 }
@@ -111,7 +111,7 @@ Typed views iterate entities that have every listed component. `const T` means r
 ```cpp
 auto view = registry.view<const Position, Velocity>();
 
-view.each([](ecs::Entity entity, const Position& position, Velocity& velocity) {
+view.each([](ashiato::Entity entity, const Position& position, Velocity& velocity) {
     velocity.dx += static_cast<float>(position.x);
 });
 
@@ -121,14 +121,14 @@ Velocity& velocity = view.write<Velocity>(entity);
 
 `view.get<T>()` and `view.write<T>()` are required-access APIs and are only available for components listed in the view. Use `contains<T>(entity)` before optional access. `view.write<T>()` is additionally available only when `T` was listed without `const`.
 
-Singleton components listed in a view are passed to callbacks but do not filter iteration. A singleton-only view calls its callback once with an invalid `ecs::Entity`.
+Singleton components listed in a view are passed to callbacks but do not filter iteration. A singleton-only view calls its callback once with an invalid `ashiato::Entity`.
 
 Mutable listed components are marked dirty before they are passed to a view callback. To read a component during iteration but mark it dirty only when user code explicitly writes it, list it as `const T` in the view and add mutable access for the same component:
 
 ```cpp
 auto view = registry.view<const Velocity>().access<Velocity>();
 
-view.each([](auto& active_view, ecs::Entity entity, const Velocity& velocity) {
+view.each([](auto& active_view, ashiato::Entity entity, const Velocity& velocity) {
     if (velocity.dx != 0.0f) {
         if (active_view.template contains<Velocity>(entity)) {
             active_view.template write<Velocity>(entity).dy += velocity.dx;
@@ -142,7 +142,7 @@ Views can also carry access-only components. Access-only components do not filte
 ```cpp
 auto view = registry.view<Position>().access<const Target, Health>();
 
-view.each([&](auto& active_view, ecs::Entity entity, Position& position) {
+view.each([&](auto& active_view, ashiato::Entity entity, Position& position) {
     const Target* target = active_view.template try_get<Target>(entity);
     if (target != nullptr) {
         if (active_view.template contains<Health>(target->entity)) {
@@ -157,8 +157,8 @@ view.each([&](auto& active_view, ecs::Entity entity, Position& position) {
 Jobs are persistent view callbacks with an integer order. Register jobs with `Registry::job<Components...>(order)`, then call `.each()` on the returned job view. `each()` returns an entity that identifies the registered job. Job entities are identity-only for now: they are useful in schedule output, but destroying them is not a supported job-removal API. Jobs run only when `run_jobs()` is called. Lower order values run first, and jobs with the same order run in the order they were added.
 
 ```cpp
-ecs::Entity move_job = registry.job<const Position, Velocity>(10).each(
-    [](ecs::Entity entity, const Position& position, Velocity& velocity) {
+ashiato::Entity move_job = registry.job<const Position, Velocity>(10).each(
+    [](ashiato::Entity entity, const Position& position, Velocity& velocity) {
         velocity.dx += position.x;
         velocity.dy += position.y;
     });
@@ -172,7 +172,7 @@ components do not filter iteration:
 ```cpp
 registry.job<const Position>(20)
     .optional<Velocity>()
-    .each([](auto& active_view, ecs::Entity entity, const Position& position) {
+    .each([](auto& active_view, ashiato::Entity entity, const Position& position) {
         if (active_view.template contains<Velocity>(entity)) {
             active_view.template write<Velocity>(entity).dx += position.x;
         }
@@ -185,7 +185,7 @@ other than the one currently being iterated. Jobs with other-entity access are a
 ```cpp
 registry.job<const Target>(30)
     .access_other_entities<Health>()
-    .each([](auto& active_view, ecs::Entity, const Target& target) {
+    .each([](auto& active_view, ashiato::Entity, const Target& target) {
         if (active_view.template contains<Health>(target.entity)) {
             --active_view.template write<Health>(target.entity).value;
         }
@@ -198,7 +198,7 @@ Jobs are single-threaded by default. Use `.max_threads(count)` to let a job spli
 registry.job<Position>(0)
     .max_threads(4)
     .min_entities_per_thread(256)
-    .each([](ecs::Entity, Position& position) {
+    .each([](ashiato::Entity, Position& position) {
         position.x += 1;
     });
 ```
@@ -206,14 +206,14 @@ registry.job<Position>(0)
 `run_jobs()` uses the orchestrator to run independent jobs in the same stage. Install an executor to hand stage tasks to a task system. The executor must run every task and return only after all tasks finish. If no executor is installed, tasks run inline.
 
 ```cpp
-registry.set_job_thread_executor([](const std::vector<ecs::JobThreadTask>& tasks) {
-    for (const ecs::JobThreadTask& task : tasks) {
+registry.set_job_thread_executor([](const std::vector<ashiato::JobThreadTask>& tasks) {
+    for (const ashiato::JobThreadTask& task : tasks) {
         task.run();
     }
 });
 
 registry.run_jobs();
-registry.run_jobs(ecs::RunJobsOptions{true}); // force serial execution
+registry.run_jobs(ashiato::RunJobsOptions{true}); // force serial execution
 ```
 
 Structural changes from a job must be declared explicitly. Declaring structural access keeps that job single-threaded and isolates it in the orchestrator schedule because add/remove operations mutate registry bookkeeping.
@@ -221,7 +221,7 @@ Structural changes from a job must be declared explicitly. Declaring structural 
 ```cpp
 registry.job<const Position>(0)
     .structural<Disabled>()
-    .each([](auto& job, ecs::Entity entity, const Position&) {
+    .each([](auto& job, ashiato::Entity entity, const Position&) {
         job.template add<Disabled>(entity);
     });
 ```
@@ -229,9 +229,9 @@ registry.job<const Position>(0)
 `Orchestrator` can inspect registered jobs and return the order in which they can be processed. `run_jobs()` uses this schedule unless forced into single-threaded mode. Each stage contains jobs that can run in parallel, and stages must be processed in order.
 
 ```cpp
-ecs::JobSchedule schedule = ecs::Orchestrator(registry).schedule();
-for (const ecs::JobScheduleStage& stage : schedule.stages) {
-    for (ecs::Entity job : stage.jobs) {
+ashiato::JobSchedule schedule = ashiato::Orchestrator(registry).schedule();
+for (const ashiato::JobScheduleStage& stage : schedule.stages) {
+    for (ashiato::Entity job : stage.jobs) {
         // job identifies a registered job in this parallel stage.
     }
 }
@@ -244,7 +244,7 @@ Fully owned groups are declared as layout hints. After declaration, matching vie
 ```cpp
 registry.declare_owned_group<Position, Velocity>();
 
-registry.view<Position, Velocity>().each([](ecs::Entity entity, Position& position, Velocity& velocity) {
+registry.view<Position, Velocity>().each([](ashiato::Entity entity, Position& position, Velocity& velocity) {
     velocity.dx += static_cast<float>(position.x);
 });
 ```
@@ -263,12 +263,12 @@ struct Velocity {
     float dy;
 };
 
-ecs::ComponentDesc velocity_desc;
+ashiato::ComponentDesc velocity_desc;
 velocity_desc.name = "Velocity";
 velocity_desc.size = sizeof(Velocity);
 velocity_desc.alignment = alignof(Velocity);
 
-ecs::Entity velocity_type = registry.register_component(velocity_desc);
+ashiato::Entity velocity_type = registry.register_component(velocity_desc);
 
 Velocity velocity{1.0f, 0.0f};
 registry.add(entity, velocity_type, &velocity);
@@ -282,8 +282,8 @@ Field metadata supports print debugging. Field types are entities, following the
 
 ```cpp
 registry.set_component_fields(position_type, {
-    {"x", offsetof(Position, x), registry.primitive_type(ecs::PrimitiveType::I32), 1},
-    {"y", offsetof(Position, y), registry.primitive_type(ecs::PrimitiveType::I32), 1},
+    {"x", offsetof(Position, x), registry.primitive_type(ashiato::PrimitiveType::I32), 1},
+    {"y", offsetof(Position, y), registry.primitive_type(ashiato::PrimitiveType::I32), 1},
 });
 
 std::string text = registry.debug_print(entity, position_type);
@@ -292,7 +292,7 @@ std::string text = registry.debug_print(entity, position_type);
 
 ## API
 
-- `ecs::Entity Registry::create()`
+- `ashiato::Entity Registry::create()`
 - `bool Registry::destroy(Entity entity)`
 - `bool Registry::alive(Entity entity) const`
 - `EntityKind Registry::entity_kind(Entity entity) const`
@@ -341,11 +341,11 @@ std::string text = registry.debug_print(entity, position_type);
 - `Registry::Snapshot Registry::Snapshot::read_native(std::istream& in)`
 - `void Registry::DeltaSnapshot::write_native(std::ostream& out, const SnapshotIoOptions& options = {}) const`
 - `Registry::DeltaSnapshot Registry::DeltaSnapshot::read_native(std::istream& in)`
-- `ecs::ComponentSerializationRegistry::register_component<T, Traits>(Registry& registry, std::string name = {})`
-- `void ecs::write_persistent_snapshot(std::ostream& out, const Registry::Snapshot& snapshot, const ComponentSerializationRegistry& serialization, const SnapshotIoOptions& options = {})`
-- `Registry::Snapshot ecs::read_persistent_snapshot(std::istream& in, const Registry& schema, const ComponentSerializationRegistry& serialization)`
-- `void ecs::write_persistent_delta_snapshot(std::ostream& out, const Registry::DeltaSnapshot& snapshot, const Registry::Snapshot& baseline, const ComponentSerializationRegistry& serialization, const SnapshotIoOptions& options = {})`
-- `Registry::DeltaSnapshot ecs::read_persistent_delta_snapshot(std::istream& in, const Registry& schema, const Registry::Snapshot& baseline, const ComponentSerializationRegistry& serialization)`
+- `ashiato::ComponentSerializationRegistry::register_component<T, Traits>(Registry& registry, std::string name = {})`
+- `void ashiato::write_persistent_snapshot(std::ostream& out, const Registry::Snapshot& snapshot, const ComponentSerializationRegistry& serialization, const SnapshotIoOptions& options = {})`
+- `Registry::Snapshot ashiato::read_persistent_snapshot(std::istream& in, const Registry& schema, const ComponentSerializationRegistry& serialization)`
+- `void ashiato::write_persistent_delta_snapshot(std::ostream& out, const Registry::DeltaSnapshot& snapshot, const Registry::Snapshot& baseline, const ComponentSerializationRegistry& serialization, const SnapshotIoOptions& options = {})`
+- `Registry::DeltaSnapshot ashiato::read_persistent_delta_snapshot(std::istream& in, const Registry& schema, const Registry::Snapshot& baseline, const ComponentSerializationRegistry& serialization)`
 - `Registry::View<Components...> Registry::view<Components...>()`
 - `Registry::JobView<Components...> Registry::job<Components...>(int order)`
 - `void Registry::set_job_thread_executor(JobThreadExecutor executor)`
@@ -356,10 +356,10 @@ std::string text = registry.debug_print(entity, position_type);
 - `Registry::JobStructuralView<...> Registry::JobView<Components...>::structural<StructuralComponents...>()`
 - `Registry::JobAccessView<...>& Registry::JobAccessView<...>::max_threads(std::size_t count)`
 - `Registry::JobStructuralAccessView<...> Registry::JobAccessView<...>::structural<StructuralComponents...>()`
-- `ecs::Orchestrator::Orchestrator(const Registry& registry)`
-- `ecs::JobSchedule ecs::Orchestrator::schedule() const`
-- `std::vector<ecs::JobScheduleStage> ecs::JobSchedule::stages`
-- `std::vector<ecs::Entity> ecs::JobScheduleStage::jobs`
+- `ashiato::Orchestrator::Orchestrator(const Registry& registry)`
+- `ashiato::JobSchedule ashiato::Orchestrator::schedule() const`
+- `std::vector<ashiato::JobScheduleStage> ashiato::JobSchedule::stages`
+- `std::vector<ashiato::Entity> ashiato::JobScheduleStage::jobs`
 - `void Registry::declare_owned_group<Owned...>()`
 - `void View<Components...>::each(Fn&& callback)`
 - `auto View<Components...>::access<AccessComponents...>() const`
@@ -400,7 +400,7 @@ In-memory snapshots are created with `Registry::create_snapshot()` / `create_del
 
 Reading and writing snapshots means serializing an existing snapshot object to or from a stream/bit buffer. `Snapshot::write_native()` / `read_native()` and `DeltaSnapshot::write_native()` / `read_native()` serialize the native in-memory snapshot binary format; `write()` / `read()` remain compatibility wrappers. That native format is useful for local transient I/O but is not a durable or portable disk format. On full native snapshot restore, typed C++ component bindings are rebuilt by matching the current process's registered component type names to restored component names; serialized typed cache slots are not trusted as stable type identities.
 
-Persistent snapshots are separate disk frames written with `write_persistent_snapshot()` and `write_persistent_delta_snapshot()`. Persistent frames identify components by unique non-empty component names, dedupe those names in a per-frame name table, store the frame length in bits before the frame body for skipping, and use `ComponentSerializationTraits<T>`/`ComponentSerializationRegistry` to quantize and serialize present component values through `ecs::BitBuffer`. Component removals and destroyed-entity tombstones are encoded by the snapshot system, not by component serialization. Persistent reads require a schema registry with matching component names and registered serialization, then return normal snapshot objects for `Registry::restore_snapshot()` or `Registry::restore_delta_snapshot()`.
+Persistent snapshots are separate disk frames written with `write_persistent_snapshot()` and `write_persistent_delta_snapshot()`. Persistent frames identify components by unique non-empty component names, dedupe those names in a per-frame name table, store the frame length in bits before the frame body for skipping, and use `ComponentSerializationTraits<T>`/`ComponentSerializationRegistry` to quantize and serialize present component values through `ashiato::BitBuffer`. Component removals and destroyed-entity tombstones are encoded by the snapshot system, not by component serialization. Persistent reads require a schema registry with matching component names and registered serialization, then return normal snapshot objects for `Registry::restore_snapshot()` or `Registry::restore_delta_snapshot()`.
 
 Registered job callbacks are not part of snapshots. Internal bookkeeping entities are tagged with `Registry::system_tag()` and excluded from snapshot payloads.
 
@@ -413,7 +413,7 @@ Destroying a component entity unregisters that component, clears its typed cache
 ## Build
 
 ```bash
-cmake -S . -B build -DECS_BUILD_TESTING=ON
+cmake -S . -B build -DASHIATO_BUILD_TESTING=ON
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
@@ -423,9 +423,9 @@ Generate coverage stats with GCC or Clang:
 ```bash
 cmake -S . -B build-coverage \
   -DCMAKE_BUILD_TYPE=Debug \
-  -DECS_BUILD_EXAMPLE=OFF \
-  -DECS_BUILD_TESTING=ON \
-  -DECS_ENABLE_COVERAGE=ON
+  -DASHIATO_BUILD_EXAMPLE=OFF \
+  -DASHIATO_BUILD_TESTING=ON \
+  -DASHIATO_ENABLE_COVERAGE=ON
 cmake --build build-coverage --target coverage
 ```
 
@@ -438,7 +438,7 @@ Build benchmarks explicitly when collecting performance data:
 ```bash
 cmake -S . -B build-bench \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DECS_BUILD_TESTING=ON \
-  -DECS_BUILD_BENCHMARKS=ON
+  -DASHIATO_BUILD_TESTING=ON \
+  -DASHIATO_BUILD_BENCHMARKS=ON
 cmake --build build-bench --target basic_operations_benchmark
 ```

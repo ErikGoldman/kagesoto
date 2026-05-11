@@ -4,7 +4,7 @@ add_executable(basic_operations_benchmark
 
 target_link_libraries(basic_operations_benchmark
     PRIVATE
-        ecs::ecs
+        ashiato::ashiato
         benchmark::benchmark_main
 )
 

@@ -1,6 +1,6 @@
-#include "ecs_test_support.hpp"
+#include "ashiato_test_support.hpp"
 
-#include "ecs/debug_server.hpp"
+#include "ashiato/debug_server.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -13,21 +13,21 @@
 
 namespace {
 
-void register_position_fields(ecs::Registry& registry) {
-    const ecs::Entity position = registry.register_component<Position>("Position");
+void register_position_fields(ashiato::Registry& registry) {
+    const ashiato::Entity position = registry.register_component<Position>("Position");
     REQUIRE(registry.set_component_fields(
         position,
         {
-            ecs::ComponentField{"x", offsetof(Position, x), registry.primitive_type(ecs::PrimitiveType::I32), 1},
-            ecs::ComponentField{"y", offsetof(Position, y), registry.primitive_type(ecs::PrimitiveType::I32), 1},
+            ashiato::ComponentField{"x", offsetof(Position, x), registry.primitive_type(ashiato::PrimitiveType::I32), 1},
+            ashiato::ComponentField{"y", offsetof(Position, y), registry.primitive_type(ashiato::PrimitiveType::I32), 1},
         }));
 }
 
-void register_game_time_fields(ecs::Registry& registry) {
-    const ecs::Entity game_time = registry.register_component<GameTime>("GameTime");
+void register_game_time_fields(ashiato::Registry& registry) {
+    const ashiato::Entity game_time = registry.register_component<GameTime>("GameTime");
     REQUIRE(registry.set_component_fields(
         game_time,
-        {ecs::ComponentField{"tick", offsetof(GameTime, tick), registry.primitive_type(ecs::PrimitiveType::I32), 1}}));
+        {ashiato::ComponentField{"tick", offsetof(GameTime, tick), registry.primitive_type(ashiato::PrimitiveType::I32), 1}}));
 }
 
 }  // namespace
@@ -35,7 +35,7 @@ void register_game_time_fields(ecs::Registry& registry) {
 #ifndef _WIN32
 namespace {
 
-std::string post_graphql(ecs::DebugServer& server, const std::string& body) {
+std::string post_graphql(ashiato::DebugServer& server, const std::string& body) {
     const int client = socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(client >= 0);
 
@@ -71,17 +71,17 @@ std::string post_graphql(ecs::DebugServer& server, const std::string& body) {
 #endif
 
 TEST_CASE("zero component views enumerate alive entities and support runtime tag filters") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Active>("Active");
 
-    const ecs::Entity first = registry.create();
-    const ecs::Entity second = registry.create();
-    const ecs::Entity stale = registry.create();
+    const ashiato::Entity first = registry.create();
+    const ashiato::Entity second = registry.create();
+    const ashiato::Entity stale = registry.create();
     REQUIRE(registry.add<Active>(second));
     REQUIRE(registry.destroy(stale));
 
-    std::vector<ecs::Entity> entities;
-    registry.view<>().each([&](ecs::Entity entity) {
+    std::vector<ashiato::Entity> entities;
+    registry.view<>().each([&](ashiato::Entity entity) {
         entities.push_back(entity);
     });
 
@@ -89,74 +89,74 @@ TEST_CASE("zero component views enumerate alive entities and support runtime tag
     REQUIRE(std::find(entities.begin(), entities.end(), second) != entities.end());
     REQUIRE(std::find(entities.begin(), entities.end(), stale) == entities.end());
 
-    std::vector<ecs::Entity> active;
-    registry.view<>().with_tags({registry.component<Active>()}).each([&](ecs::Entity entity) {
+    std::vector<ashiato::Entity> active;
+    registry.view<>().with_tags({registry.component<Active>()}).each([&](ashiato::Entity entity) {
         active.push_back(entity);
     });
-    REQUIRE(active == std::vector<ecs::Entity>{second});
+    REQUIRE(active == std::vector<ashiato::Entity>{second});
 }
 
 TEST_CASE("jobs are discoverable through a job tag and expose read only metadata") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Velocity>("Velocity");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{1, 2}) != nullptr);
 
-    const ecs::Entity job = registry.job<const Position, Velocity>(7).name("Move test").max_threads(2).each(
-        [](ecs::Entity, const Position&, Velocity&) {});
+    const ashiato::Entity job = registry.job<const Position, Velocity>(7).name("Move test").max_threads(2).each(
+        [](ashiato::Entity, const Position&, Velocity&) {});
 
-    std::vector<ecs::Entity> jobs;
-    registry.view<>().with_tags({registry.job_tag()}).each([&](ecs::Entity current) {
+    std::vector<ashiato::Entity> jobs;
+    registry.view<>().with_tags({registry.job_tag()}).each([&](ashiato::Entity current) {
         jobs.push_back(current);
     });
-    REQUIRE(jobs == std::vector<ecs::Entity>{job});
+    REQUIRE(jobs == std::vector<ashiato::Entity>{job});
 
-    const std::optional<ecs::JobInfo> info = registry.job_info(job);
+    const std::optional<ashiato::JobInfo> info = registry.job_info(job);
     REQUIRE(info);
     REQUIRE(info->name == "Move test");
     REQUIRE(info->order == 7);
-    REQUIRE(info->reads == std::vector<ecs::Entity>{registry.component<Position>()});
-    REQUIRE(info->writes == std::vector<ecs::Entity>{registry.component<Velocity>()});
+    REQUIRE(info->reads == std::vector<ashiato::Entity>{registry.component<Position>()});
+    REQUIRE(info->writes == std::vector<ashiato::Entity>{registry.component<Velocity>()});
 
-    const std::vector<ecs::Entity> matches = registry.job_matching_entities(job);
+    const std::vector<ashiato::Entity> matches = registry.job_matching_entities(job);
     REQUIRE(matches.empty());
     REQUIRE(registry.add<Velocity>(entity, Velocity{}) != nullptr);
-    REQUIRE(registry.job_matching_entities(job) == std::vector<ecs::Entity>{entity});
+    REQUIRE(registry.job_matching_entities(job) == std::vector<ashiato::Entity>{entity});
 }
 
 TEST_CASE("registry exposes components present on an entity") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_position_fields(registry);
     registry.register_component<Active>("Active");
     registry.register_component<GameTime>("GameTime");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{3, 4}) != nullptr);
     REQUIRE(registry.add<Active>(entity));
 
-    const std::vector<ecs::EntityComponentInfo> components = registry.components(entity);
-    const auto position = std::find_if(components.begin(), components.end(), [&](const ecs::EntityComponentInfo& info) {
+    const std::vector<ashiato::EntityComponentInfo> components = registry.components(entity);
+    const auto position = std::find_if(components.begin(), components.end(), [&](const ashiato::EntityComponentInfo& info) {
         return info.component == registry.component<Position>();
     });
     REQUIRE(position != components.end());
     REQUIRE(position->name == "Position");
     REQUIRE(position->debug_value == "Position{x=3, y=4}");
 
-    const auto active = std::find_if(components.begin(), components.end(), [&](const ecs::EntityComponentInfo& info) {
+    const auto active = std::find_if(components.begin(), components.end(), [&](const ashiato::EntityComponentInfo& info) {
         return info.component == registry.component<Active>();
     });
     REQUIRE(active != components.end());
     REQUIRE(active->info.tag);
 
-    const auto singleton = std::find_if(components.begin(), components.end(), [&](const ecs::EntityComponentInfo& info) {
+    const auto singleton = std::find_if(components.begin(), components.end(), [&](const ashiato::EntityComponentInfo& info) {
         return info.component == registry.component<GameTime>();
     });
     REQUIRE(singleton == components.end());
 
-    const std::vector<ecs::EntityComponentInfo> singletons = registry.singleton_components();
-    const auto game_time = std::find_if(singletons.begin(), singletons.end(), [&](const ecs::EntityComponentInfo& info) {
+    const std::vector<ashiato::EntityComponentInfo> singletons = registry.singleton_components();
+    const auto game_time = std::find_if(singletons.begin(), singletons.end(), [&](const ashiato::EntityComponentInfo& info) {
         return info.component == registry.component<GameTime>();
     });
     REQUIRE(game_time != singletons.end());
@@ -166,20 +166,20 @@ TEST_CASE("registry exposes components present on an entity") {
 
 #ifndef _WIN32
 TEST_CASE("debug server responds to a loopback GraphQL request") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_position_fields(registry);
     register_game_time_fields(registry);
     registry.write<GameTime>().tick = 42;
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{5, 6}) != nullptr);
 
-    ecs::DebugServer server(registry, "client 1", ecs::DebugServerOptions{true});
+    ashiato::DebugServer server(registry, "client 1", ashiato::DebugServerOptions{true});
     INFO(server.last_error());
     REQUIRE(server.enabled());
     REQUIRE(server.port() != 0);
-    REQUIRE(registry.add<ecs::DebugName>(entity, ecs::DebugName{"ball"}) != nullptr);
-    const ecs::Entity duplicate_name = registry.create();
-    REQUIRE(registry.add<ecs::DebugName>(duplicate_name, ecs::DebugName{"ball"}) != nullptr);
+    REQUIRE(registry.add<ashiato::DebugName>(entity, ashiato::DebugName{"ball"}) != nullptr);
+    const ashiato::Entity duplicate_name = registry.create();
+    REQUIRE(registry.add<ashiato::DebugName>(duplicate_name, ashiato::DebugName{"ball"}) != nullptr);
 
     const std::string body =
         "{\"query\":\"query($id: ID!) { entity(id: $id) { id components { name fields { name type value } } } }\","
@@ -203,7 +203,7 @@ TEST_CASE("debug server responds to a loopback GraphQL request") {
     REQUIRE(duplicated_entities_response.find("\"displayName\":\"ball 1\"") != std::string::npos);
     REQUIRE(duplicated_entities_response.find("\"displayName\":\"ball 2\"") != std::string::npos);
 
-    const ecs::Entity debug_name_component = registry.component<ecs::DebugName>();
+    const ashiato::Entity debug_name_component = registry.component<ashiato::DebugName>();
     const std::string rename_body =
         "{\"query\":\"mutation($entity: ID!, $component: ID!, $value: JSON!) { setComponent(entity: $entity, "
         "component: $component, value: $value) { name fields { name type value } } }\","

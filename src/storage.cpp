@@ -1,6 +1,6 @@
-#include "ecs/ecs.hpp"
+#include "ashiato/ashiato.hpp"
 
-namespace ecs {
+namespace ashiato {
 
 thread_local Registry::TypeErasedStorage::DeferredDirtyWrites*
     Registry::TypeErasedStorage::deferred_dirty_writes_ = nullptr;
@@ -91,7 +91,7 @@ Registry::TypeErasedStorage::~TypeErasedStorage() {
 
 void Registry::TypeErasedStorage::emplace_or_replace_tag(std::uint32_t index) {
     if (!info_.tag) {
-        throw std::logic_error("ecs component storage is not a tag");
+        throw std::logic_error("ashiato component storage is not a tag");
     }
 
     if (contains(index)) {
@@ -112,7 +112,7 @@ void Registry::TypeErasedStorage::emplace_or_replace_tag(std::uint32_t index) {
 
 void* Registry::TypeErasedStorage::emplace_or_replace_bytes(std::uint32_t index, const void* value) {
     if (info_.tag) {
-        throw std::logic_error("ecs tags do not store component values");
+        throw std::logic_error("ashiato tags do not store component values");
     }
     if (!info_.trivially_copyable) {
         throw std::logic_error("runtime byte add requires a trivially copyable component");
@@ -165,7 +165,7 @@ void Registry::TypeErasedStorage::emplace_or_replace_copy(std::uint32_t index, c
 
 void* Registry::TypeErasedStorage::ensure(std::uint32_t index) {
     if (info_.tag) {
-        throw std::logic_error("ecs tags do not store component values");
+        throw std::logic_error("ashiato tags do not store component values");
     }
     if (void* existing = write(index)) {
         return existing;
@@ -355,7 +355,7 @@ void Registry::TypeErasedStorage::swap_dense(std::uint32_t lhs, std::uint32_t rh
         return;
     }
     if (lhs >= size_ || rhs >= size_) {
-        throw std::out_of_range("ecs dense storage swap index is out of range");
+        throw std::out_of_range("ashiato dense storage swap index is out of range");
     }
 
     if (!info_.tag) {
@@ -458,7 +458,7 @@ void Registry::TypeErasedStorage::deallocate(unsigned char* data, std::size_t al
 
 void Registry::TypeErasedStorage::assign_bytes(void* target, const void* value) {
     if (info_.tag) {
-        throw std::logic_error("ecs tags do not store component values");
+        throw std::logic_error("ashiato tags do not store component values");
     }
     if (value != nullptr) {
         std::memcpy(target, value, info_.size);
@@ -476,7 +476,7 @@ void Registry::TypeErasedStorage::construct_copy(void* target, const void* value
         return;
     }
     if (lifecycle_.copy_construct == nullptr) {
-        throw std::logic_error("ecs component storage is not copyable");
+        throw std::logic_error("ashiato component storage is not copyable");
     }
     lifecycle_.copy_construct(target, value);
 }
@@ -490,7 +490,7 @@ void Registry::TypeErasedStorage::replace_copy(void* target, const void* value) 
         return;
     }
     if (lifecycle_.copy_construct == nullptr) {
-        throw std::logic_error("ecs component storage is not copyable");
+        throw std::logic_error("ashiato component storage is not copyable");
     }
     unsigned char* replacement = allocate(1, info_);
     bool replacement_constructed = false;
@@ -715,7 +715,7 @@ std::unique_ptr<Registry::TypeErasedStorage> Registry::TypeErasedStorage::clone_
                 copy->size_ = size_;
             } else {
                 if (lifecycle_.copy_construct == nullptr) {
-                    throw std::logic_error("ecs component storage is not copyable");
+                    throw std::logic_error("ashiato component storage is not copyable");
                 }
                 for (; copy->size_ < size_; ++copy->size_) {
                     lifecycle_.copy_construct(
@@ -850,7 +850,7 @@ void Registry::TypeErasedStorage::copy_from(const TypeErasedStorage& other) {
         data_ = nullptr;
         size_ = 0;
         capacity_ = 0;
-        throw std::logic_error("ecs component storage is not copyable");
+        throw std::logic_error("ashiato component storage is not copyable");
     }
 
     std::size_t constructed = 0;
@@ -872,4 +872,4 @@ void Registry::TypeErasedStorage::copy_from(const TypeErasedStorage& other) {
     }
 }
 
-}  // namespace ecs
+}  // namespace ashiato

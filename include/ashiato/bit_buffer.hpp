@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace ecs {
+namespace ashiato {
 
 class BitBuffer {
 public:
@@ -54,6 +54,18 @@ public:
 
     void reserve_bytes(std::size_t capacity) {
         bytes_.reserve(capacity);
+    }
+
+    void truncate_bits(std::size_t bit_size) {
+        if (bit_size > bit_size_) {
+            throw std::out_of_range("bit buffer truncate past end");
+        }
+        bit_size_ = bit_size;
+        bytes_.resize(byte_size());
+        if (read_bit_ > bit_size_) {
+            read_bit_ = bit_size_;
+        }
+        clear_unused_tail_bits();
     }
 
     std::size_t read_offset_bits() const noexcept {
@@ -344,4 +356,4 @@ private:
     std::size_t read_bit_ = 0;
 };
 
-}  // namespace ecs
+}  // namespace ashiato

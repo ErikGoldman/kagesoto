@@ -43,7 +43,7 @@ import type {
 
 const AUTO_REFRESH_MS = 1500;
 const DEFAULT_BASE_PORT = 8080;
-const BASE_PORT_STORAGE_KEY = "ecs-debugger.basePort";
+const BASE_PORT_STORAGE_KEY = "ashiato-debugger.basePort";
 const EMPTY_COMPONENT_FIELDS: ComponentFieldValue[] = [];
 
 export function App() {
@@ -137,7 +137,7 @@ export function App() {
         <div className="title">
           <Database size={22} />
           <div>
-            <h1>ECS Debugger</h1>
+            <h1>Ashiato Debugger</h1>
             <span>{aliveServers.length} server{aliveServers.length === 1 ? "" : "s"} connected</span>
           </div>
         </div>

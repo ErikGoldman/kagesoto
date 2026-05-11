@@ -1,18 +1,18 @@
-#include "ecs_test_support.hpp"
+#include "ashiato_test_support.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 TEST_CASE("jobs are persistent and use access views") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Velocity>("Velocity");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{2, 0}) != nullptr);
     REQUIRE(registry.add<Velocity>(entity, Velocity{1.0f, 0.0f}) != nullptr);
 
     registry.job<const Position>(0).access_other_entities<Velocity>().each(
-        [&](auto& active_view, ecs::Entity current, const Position& position) {
+        [&](auto& active_view, ashiato::Entity current, const Position& position) {
             Velocity& velocity = active_view.template write<Velocity>(current);
             velocity.dx += static_cast<float>(position.x);
         });
@@ -24,12 +24,12 @@ TEST_CASE("jobs are persistent and use access views") {
 }
 
 TEST_CASE("job optional components do not filter and are limited to current entity") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Health>("Health");
 
-    const ecs::Entity with_health = registry.create();
-    const ecs::Entity without_health = registry.create();
+    const ashiato::Entity with_health = registry.create();
+    const ashiato::Entity without_health = registry.create();
     REQUIRE(registry.add<Position>(with_health, Position{1, 0}) != nullptr);
     REQUIRE(registry.add<Health>(with_health, Health{10}) != nullptr);
     REQUIRE(registry.add<Position>(without_health, Position{2, 0}) != nullptr);
@@ -37,7 +37,7 @@ TEST_CASE("job optional components do not filter and are limited to current enti
     int calls = 0;
     int health_sum = 0;
     registry.job<Position>(0).optional<Health>().each(
-        [&](auto& view, ecs::Entity, Position&) {
+        [&](auto& view, ashiato::Entity, Position&) {
             ++calls;
             if (const Health* health = view.template try_get<Health>()) {
                 health_sum += health->value;
@@ -52,12 +52,12 @@ TEST_CASE("job optional components do not filter and are limited to current enti
 }
 
 TEST_CASE("optional jobs can be threaded but access other entities jobs are single threaded") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Health>("Health");
 
     for (int i = 0; i < 4; ++i) {
-        const ecs::Entity entity = registry.create();
+        const ashiato::Entity entity = registry.create();
         REQUIRE(registry.add<Position>(entity, Position{i, 0}) != nullptr);
         if ((i % 2) == 0) {
             REQUIRE(registry.add<Health>(entity, Health{i}) != nullptr);
@@ -65,16 +65,16 @@ TEST_CASE("optional jobs can be threaded but access other entities jobs are sing
     }
 
     registry.job<Position>(0).optional<Health>().max_threads(2).min_entities_per_thread(1).each(
-        [](auto& view, ecs::Entity, Position& position) {
+        [](auto& view, ashiato::Entity, Position& position) {
             if (view.template contains<Health>()) {
                 position.x += view.template write<Health>().value;
             }
         });
-    registry.job<Position>(1).access_other_entities<Health>().each([](auto&, ecs::Entity, Position&) {});
+    registry.job<Position>(1).access_other_entities<Health>().each([](auto&, ashiato::Entity, Position&) {});
 
     std::vector<std::size_t> thread_counts;
-    registry.set_job_thread_executor([&](const std::vector<ecs::JobThreadTask>& tasks) {
-        for (const ecs::JobThreadTask& task : tasks) {
+    registry.set_job_thread_executor([&](const std::vector<ashiato::JobThreadTask>& tasks) {
+        for (const ashiato::JobThreadTask& task : tasks) {
             thread_counts.push_back(task.thread_count);
             task.run();
         }
@@ -90,13 +90,13 @@ TEST_CASE("optional jobs can be threaded but access other entities jobs are sing
 }
 
 TEST_CASE("job callback views create nested views from declared components") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Velocity>("Velocity");
     registry.register_component<Health>("Health");
 
-    const ecs::Entity first = registry.create();
-    const ecs::Entity second = registry.create();
+    const ashiato::Entity first = registry.create();
+    const ashiato::Entity second = registry.create();
     REQUIRE(registry.add<Position>(first, Position{1, 0}) != nullptr);
     REQUIRE(registry.add<Velocity>(first, Velocity{2.0f, 0.0f}) != nullptr);
     REQUIRE(registry.add<Health>(first, Health{10}) != nullptr);
@@ -106,10 +106,10 @@ TEST_CASE("job callback views create nested views from declared components") {
 
     int outer_calls = 0;
     registry.job<const Position>(0).access_other_entities<Velocity, Health>().single_thread().each(
-        [&](auto& view, ecs::Entity entity, const Position& position) {
+        [&](auto& view, ashiato::Entity entity, const Position& position) {
             int nested_calls = 0;
             auto nested = view.template view<const Position, Velocity, Health>();
-            nested.each([&](ecs::Entity nested_entity, const Position& nested_position, Velocity& velocity, Health& health) {
+            nested.each([&](ashiato::Entity nested_entity, const Position& nested_position, Velocity& velocity, Health& health) {
                 if (nested_entity == entity) {
                     velocity.dx += static_cast<float>(position.x + nested_position.x);
                     health.value += position.x;
@@ -131,21 +131,21 @@ TEST_CASE("job callback views create nested views from declared components") {
 }
 
 TEST_CASE("registry access inside job callbacks throws in checked builds") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Velocity>("Velocity");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
     REQUIRE(registry.add<Velocity>(entity, Velocity{2.0f, 0.0f}) != nullptr);
 
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
-    registry.job<Position>(0).each([&](ecs::Entity current, Position&) {
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
+    registry.job<Position>(0).each([&](ashiato::Entity current, Position&) {
         (void)registry.get<Position>(current);
     });
     REQUIRE_THROWS_AS(registry.run_jobs(), std::logic_error);
 #else
-    registry.job<Position>(0).each([&](ecs::Entity current, Position&) {
+    registry.job<Position>(0).each([&](ashiato::Entity current, Position&) {
         REQUIRE(registry.get<Position>(current).x == 1);
     });
     registry.run_jobs();
@@ -153,29 +153,29 @@ TEST_CASE("registry access inside job callbacks throws in checked builds") {
 }
 
 TEST_CASE("registry view and add access inside job callbacks throws in checked builds") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
     registry.register_component<Velocity>("Velocity");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
 
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
-    registry.job<Position>(0).each([&](ecs::Entity current, Position&) {
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
+    registry.job<Position>(0).each([&](ashiato::Entity current, Position&) {
         (void)registry.add<Velocity>(current, Velocity{});
     });
     REQUIRE_THROWS_AS(registry.run_jobs(), std::logic_error);
 
-    ecs::Registry view_registry;
+    ashiato::Registry view_registry;
     view_registry.register_component<Position>("Position");
-    const ecs::Entity view_entity = view_registry.create();
+    const ashiato::Entity view_entity = view_registry.create();
     REQUIRE(view_registry.add<Position>(view_entity, Position{1, 0}) != nullptr);
-    view_registry.job<Position>(0).each([&](ecs::Entity, Position&) {
+    view_registry.job<Position>(0).each([&](ashiato::Entity, Position&) {
         (void)view_registry.view<Position>();
     });
     REQUIRE_THROWS_AS(view_registry.run_jobs(), std::logic_error);
 #else
-    registry.job<Position>(0).each([&](ecs::Entity current, Position&) {
+    registry.job<Position>(0).each([&](ashiato::Entity current, Position&) {
         REQUIRE(registry.add<Velocity>(current, Velocity{}) != nullptr);
     });
     registry.run_jobs();
@@ -183,28 +183,28 @@ TEST_CASE("registry view and add access inside job callbacks throws in checked b
 }
 
 TEST_CASE("threaded job callback registry access throws in checked builds") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
 
     for (int i = 0; i < 4; ++i) {
-        const ecs::Entity entity = registry.create();
+        const ashiato::Entity entity = registry.create();
         REQUIRE(registry.add<Position>(entity, Position{i, 0}) != nullptr);
     }
 
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
     registry.job<Position>(0).max_threads(2).min_entities_per_thread(1).each(
-        [&](ecs::Entity entity, Position&) {
+        [&](ashiato::Entity entity, Position&) {
             (void)registry.get<Position>(entity);
         });
-    registry.set_job_thread_executor([](const std::vector<ecs::JobThreadTask>& tasks) {
-        for (const ecs::JobThreadTask& task : tasks) {
+    registry.set_job_thread_executor([](const std::vector<ashiato::JobThreadTask>& tasks) {
+        for (const ashiato::JobThreadTask& task : tasks) {
             task.run();
         }
     });
     REQUIRE_THROWS_AS(registry.run_jobs(), std::logic_error);
 #else
     registry.job<Position>(0).max_threads(2).min_entities_per_thread(1).each(
-        [&](ecs::Entity entity, Position&) {
+        [&](ashiato::Entity entity, Position&) {
             REQUIRE(registry.get<Position>(entity).x >= 0);
         });
     registry.run_jobs();
@@ -212,22 +212,22 @@ TEST_CASE("threaded job callback registry access throws in checked builds") {
 }
 
 TEST_CASE("jobs added while jobs are running wait until the next run or throw in checked jobs") {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
     REQUIRE(registry.add<Position>(entity, Position{1, 0}) != nullptr);
 
     int outer_calls = 0;
     int inner_calls = 0;
-    registry.job<Position>(0).each([&](ecs::Entity, Position&) {
+    registry.job<Position>(0).each([&](ashiato::Entity, Position&) {
         ++outer_calls;
-        registry.job<Position>(-1).each([&](ecs::Entity, Position&) {
+        registry.job<Position>(-1).each([&](ashiato::Entity, Position&) {
             ++inner_calls;
         });
     });
 
-#if ECS_RUNTIME_REGISTRY_ACCESS_CHECKING
+#if ASHIATO_RUNTIME_REGISTRY_ACCESS_CHECKING
     REQUIRE_THROWS_AS(registry.run_jobs(), std::logic_error);
     REQUIRE(outer_calls == 1);
     REQUIRE(inner_calls == 0);

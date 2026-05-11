@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ecs/ecs.hpp"
+#include "ashiato/ashiato.hpp"
 
 #include <algorithm>
 #include <array>
@@ -9,13 +9,13 @@
 #include <string>
 #include <string_view>
 
-#ifndef ECS_ENABLE_DEBUG_SERVER
-#define ECS_ENABLE_DEBUG_SERVER 0
+#ifndef ASHIATO_ENABLE_DEBUG_SERVER
+#define ASHIATO_ENABLE_DEBUG_SERVER 0
 #endif
 
-#if ECS_ENABLE_DEBUG_SERVER
+#if ASHIATO_ENABLE_DEBUG_SERVER
 
-namespace ecs {
+namespace ashiato {
 
 struct DebugName {
     static constexpr std::size_t storage_size = 32;
@@ -72,6 +72,6 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace ecs
+}  // namespace ashiato
 
 #endif

@@ -1,4 +1,4 @@
-#include "ecs/bit_buffer.hpp"
+#include "ashiato/bit_buffer.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -7,7 +7,7 @@
 #include <vector>
 
 TEST_CASE("bit buffer pushes and reads bits bytes and bools") {
-    ecs::BitBuffer buffer;
+    ashiato::BitBuffer buffer;
     buffer.push_bool(true);
     buffer.push_bits(0b101, 3U);
     buffer.push_bytes("AZ", 2U);
@@ -25,11 +25,11 @@ TEST_CASE("bit buffer pushes and reads bits bytes and bools") {
 }
 
 TEST_CASE("bit buffer preserves exact non byte aligned frame lengths") {
-    ecs::BitBuffer source;
+    ashiato::BitBuffer source;
     source.push_bits(0b101, 3U);
     source.push_unsigned_bits(0xcafebabeU, 32U);
 
-    ecs::BitBuffer loaded;
+    ashiato::BitBuffer loaded;
     loaded.assign_bytes(source.bytes(), source.bit_size());
 
     REQUIRE(loaded.bit_size() == 35U);
@@ -39,7 +39,7 @@ TEST_CASE("bit buffer preserves exact non byte aligned frame lengths") {
 }
 
 TEST_CASE("bit buffer clears stale trailing bits after assigning non byte aligned payloads") {
-    ecs::BitBuffer buffer;
+    ashiato::BitBuffer buffer;
     buffer.assign_bytes(std::vector<std::uint8_t>{0xFEU}, 1U);
 
     buffer.push_bool(false);
@@ -50,10 +50,10 @@ TEST_CASE("bit buffer clears stale trailing bits after assigning non byte aligne
 }
 
 TEST_CASE("bit buffer copies only logical bits from non byte aligned source buffers") {
-    ecs::BitBuffer source;
+    ashiato::BitBuffer source;
     source.assign_bytes(std::vector<std::uint8_t>{0xFEU}, 1U);
 
-    ecs::BitBuffer copied;
+    ashiato::BitBuffer copied;
     copied.push_buffer_bits(source);
     copied.push_bool(false);
 
@@ -63,7 +63,7 @@ TEST_CASE("bit buffer copies only logical bits from non byte aligned source buff
 }
 
 TEST_CASE("bit buffer validates invalid reads writes and assignment") {
-    ecs::BitBuffer buffer;
+    ashiato::BitBuffer buffer;
     REQUIRE_THROWS_AS(buffer.push_bits(0, 65U), std::invalid_argument);
     REQUIRE_THROWS_AS(buffer.read_unsigned_bits(65U), std::invalid_argument);
     REQUIRE_THROWS_AS(buffer.read_bool(), std::out_of_range);
@@ -71,7 +71,7 @@ TEST_CASE("bit buffer validates invalid reads writes and assignment") {
 }
 
 TEST_CASE("bit buffer supports byte aligned unsigned and byte operations") {
-    ecs::BitBuffer buffer;
+    ashiato::BitBuffer buffer;
     buffer.reserve_bytes(8U);
     buffer.push_unsigned_bits(0x1234U, 16U);
     buffer.push_bytes("xy", 2U);
@@ -95,7 +95,7 @@ TEST_CASE("bit buffer supports byte aligned unsigned and byte operations") {
 }
 
 TEST_CASE("bit buffer supports unaligned unsigned byte and buffer operations") {
-    ecs::BitBuffer buffer;
+    ashiato::BitBuffer buffer;
     buffer.push_bool(true);
     buffer.push_unsigned_bits(0x1ffU, 9U);
     buffer.push_bytes("A", 1U);
@@ -107,11 +107,11 @@ TEST_CASE("bit buffer supports unaligned unsigned byte and buffer operations") {
     REQUIRE(byte == 'A');
     REQUIRE(buffer.remaining_bits() == 0U);
 
-    ecs::BitBuffer source;
+    ashiato::BitBuffer source;
     source.push_bool(false);
     source.push_bool(true);
 
-    ecs::BitBuffer copied;
+    ashiato::BitBuffer copied;
     copied.push_bool(true);
     copied.push_buffer_bits(source);
     REQUIRE(copied.bit_size() == 3U);
@@ -119,10 +119,10 @@ TEST_CASE("bit buffer supports unaligned unsigned byte and buffer operations") {
     REQUIRE_FALSE(copied.read_bool());
     REQUIRE(copied.read_bool());
 
-    ecs::BitBuffer frame;
+    ashiato::BitBuffer frame;
     frame.push_bool(false);
     frame.push_bytes("B", 1U);
-    ecs::BitBuffer extracted;
+    ashiato::BitBuffer extracted;
     frame.read_buffer_bits(extracted, 9U);
     REQUIRE_FALSE(extracted.read_bool());
     char extracted_byte{};
@@ -131,7 +131,7 @@ TEST_CASE("bit buffer supports unaligned unsigned byte and buffer operations") {
 }
 
 TEST_CASE("bit buffer overwrites aligned unaligned and wide bit ranges") {
-    ecs::BitBuffer buffer;
+    ashiato::BitBuffer buffer;
     buffer.push_unsigned_bits(0U, 16U);
     buffer.overwrite_unsigned_bits(0U, 0xabcdU, 16U);
     REQUIRE(buffer.read_unsigned_bits(16U) == 0xabcdU);
@@ -141,7 +141,7 @@ TEST_CASE("bit buffer overwrites aligned unaligned and wide bit ranges") {
     buffer.skip_bits(3U);
     REQUIRE(buffer.read_unsigned_bits(5U) == 0x1fU);
 
-    ecs::BitBuffer wide;
+    ashiato::BitBuffer wide;
     wide.push_bool(false);
     wide.push_unsigned_bits(0U, 64U);
     wide.overwrite_unsigned_bits(1U, 0xffffffffffffffffULL, 64U);
@@ -150,7 +150,7 @@ TEST_CASE("bit buffer overwrites aligned unaligned and wide bit ranges") {
 }
 
 TEST_CASE("bit buffer accepts no-op operations and rejects null byte buffers") {
-    ecs::BitBuffer buffer;
+    ashiato::BitBuffer buffer;
     buffer.push_unsigned_bits(123U, 0U);
     buffer.push_bytes(nullptr, 0U);
     buffer.read_bytes(nullptr, 0U);
@@ -165,7 +165,7 @@ TEST_CASE("bit buffer accepts no-op operations and rejects null byte buffers") {
 }
 
 TEST_CASE("bit buffer reads unaligned 64-bit values across a byte window") {
-    ecs::BitBuffer buffer;
+    ashiato::BitBuffer buffer;
     buffer.push_bool(true);
     buffer.push_unsigned_bits(0x0123456789abcdefULL, 64U);
     buffer.push_bool(false);
@@ -177,7 +177,7 @@ TEST_CASE("bit buffer reads unaligned 64-bit values across a byte window") {
 }
 
 TEST_CASE("bit buffer masks overwritten tail bits without disturbing neighbors") {
-    ecs::BitBuffer buffer;
+    ashiato::BitBuffer buffer;
     buffer.push_unsigned_bits(0xffffU, 16U);
     buffer.overwrite_unsigned_bits(5U, 0U, 6U);
 

@@ -1,4 +1,4 @@
-#include "ecs/ecs.hpp"
+#include "ashiato/ashiato.hpp"
 
 #include <iostream>
 
@@ -8,10 +8,10 @@ struct Position {
 };
 
 int main() {
-    ecs::Registry registry;
+    ashiato::Registry registry;
     registry.register_component<Position>("Position");
 
-    const ecs::Entity entity = registry.create();
+    const ashiato::Entity entity = registry.create();
 
     registry.add<Position>(entity, Position{1.0f, 2.0f});
 

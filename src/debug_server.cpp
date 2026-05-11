@@ -1,6 +1,6 @@
-#include "ecs/debug_server.hpp"
+#include "ashiato/debug_server.hpp"
 
-#if ECS_ENABLE_DEBUG_SERVER
+#if ASHIATO_ENABLE_DEBUG_SERVER
 
 #include <cerrno>
 #include <cctype>
@@ -21,7 +21,7 @@
 #include <unistd.h>
 #endif
 
-namespace ecs {
+namespace ashiato {
 namespace {
 
 #ifdef _WIN32
@@ -1145,6 +1145,6 @@ const std::string& DebugServer::last_error() const noexcept {
     return impl_ != nullptr ? impl_->last_error() : empty;
 }
 
-}  // namespace ecs
+}  // namespace ashiato
 
 #endif

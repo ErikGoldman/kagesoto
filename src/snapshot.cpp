@@ -1,6 +1,6 @@
-#include "ecs/ecs.hpp"
+#include "ashiato/ashiato.hpp"
 
-namespace ecs {
+namespace ashiato {
 
 namespace detail {
 
@@ -12,14 +12,14 @@ constexpr std::uint32_t persistent_delta_kind = 2U;
 void write_exact(std::ostream& out, const void* data, std::size_t size) {
     out.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
     if (!out) {
-        throw std::runtime_error("ecs snapshot write failed");
+        throw std::runtime_error("ashiato snapshot write failed");
     }
 }
 
 void read_exact(std::istream& in, void* data, std::size_t size) {
     in.read(static_cast<char*>(data), static_cast<std::streamsize>(size));
     if (!in) {
-        throw std::runtime_error("ecs snapshot read failed");
+        throw std::runtime_error("ashiato snapshot read failed");
     }
 }
 
@@ -47,7 +47,7 @@ void write_string(std::ostream& out, const std::string& value) {
 std::string read_string(std::istream& in) {
     const auto size = read_pod<std::uint64_t>(in);
     if (size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-        throw std::runtime_error("ecs snapshot string is too large");
+        throw std::runtime_error("ashiato snapshot string is too large");
     }
     std::string value(static_cast<std::size_t>(size), '\0');
     if (!value.empty()) {
@@ -152,7 +152,7 @@ BitBuffer read_frame(std::istream& in, std::uint32_t expected_kind) {
 
 }  // namespace detail
 
-bool snapshot_component_selected(ecs::Entity component, const SnapshotComponentOptions& options) {
+bool snapshot_component_selected(ashiato::Entity component, const SnapshotComponentOptions& options) {
     const bool included = options.include_components.empty() ||
         std::find(options.include_components.begin(), options.include_components.end(), component) !=
             options.include_components.end();
@@ -261,7 +261,7 @@ std::unique_ptr<Registry::TypeErasedStorage> read_storage(
 
 void validate_serializable_component(const Registry::ComponentRecord& record) {
     if (!record.info.tag && !record.info.trivially_copyable) {
-        throw std::logic_error("ecs snapshot selected component is not disk serializable");
+        throw std::logic_error("ashiato snapshot selected component is not disk serializable");
     }
 }
 
@@ -387,7 +387,7 @@ void read_snapshot_header(
     if (detail::read_pod<std::uint32_t>(in) != magic ||
         detail::read_pod<std::uint32_t>(in) != version ||
         detail::read_pod<std::uint32_t>(in) != expected_kind) {
-        throw std::runtime_error("ecs snapshot header is invalid");
+        throw std::runtime_error("ashiato snapshot header is invalid");
     }
     has_entities = detail::read_pod<std::uint8_t>(in) != 0U;
     baseline_token = detail::read_pod<std::uint64_t>(in);
@@ -436,7 +436,7 @@ void read_snapshot_header(
         const auto index = detail::read_pod<std::uint32_t>(in);
         const auto found = components.find(index);
         if (found == components.end()) {
-            throw std::runtime_error("ecs snapshot storage references missing component metadata");
+            throw std::runtime_error("ashiato snapshot storage references missing component metadata");
         }
         storages[index] = read_storage(in, found->second);
     }
@@ -489,7 +489,7 @@ Registry::Snapshot Registry::Snapshot::read_native(std::istream& in) {
         snapshot.groups_,
         snapshot.storages_);
     if (!has_entities || baseline_token != 0U) {
-        throw std::runtime_error("ecs full snapshot payload is invalid");
+        throw std::runtime_error("ashiato full snapshot payload is invalid");
     }
     for (const auto& component : snapshot.components_) {
         if (!component.second.name.empty()) {
@@ -1228,13 +1228,13 @@ void Registry::restore_snapshot(const Snapshot& snapshot) {
 void Registry::restore_delta_snapshot(const DeltaSnapshot& snapshot) {
     require_runtime_registry_access_allowed("restore_delta_snapshot");
     if (state_token_ != snapshot.baseline_token_) {
-        throw std::logic_error("ecs delta snapshot baseline does not match registry state");
+        throw std::logic_error("ashiato delta snapshot baseline does not match registry state");
     }
 
     for (const auto& component : snapshot.components_) {
         const auto found = component_catalog_.records.find(component.first);
         if (found == component_catalog_.records.end()) {
-            throw std::logic_error("ecs delta snapshot component is not registered");
+            throw std::logic_error("ashiato delta snapshot component is not registered");
         }
 
         const ComponentRecord& current = found->second;
@@ -1245,7 +1245,7 @@ void Registry::restore_delta_snapshot(const DeltaSnapshot& snapshot) {
             current.info.trivially_copyable != captured.info.trivially_copyable ||
             current.info.tag != captured.info.tag ||
             current.singleton != captured.singleton) {
-            throw std::logic_error("ecs delta snapshot component metadata does not match registry");
+            throw std::logic_error("ashiato delta snapshot component metadata does not match registry");
         }
     }
 
@@ -1281,7 +1281,7 @@ void Registry::restore_delta_snapshot(const DeltaSnapshot& snapshot) {
         const std::uint32_t component_index = storage.first;
         const auto found_component = component_catalog_.records.find(component_index);
         if (found_component == component_catalog_.records.end()) {
-            throw std::logic_error("ecs delta snapshot component is not registered");
+            throw std::logic_error("ashiato delta snapshot component is not registered");
         }
         const Entity component = found_component->second.entity;
         const TypeErasedStorage& delta_storage = *storage.second;
@@ -1294,7 +1294,7 @@ void Registry::restore_delta_snapshot(const DeltaSnapshot& snapshot) {
                 continue;
             }
             if (target_storage == nullptr || !target_storage->contains_index(entity_index)) {
-                throw std::logic_error("ecs delta snapshot component removal does not match registry state");
+                throw std::logic_error("ashiato delta snapshot component removal does not match registry state");
             }
             remove_from_groups_before_component_removal(entity_index, component_index);
             target_storage->remove_index(entity_index);
@@ -1303,7 +1303,7 @@ void Registry::restore_delta_snapshot(const DeltaSnapshot& snapshot) {
         for (std::size_t dense = 0; dense < delta_storage.dense_size(); ++dense) {
             const std::uint32_t entity_index = delta_storage.dense_index_at(dense);
             if (entity_index >= entity_store_.slots.size() || slot_index(entity_store_.slots[entity_index]) != entity_index) {
-                throw std::logic_error("ecs delta snapshot entity is not alive");
+                throw std::logic_error("ashiato delta snapshot entity is not alive");
             }
             storage_for(component).emplace_or_replace_copy(entity_index, delta_storage.get_dense(dense));
             refresh_group_after_add(entity_index, component_index);
@@ -1315,4 +1315,4 @@ void Registry::restore_delta_snapshot(const DeltaSnapshot& snapshot) {
     restore_internal_bookkeeping_tags();
 }
 
-}  // namespace ecs
+}  // namespace ashiato

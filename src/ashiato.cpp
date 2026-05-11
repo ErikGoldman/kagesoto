@@ -1,6 +1,6 @@
-#include "ecs/ecs.hpp"
+#include "ashiato/ashiato.hpp"
 
-namespace ecs {
+namespace ashiato {
 
 Registry::Registry() {
     register_system_tag();
@@ -83,7 +83,7 @@ bool Registry::add_tag(Entity entity, Entity tag) {
     require_runtime_registry_access_allowed("add_tag");
     const ComponentRecord& record = require_component_record(tag);
     if (!record.info.tag) {
-        throw std::logic_error("ecs component entity is not a tag");
+        throw std::logic_error("ashiato component entity is not a tag");
     }
     if (!alive(entity)) {
         return false;
@@ -103,7 +103,7 @@ void* Registry::add(Entity entity, Entity component, const void* value) {
     require_runtime_registry_access_allowed("add");
     const ComponentRecord& record = require_component_record(component);
     if (record.info.tag) {
-        throw std::logic_error("ecs tags cannot be added as writable components");
+        throw std::logic_error("ashiato tags cannot be added as writable components");
     }
     if (record.singleton) {
         return storage_for(component).emplace_or_replace_bytes(entity_index(singleton_entity()), value);
@@ -121,7 +121,7 @@ void* Registry::write(Entity entity, Entity component) {
     require_runtime_registry_access_allowed("write");
     const ComponentRecord& record = require_component_record(component);
     if (record.info.tag) {
-        throw std::logic_error("ecs tags cannot be written");
+        throw std::logic_error("ashiato tags cannot be written");
     }
     if (record.singleton) {
         entity = component_catalog_.singleton_entity;
@@ -138,7 +138,7 @@ bool Registry::has(Entity entity, Entity component) const {
     require_runtime_registry_access_allowed("has");
     const ComponentRecord& record = require_component_record(component);
     if (!record.info.tag) {
-        throw std::logic_error("ecs component entity is not a tag");
+        throw std::logic_error("ashiato component entity is not a tag");
     }
     if (!alive(entity)) {
         return false;
@@ -535,7 +535,7 @@ const Registry::ComponentRecord* Registry::find_component_record(Entity componen
 Registry::ComponentRecord& Registry::require_component_record(Entity component) {
     ComponentRecord* record = find_component_record(component);
     if (record == nullptr) {
-        throw std::logic_error("ecs component entity is not registered");
+        throw std::logic_error("ashiato component entity is not registered");
     }
 
     return *record;
@@ -544,7 +544,7 @@ Registry::ComponentRecord& Registry::require_component_record(Entity component) 
 const Registry::ComponentRecord& Registry::require_component_record(Entity component) const {
     const ComponentRecord* record = find_component_record(component);
     if (record == nullptr) {
-        throw std::logic_error("ecs component entity is not registered");
+        throw std::logic_error("ashiato component entity is not registered");
     }
 
     return *record;
@@ -593,7 +593,7 @@ void Registry::rebuild_typed_storages() {
 void Registry::require_tag_component(Entity component) const {
     const ComponentRecord& record = require_component_record(component);
     if (!record.info.tag) {
-        throw std::logic_error("ecs component entity is not a tag");
+        throw std::logic_error("ashiato component entity is not a tag");
     }
 }
 
@@ -676,7 +676,7 @@ Entity Registry::register_primitive(std::string name, std::size_t size, std::siz
 
 void Registry::register_system_tag() {
     ComponentDesc desc;
-    desc.name = "ecs.system";
+    desc.name = "ashiato.system";
     desc.size = 0;
     desc.alignment = 1;
 
@@ -689,7 +689,7 @@ void Registry::register_system_tag() {
 
 void Registry::register_job_tag() {
     ComponentDesc desc;
-    desc.name = "ecs.job";
+    desc.name = "ashiato.job";
     desc.size = 0;
     desc.alignment = 1;
 
@@ -936,7 +936,7 @@ const std::vector<std::size_t>& Registry::ordered_job_indices() const {
 std::size_t Registry::job_index(Entity job) const {
     const auto found = job_registry_.index_by_entity.find(job.value);
     if (found == job_registry_.index_by_entity.end()) {
-        throw std::logic_error("ecs job is not registered");
+        throw std::logic_error("ashiato job is not registered");
     }
     return found->second;
 }
@@ -950,4 +950,4 @@ bool Registry::job_excluded_by_options(const JobRecord& job, const RunJobsOption
     return false;
 }
 
-}  // namespace ecs
+}  // namespace ashiato

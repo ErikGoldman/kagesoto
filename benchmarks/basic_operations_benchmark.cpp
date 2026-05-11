@@ -1,4 +1,4 @@
-#include "ecs/ecs.hpp"
+#include "ashiato/ashiato.hpp"
 
 #include <benchmark/benchmark.h>
 
@@ -112,7 +112,7 @@ public:
         }
     }
 
-    void run(const std::vector<ecs::JobThreadTask>& tasks) {
+    void run(const std::vector<ashiato::JobThreadTask>& tasks) {
         if (tasks.empty()) {
             return;
         }
@@ -121,7 +121,7 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             remaining_ = tasks.size();
             first_exception_ = nullptr;
-            for (const ecs::JobThreadTask& task : tasks) {
+            for (const ashiato::JobThreadTask& task : tasks) {
                 queue_.push_back(&task);
             }
         }
@@ -140,7 +140,7 @@ public:
 private:
     void worker_loop() {
         for (;;) {
-            const ecs::JobThreadTask* task = nullptr;
+            const ashiato::JobThreadTask* task = nullptr;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 work_ready_.wait(lock, [this]() {
@@ -173,7 +173,7 @@ private:
     }
 
     std::vector<std::thread> workers_;
-    std::deque<const ecs::JobThreadTask*> queue_;
+    std::deque<const ashiato::JobThreadTask*> queue_;
     std::mutex mutex_;
     std::condition_variable work_ready_;
     std::condition_variable work_done_;
@@ -183,11 +183,11 @@ private:
 };
 
 template <typename T>
-void register_component(ecs::Registry& registry, const char* name) {
+void register_component(ashiato::Registry& registry, const char* name) {
     registry.register_component<T>(name);
 }
 
-void register_first_n_components(ecs::Registry& registry, int count) {
+void register_first_n_components(ashiato::Registry& registry, int count) {
     register_component<C0>(registry, "C0");
     if (count <= 1) {
         return;
@@ -218,8 +218,8 @@ void register_first_n_components(ecs::Registry& registry, int count) {
     register_component<C15>(registry, "C15");
 }
 
-std::vector<ecs::Entity> create_entities(ecs::Registry& registry, int count) {
-    std::vector<ecs::Entity> entities;
+std::vector<ashiato::Entity> create_entities(ashiato::Registry& registry, int count) {
+    std::vector<ashiato::Entity> entities;
     entities.reserve(static_cast<std::size_t>(count));
 
     for (int i = 0; i < count; ++i) {
@@ -229,7 +229,7 @@ std::vector<ecs::Entity> create_entities(ecs::Registry& registry, int count) {
     return entities;
 }
 
-void add_first_n_components(ecs::Registry& registry, const std::vector<ecs::Entity>& entities, int count) {
+void add_first_n_components(ashiato::Registry& registry, const std::vector<ashiato::Entity>& entities, int count) {
     for (std::size_t i = 0; i < entities.size(); ++i) {
         const auto value = static_cast<std::int64_t>(i);
         registry.add<C0>(entities[i], C0{value});
@@ -270,26 +270,26 @@ void set_entity_items_processed(benchmark::State& state, int entity_count) {
 template <int ComponentCount>
 void BM_IterateUngroupedViewComponents(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, ComponentCount);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, ComponentCount);
 
     for (auto _ : state) {
         std::int64_t total = 0;
         if constexpr (ComponentCount == 1) {
-            registry.view<const C0>().each([&](ecs::Entity, const C0& c0) {
+            registry.view<const C0>().each([&](ashiato::Entity, const C0& c0) {
                 total += c0.value;
             });
         } else if constexpr (ComponentCount == 2) {
-            registry.view<const C0, const C1>().each([&](ecs::Entity, const C0& c0, const C1& c1) {
+            registry.view<const C0, const C1>().each([&](ashiato::Entity, const C0& c0, const C1& c1) {
                 total += c0.value;
                 total += c1.value;
             });
         } else if constexpr (ComponentCount == 8) {
             registry.view<const C0, const C1, const C2, const C3, const C4, const C5, const C6, const C7>()
                 .each([&](
-                          ecs::Entity,
+                          ashiato::Entity,
                           const C0& c0,
                           const C1& c1,
                           const C2& c2,
@@ -327,7 +327,7 @@ void BM_IterateUngroupedViewComponents(benchmark::State& state) {
                     const C14,
                     const C15>()
                 .each([&](
-                          ecs::Entity,
+                          ashiato::Entity,
                           const C0& c0,
                           const C1& c1,
                           const C2& c2,
@@ -371,9 +371,9 @@ void BM_IterateUngroupedViewComponents(benchmark::State& state) {
 void BM_IterateSparseTwoComponentView(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
     const int stride = static_cast<int>(state.range(1));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 2);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
 
     for (std::size_t i = 0; i < entities.size(); ++i) {
         const auto value = static_cast<std::int64_t>(i);
@@ -385,7 +385,7 @@ void BM_IterateSparseTwoComponentView(benchmark::State& state) {
 
     for (auto _ : state) {
         std::int64_t total = 0;
-        registry.view<const C0, const C1>().each([&](ecs::Entity, const C0& c0, const C1& c1) {
+        registry.view<const C0, const C1>().each([&](ashiato::Entity, const C0& c0, const C1& c1) {
             total += c0.value;
             total += c1.value;
         });
@@ -397,16 +397,16 @@ void BM_IterateSparseTwoComponentView(benchmark::State& state) {
 
 void BM_AddRemoveComponents(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_component<C0>(registry, "C0");
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
 
     for (auto _ : state) {
         for (std::size_t i = 0; i < entities.size(); ++i) {
             benchmark::DoNotOptimize(registry.add<C0>(entities[i], C0{static_cast<std::int64_t>(i)}));
         }
 
-        for (ecs::Entity entity : entities) {
+        for (ashiato::Entity entity : entities) {
             benchmark::DoNotOptimize(registry.remove<C0>(entity));
         }
     }
@@ -416,14 +416,14 @@ void BM_AddRemoveComponents(benchmark::State& state) {
 
 void BM_IterateSingleComponent(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 1);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 1);
 
     for (auto _ : state) {
         std::int64_t total = 0;
-        for (ecs::Entity entity : entities) {
+        for (ashiato::Entity entity : entities) {
             total += registry.get<C0>(entity).value;
         }
         benchmark::DoNotOptimize(total);
@@ -435,14 +435,14 @@ void BM_IterateSingleComponent(benchmark::State& state) {
 template <int ComponentCount>
 void BM_IterateComponents(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, ComponentCount);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, ComponentCount);
 
     for (auto _ : state) {
         std::int64_t total = 0;
-        for (ecs::Entity entity : entities) {
+        for (ashiato::Entity entity : entities) {
             total += registry.get<C0>(entity).value;
             total += registry.get<C1>(entity).value;
             if constexpr (ComponentCount >= 8) {
@@ -473,9 +473,9 @@ void BM_IterateComponents(benchmark::State& state) {
 template <int ComponentCount>
 void BM_IterateOwnedGroupViewComponents(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, ComponentCount);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, ComponentCount);
 
     if constexpr (ComponentCount == 2) {
@@ -489,14 +489,14 @@ void BM_IterateOwnedGroupViewComponents(benchmark::State& state) {
     for (auto _ : state) {
         std::int64_t total = 0;
         if constexpr (ComponentCount == 2) {
-            registry.view<const C0, const C1>().each([&](ecs::Entity, const C0& c0, const C1& c1) {
+            registry.view<const C0, const C1>().each([&](ashiato::Entity, const C0& c0, const C1& c1) {
                 total += c0.value;
                 total += c1.value;
             });
         } else if constexpr (ComponentCount == 8) {
             registry.view<const C0, const C1, const C2, const C3, const C4, const C5, const C6, const C7>()
                 .each([&](
-                          ecs::Entity,
+                          ashiato::Entity,
                           const C0& c0,
                           const C1& c1,
                           const C2& c2,
@@ -534,7 +534,7 @@ void BM_IterateOwnedGroupViewComponents(benchmark::State& state) {
                     const C14,
                     const C15>()
                 .each([&](
-                          ecs::Entity,
+                          ashiato::Entity,
                           const C0& c0,
                           const C1& c1,
                           const C2& c2,
@@ -577,13 +577,13 @@ void BM_IterateOwnedGroupViewComponents(benchmark::State& state) {
 
 void BM_IterateWriteSameComponent(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 1);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 1);
 
     for (auto _ : state) {
-        for (ecs::Entity entity : entities) {
+        for (ashiato::Entity entity : entities) {
             C0& component = registry.write<C0>(entity);
             component.value += 1;
             benchmark::DoNotOptimize(component);
@@ -596,13 +596,13 @@ void BM_IterateWriteSameComponent(benchmark::State& state) {
 
 void BM_IterateWriteEightComponents(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 8);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 8);
 
     for (auto _ : state) {
-        for (ecs::Entity entity : entities) {
+        for (ashiato::Entity entity : entities) {
             registry.write<C0>(entity).value += 1;
             registry.write<C1>(entity).value += 1;
             registry.write<C2>(entity).value += 1;
@@ -620,15 +620,15 @@ void BM_IterateWriteEightComponents(benchmark::State& state) {
 
 void BM_IterateWriteOwnedGroupViewEightComponents(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 8);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 8);
     registry.declare_owned_group<C0, C1, C2, C3, C4, C5, C6, C7>();
 
     for (auto _ : state) {
         registry.view<C0, C1, C2, C3, C4, C5, C6, C7>().each([&](
-            ecs::Entity,
+            ashiato::Entity,
             C0& c0,
             C1& c1,
             C2& c2,
@@ -654,13 +654,13 @@ void BM_IterateWriteOwnedGroupViewEightComponents(benchmark::State& state) {
 
 void BM_AccessViewReadWrite(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 2);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 2);
 
     for (auto _ : state) {
-        registry.view<const C0>().access<C1>().each([&](auto& view, ecs::Entity entity, const C0& c0) {
+        registry.view<const C0>().access<C1>().each([&](auto& view, ashiato::Entity entity, const C0& c0) {
             view.template write<C1>(entity).value += c0.value;
         });
         benchmark::ClobberMemory();
@@ -671,11 +671,11 @@ void BM_AccessViewReadWrite(benchmark::State& state) {
 
 void BM_TypedTagFilteredView(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 1);
     register_component<TagA>(registry, "TagA");
     register_component<TagB>(registry, "TagB");
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 1);
 
     for (std::size_t i = 0; i < entities.size(); ++i) {
@@ -690,7 +690,7 @@ void BM_TypedTagFilteredView(benchmark::State& state) {
     for (auto _ : state) {
         std::int64_t total = 0;
         registry.view<const C0>().with_tags<const TagA>().without_tags<const TagB>().each(
-            [&](ecs::Entity, const C0& c0) {
+            [&](ashiato::Entity, const C0& c0) {
                 total += c0.value;
             });
         benchmark::DoNotOptimize(total);
@@ -701,11 +701,11 @@ void BM_TypedTagFilteredView(benchmark::State& state) {
 
 void BM_RuntimeTagFilteredView(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 1);
-    const ecs::Entity tag_a = registry.register_tag("RuntimeTagA");
-    const ecs::Entity tag_b = registry.register_tag("RuntimeTagB");
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const ashiato::Entity tag_a = registry.register_tag("RuntimeTagA");
+    const ashiato::Entity tag_b = registry.register_tag("RuntimeTagB");
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 1);
 
     for (std::size_t i = 0; i < entities.size(); ++i) {
@@ -719,7 +719,7 @@ void BM_RuntimeTagFilteredView(benchmark::State& state) {
 
     for (auto _ : state) {
         std::int64_t total = 0;
-        registry.view<const C0>().with_tags({tag_a}).without_tags({tag_b}).each([&](ecs::Entity, const C0& c0) {
+        registry.view<const C0>().with_tags({tag_a}).without_tags({tag_b}).each([&](ashiato::Entity, const C0& c0) {
             total += c0.value;
         });
         benchmark::DoNotOptimize(total);
@@ -730,9 +730,9 @@ void BM_RuntimeTagFilteredView(benchmark::State& state) {
 
 void BM_GroupMaintenanceAddRemove(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 2);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     for (std::size_t i = 0; i < entities.size(); ++i) {
         registry.add<C0>(entities[i], C0{static_cast<std::int64_t>(i)});
     }
@@ -742,7 +742,7 @@ void BM_GroupMaintenanceAddRemove(benchmark::State& state) {
         for (std::size_t i = 0; i < entities.size(); ++i) {
             benchmark::DoNotOptimize(registry.add<C1>(entities[i], C1{static_cast<std::int64_t>(i)}));
         }
-        for (ecs::Entity entity : entities) {
+        for (ashiato::Entity entity : entities) {
             benchmark::DoNotOptimize(registry.remove<C1>(entity));
         }
     }
@@ -752,8 +752,8 @@ void BM_GroupMaintenanceAddRemove(benchmark::State& state) {
 
 void BM_AddRemoveEntities(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
-    std::vector<ecs::Entity> entities;
+    ashiato::Registry registry;
+    std::vector<ashiato::Entity> entities;
     entities.reserve(static_cast<std::size_t>(entity_count));
 
     for (auto _ : state) {
@@ -763,7 +763,7 @@ void BM_AddRemoveEntities(benchmark::State& state) {
             entities.push_back(registry.create());
         }
 
-        for (ecs::Entity entity : entities) {
+        for (ashiato::Entity entity : entities) {
             benchmark::DoNotOptimize(registry.destroy(entity));
         }
     }
@@ -773,9 +773,9 @@ void BM_AddRemoveEntities(benchmark::State& state) {
 
 void BM_Snapshot(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 8);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 8);
     registry.clear_all_dirty<C0>();
     registry.clear_all_dirty<C1>();
@@ -796,9 +796,9 @@ void BM_Snapshot(benchmark::State& state) {
 
 void BM_DeltaSnapshotDirtyValues(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 8);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 8);
     registry.clear_all_dirty<C0>();
     registry.clear_all_dirty<C1>();
@@ -825,9 +825,9 @@ void BM_DeltaSnapshotDirtyValues(benchmark::State& state) {
 
 void BM_DeltaSnapshotStructuralChanges(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 2);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 2);
     registry.clear_all_dirty<C0>();
     registry.clear_all_dirty<C1>();
@@ -850,9 +850,9 @@ void BM_DeltaSnapshotStructuralChanges(benchmark::State& state) {
 
 void BM_SnapshotRestore(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 8);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 8);
     registry.declare_owned_group<C0, C1, C2, C3, C4, C5, C6, C7>();
     auto snapshot = registry.create_snapshot();
@@ -867,9 +867,9 @@ void BM_SnapshotRestore(benchmark::State& state) {
 
 void BM_DeltaSnapshotRestoreDirtyValues(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry source;
+    ashiato::Registry source;
     register_first_n_components(source, 8);
-    const std::vector<ecs::Entity> entities = create_entities(source, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(source, entity_count);
     add_first_n_components(source, entities, 8);
     source.clear_all_dirty<C0>();
     source.clear_all_dirty<C1>();
@@ -887,7 +887,7 @@ void BM_DeltaSnapshotRestoreDirtyValues(benchmark::State& state) {
     }
     auto delta = source.create_delta_snapshot(baseline);
 
-    ecs::Registry replay;
+    ashiato::Registry replay;
     register_first_n_components(replay, 8);
     replay.restore_snapshot(baseline);
 
@@ -905,9 +905,9 @@ void BM_DeltaSnapshotRestoreDirtyValues(benchmark::State& state) {
 
 void BM_DeltaSnapshotRestoreStructuralChanges(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry source;
+    ashiato::Registry source;
     register_first_n_components(source, 2);
-    const std::vector<ecs::Entity> entities = create_entities(source, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(source, entity_count);
     add_first_n_components(source, entities, 2);
     source.declare_owned_group<C0, C1>();
     source.clear_all_dirty<C0>();
@@ -922,7 +922,7 @@ void BM_DeltaSnapshotRestoreStructuralChanges(benchmark::State& state) {
     }
     auto delta = source.create_delta_snapshot(baseline);
 
-    ecs::Registry replay;
+    ashiato::Registry replay;
     register_first_n_components(replay, 2);
     replay.declare_owned_group<C0, C1>();
     replay.restore_snapshot(baseline);
@@ -941,20 +941,20 @@ void BM_DeltaSnapshotRestoreStructuralChanges(benchmark::State& state) {
 
 void BM_RuntimeAddRemoveComponents(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
-    ecs::ComponentDesc desc;
+    ashiato::Registry registry;
+    ashiato::ComponentDesc desc;
     desc.name = "RuntimeC0";
     desc.size = sizeof(C0);
     desc.alignment = alignof(C0);
-    const ecs::Entity component = registry.register_component(std::move(desc));
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const ashiato::Entity component = registry.register_component(std::move(desc));
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
 
     for (auto _ : state) {
         for (std::size_t i = 0; i < entities.size(); ++i) {
             const C0 value{static_cast<std::int64_t>(i)};
             benchmark::DoNotOptimize(registry.add(entities[i], component, &value));
         }
-        for (ecs::Entity entity : entities) {
+        for (ashiato::Entity entity : entities) {
             benchmark::DoNotOptimize(registry.remove(entity, component));
         }
     }
@@ -964,20 +964,20 @@ void BM_RuntimeAddRemoveComponents(benchmark::State& state) {
 
 void BM_RuntimeEnsureExistingWriteRead(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
-    ecs::ComponentDesc desc;
+    ashiato::Registry registry;
+    ashiato::ComponentDesc desc;
     desc.name = "RuntimeC0";
     desc.size = sizeof(C0);
     desc.alignment = alignof(C0);
-    const ecs::Entity component = registry.register_component(std::move(desc));
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
-    for (ecs::Entity entity : entities) {
+    const ashiato::Entity component = registry.register_component(std::move(desc));
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
+    for (ashiato::Entity entity : entities) {
         registry.ensure(entity, component);
     }
 
     for (auto _ : state) {
         std::int64_t total = 0;
-        for (ecs::Entity entity : entities) {
+        for (ashiato::Entity entity : entities) {
             auto* value = static_cast<C0*>(registry.ensure(entity, component));
             value->value += 1;
             total += static_cast<const C0*>(registry.get(entity, component))->value;
@@ -991,9 +991,9 @@ void BM_RuntimeEnsureExistingWriteRead(benchmark::State& state) {
 
 void BM_NonTrivialComponentChurn(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_component<CopyablePayload>(registry, "CopyablePayload");
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
 
     for (auto _ : state) {
         for (std::size_t i = 0; i < entities.size(); ++i) {
@@ -1006,7 +1006,7 @@ void BM_NonTrivialComponentChurn(benchmark::State& state) {
                 entities[i],
                 CopyablePayload{std::to_string(i + entities.size())}));
         }
-        for (ecs::Entity entity : entities) {
+        for (ashiato::Entity entity : entities) {
             benchmark::DoNotOptimize(registry.remove<CopyablePayload>(entity));
         }
     }
@@ -1016,14 +1016,14 @@ void BM_NonTrivialComponentChurn(benchmark::State& state) {
 
 void BM_JobScheduleReadOnly(benchmark::State& state) {
     const int job_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 1);
     for (int i = 0; i < job_count; ++i) {
-        registry.job<const C0>(i).each([](ecs::Entity, const C0&) {});
+        registry.job<const C0>(i).each([](ashiato::Entity, const C0&) {});
     }
 
     for (auto _ : state) {
-        auto schedule = ecs::Orchestrator(registry).schedule();
+        auto schedule = ashiato::Orchestrator(registry).schedule();
         benchmark::DoNotOptimize(&schedule);
     }
 
@@ -1032,14 +1032,14 @@ void BM_JobScheduleReadOnly(benchmark::State& state) {
 
 void BM_JobScheduleConflictingWrites(benchmark::State& state) {
     const int job_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 1);
     for (int i = 0; i < job_count; ++i) {
-        registry.job<C0>(i).each([](ecs::Entity, C0&) {});
+        registry.job<C0>(i).each([](ashiato::Entity, C0&) {});
     }
 
     for (auto _ : state) {
-        auto schedule = ecs::Orchestrator(registry).schedule();
+        auto schedule = ashiato::Orchestrator(registry).schedule();
         benchmark::DoNotOptimize(&schedule);
     }
 
@@ -1048,19 +1048,19 @@ void BM_JobScheduleConflictingWrites(benchmark::State& state) {
 
 void BM_RunJobsSingleThread(benchmark::State& state) {
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 1);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 1);
 
     for (int i = 0; i < 4; ++i) {
-        registry.job<C0>(i).each([](ecs::Entity, C0& c0) {
+        registry.job<C0>(i).each([](ashiato::Entity, C0& c0) {
             c0.value += 1;
         });
     }
 
     for (auto _ : state) {
-        registry.run_jobs(ecs::RunJobsOptions{true});
+        registry.run_jobs(ashiato::RunJobsOptions{true});
         benchmark::ClobberMemory();
     }
 
@@ -1075,22 +1075,22 @@ void BM_RunJobsParallelThreadPool(benchmark::State& state) {
     }
 
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 1);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 1);
 
     for (int i = 0; i < 4; ++i) {
         registry.job<C0>(i)
             .max_threads(BenchmarkThreadPool::thread_count)
             .min_entities_per_thread(1024)
-            .each([](ecs::Entity, C0& c0) {
+            .each([](ashiato::Entity, C0& c0) {
                 c0.value += 1;
             });
     }
 
     BenchmarkThreadPool thread_pool(BenchmarkThreadPool::thread_count);
-    registry.set_job_thread_executor([&thread_pool](const std::vector<ecs::JobThreadTask>& tasks) {
+    registry.set_job_thread_executor([&thread_pool](const std::vector<ashiato::JobThreadTask>& tasks) {
         thread_pool.run(tasks);
     });
 
@@ -1110,38 +1110,38 @@ void BM_RunJobsParallelOverlappingWritesThreadPool(benchmark::State& state) {
     }
 
     const int entity_count = static_cast<int>(state.range(0));
-    ecs::Registry registry;
+    ashiato::Registry registry;
     register_first_n_components(registry, 4);
-    const std::vector<ecs::Entity> entities = create_entities(registry, entity_count);
+    const std::vector<ashiato::Entity> entities = create_entities(registry, entity_count);
     add_first_n_components(registry, entities, 4);
 
     registry.job<C0>(0)
         .max_threads(BenchmarkThreadPool::thread_count)
         .min_entities_per_thread(1024)
-        .each([](ecs::Entity, C0& c0) {
+        .each([](ashiato::Entity, C0& c0) {
             c0.value += 1;
         });
     registry.job<C1>(0)
         .max_threads(BenchmarkThreadPool::thread_count)
         .min_entities_per_thread(1024)
-        .each([](ecs::Entity, C1& c1) {
+        .each([](ashiato::Entity, C1& c1) {
             c1.value += 1;
         });
     registry.job<C2>(0)
         .max_threads(BenchmarkThreadPool::thread_count)
         .min_entities_per_thread(1024)
-        .each([](ecs::Entity, C2& c2) {
+        .each([](ashiato::Entity, C2& c2) {
             c2.value += 1;
         });
     registry.job<C3>(0)
         .max_threads(BenchmarkThreadPool::thread_count)
         .min_entities_per_thread(1024)
-        .each([](ecs::Entity, C3& c3) {
+        .each([](ashiato::Entity, C3& c3) {
             c3.value += 1;
         });
 
     BenchmarkThreadPool thread_pool(BenchmarkThreadPool::thread_count);
-    registry.set_job_thread_executor([&thread_pool](const std::vector<ecs::JobThreadTask>& tasks) {
+    registry.set_job_thread_executor([&thread_pool](const std::vector<ashiato::JobThreadTask>& tasks) {
         thread_pool.run(tasks);
     });
 
