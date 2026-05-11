@@ -412,6 +412,19 @@ Destroying a component entity unregisters that component, clears its typed cache
 
 ## Build
 
+Build only the static library:
+
+```bash
+cmake -S . -B build-static \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DASHIATO_BUILD_STATIC_LIBRARY_ONLY=ON
+cmake --build build-static --target ashiato
+```
+
+This produces the static archive under the configured build tree, for example
+`build-static/libashiato.a` on Unix-like generators. The `ashiato::ashiato`
+CMake target exposes the public include directory for consumers.
+
 ```bash
 cmake -S . -B build -DASHIATO_BUILD_TESTING=ON
 cmake --build build
