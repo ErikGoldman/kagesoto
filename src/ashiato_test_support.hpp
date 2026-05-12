@@ -242,6 +242,17 @@ struct HasRegistryRemove<
     std::void_t<decltype(std::declval<Registry&>().template remove<T>(std::declval<ashiato::Entity>()))>>
     : std::true_type {};
 
+template <typename Registry, typename T, typename = void>
+struct HasRegistryEachAdded : std::false_type {};
+
+template <typename Registry, typename T>
+struct HasRegistryEachAdded<
+    Registry,
+    T,
+    std::void_t<decltype(std::declval<const Registry&>().template each_added<T>(
+        std::declval<void (*)(ashiato::Entity, const void*)>()))>>
+    : std::true_type {};
+
 template <typename Registry, typename Components, typename = void>
 struct HasRegistryView : std::false_type {};
 

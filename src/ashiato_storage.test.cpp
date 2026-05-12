@@ -18,6 +18,12 @@ TEST_CASE("dirty component iteration exposes current values and removal tombston
     REQUIRE(registry.remove<Position>(second));
     REQUIRE(registry.destroy(destroyed));
 
+    std::vector<ashiato::Entity> added_entities;
+    registry.each_added<Position>([&](ashiato::Entity entity, const void*) {
+        added_entities.push_back(entity);
+    });
+    REQUIRE(added_entities.empty());
+
     std::vector<ashiato::Entity> dirty_entities;
     std::vector<Position> dirty_values;
     registry.each_dirty<Position>([&](ashiato::Entity entity, const void* value) {
@@ -51,15 +57,147 @@ TEST_CASE("dirty component iteration exposes current values and removal tombston
     registry.clear_all_dirty<Position>();
 
     int dirty_count = 0;
+    int added_count = 0;
     int removal_count = 0;
     registry.each_dirty<Position>([&](ashiato::Entity, const void*) {
         ++dirty_count;
+    });
+    registry.each_added<Position>([&](ashiato::Entity, const void*) {
+        ++added_count;
     });
     registry.each_removed<Position>([&](ashiato::Registry::ComponentRemoval) {
         ++removal_count;
     });
     REQUIRE(dirty_count == 0);
+    REQUIRE(added_count == 0);
     REQUIRE(removal_count == 0);
+}
+
+TEST_CASE("dirty component iteration exposes additions separately from writes") {
+    ashiato::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ashiato::Entity added = registry.create();
+    const ashiato::Entity replaced = registry.create();
+    const ashiato::Entity written = registry.create();
+
+    REQUIRE(registry.add<Position>(replaced, Position{1, 2}) != nullptr);
+    REQUIRE(registry.add<Position>(written, Position{3, 4}) != nullptr);
+    registry.clear_all_dirty<Position>();
+
+    REQUIRE(registry.add<Position>(added, Position{5, 6}) != nullptr);
+    REQUIRE(registry.add<Position>(replaced, Position{7, 8}) != nullptr);
+    registry.write<Position>(written).x = 9;
+
+    std::vector<ashiato::Entity> additions;
+    std::vector<Position> added_values;
+    registry.each_added<Position>([&](ashiato::Entity entity, const void* value) {
+        additions.push_back(entity);
+        added_values.push_back(*static_cast<const Position*>(value));
+    });
+
+    REQUIRE(additions == std::vector<ashiato::Entity>{added});
+    REQUIRE(added_values.size() == 1);
+    REQUIRE(added_values[0].x == 5);
+    REQUIRE(added_values[0].y == 6);
+
+    std::vector<ashiato::Entity> dirty;
+    registry.each_dirty<Position>([&](ashiato::Entity entity, const void*) {
+        dirty.push_back(entity);
+    });
+    REQUIRE(dirty.size() == 3);
+    REQUIRE(std::find(dirty.begin(), dirty.end(), added) != dirty.end());
+    REQUIRE(std::find(dirty.begin(), dirty.end(), replaced) != dirty.end());
+    REQUIRE(std::find(dirty.begin(), dirty.end(), written) != dirty.end());
+
+    REQUIRE(registry.clear_dirty<Position>(added));
+    additions.clear();
+    registry.each_added<Position>([&](ashiato::Entity entity, const void*) {
+        additions.push_back(entity);
+    });
+    REQUIRE(additions.empty());
+}
+
+TEST_CASE("dirty component addition tracking collapses add remove and remove add") {
+    ashiato::Registry registry;
+    registry.register_component<Position>("Position");
+
+    const ashiato::Entity added_then_removed = registry.create();
+    const ashiato::Entity removed_then_added = registry.create();
+    REQUIRE(registry.add<Position>(removed_then_added, Position{1, 2}) != nullptr);
+    registry.clear_all_dirty<Position>();
+
+    REQUIRE(registry.add<Position>(added_then_removed, Position{3, 4}) != nullptr);
+    REQUIRE(registry.remove<Position>(added_then_removed));
+    REQUIRE(registry.remove<Position>(removed_then_added));
+    REQUIRE(registry.add<Position>(removed_then_added, Position{5, 6}) != nullptr);
+
+    std::vector<ashiato::Entity> additions;
+    registry.each_added<Position>([&](ashiato::Entity entity, const void*) {
+        additions.push_back(entity);
+    });
+    REQUIRE(additions == std::vector<ashiato::Entity>{removed_then_added});
+
+    std::vector<ashiato::Registry::ComponentRemoval> removals;
+    registry.each_removed<Position>([&](ashiato::Registry::ComponentRemoval removal) {
+        removals.push_back(removal);
+    });
+    REQUIRE(removals.size() == 1);
+    REQUIRE(removals[0].entity_index == ashiato::Registry::entity_index(added_then_removed));
+    REQUIRE_FALSE(removals[0].entity_destroyed);
+}
+
+TEST_CASE("runtime and tag component additions are exposed through dirty tracking") {
+    ashiato::Registry registry;
+    ashiato::ComponentDesc velocity_desc;
+    velocity_desc.name = "Velocity";
+    velocity_desc.size = sizeof(Velocity);
+    velocity_desc.alignment = alignof(Velocity);
+    const ashiato::Entity velocity_component = registry.register_component(velocity_desc);
+    const ashiato::Entity visible = registry.register_tag("Visible");
+
+    const ashiato::Entity runtime_entity = registry.create();
+    const ashiato::Entity tag_entity = registry.create();
+    const Velocity velocity{1.5f, 2.5f};
+    REQUIRE(registry.add(runtime_entity, velocity_component, &velocity) != nullptr);
+    REQUIRE(registry.add_tag(tag_entity, visible));
+
+    std::vector<ashiato::Entity> runtime_additions;
+    registry.each_added(velocity_component, [&](ashiato::Entity entity, const void* value) {
+        runtime_additions.push_back(entity);
+        REQUIRE(static_cast<const Velocity*>(value)->dx == 1.5f);
+    });
+    REQUIRE(runtime_additions == std::vector<ashiato::Entity>{runtime_entity});
+
+    std::vector<ashiato::Entity> tag_additions;
+    registry.each_added(visible, [&](ashiato::Entity entity, const void* value) {
+        tag_additions.push_back(entity);
+        REQUIRE(value == nullptr);
+    });
+    REQUIRE(tag_additions == std::vector<ashiato::Entity>{tag_entity});
+}
+
+TEST_CASE("native snapshots preserve dirty component addition tracking") {
+    ashiato::Registry source;
+    source.register_component<Position>("Position");
+    const ashiato::Entity entity = source.create();
+    REQUIRE(source.add<Position>(entity, Position{7, 8}) != nullptr);
+
+    const ashiato::Registry::Snapshot snapshot = source.create_snapshot();
+    std::stringstream stream;
+    snapshot.write_native(stream);
+
+    ashiato::Registry replay;
+    replay.register_component<Position>("Position");
+    replay.restore_snapshot(ashiato::Registry::Snapshot::read_native(stream));
+
+    std::vector<ashiato::Entity> additions;
+    replay.each_added<Position>([&](ashiato::Entity added, const void* value) {
+        additions.push_back(added);
+        REQUIRE(static_cast<const Position*>(value)->x == 7);
+    });
+    REQUIRE(additions.size() == 1);
+    REQUIRE(ashiato::Registry::entity_index(additions[0]) == ashiato::Registry::entity_index(entity));
 }
 
 TEST_CASE("runtime components use component entities and the shared write path") {

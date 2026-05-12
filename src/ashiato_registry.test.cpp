@@ -260,6 +260,8 @@ TEST_CASE("singleton components are created at registration and expose no-entity
     static_assert(!HasRegistryRemove<ashiato::Registry, GameTime>::value, "singletons cannot be removed per entity");
     static_assert(HasRegistryAdd<ashiato::Registry, Position>::value, "regular components can be added per entity");
     static_assert(HasRegistryRemove<ashiato::Registry, Position>::value, "regular components can be removed per entity");
+    static_assert(HasRegistryEachAdded<ashiato::Registry, Position>::value, "regular components expose dirty additions");
+    static_assert(!HasRegistryEachAdded<ashiato::Registry, GameTime>::value, "singletons do not expose dirty additions");
 
     ashiato::Registry registry;
     const ashiato::Entity game_time_component = registry.register_component<GameTime>("GameTime");
@@ -267,6 +269,9 @@ TEST_CASE("singleton components are created at registration and expose no-entity
     const GameTime& initial = registry.get<GameTime>();
     REQUIRE(initial.tick == 0);
     REQUIRE(registry.is_dirty<GameTime>());
+    REQUIRE_THROWS_AS(
+        registry.each_added(game_time_component, [](ashiato::Entity, const void*) {}),
+        std::logic_error);
 
     REQUIRE(registry.clear_dirty<GameTime>());
     REQUIRE_FALSE(registry.is_dirty<GameTime>());

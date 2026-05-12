@@ -647,7 +647,10 @@ public:
         ensure_typed_capacity(id);
         component_catalog_.typed_components[id] = component;
         if constexpr (is_singleton_component<T>::value) {
-            storage_for(component).template emplace_or_replace<T>(entity_index(singleton_entity()));
+            const Entity singleton = singleton_entity();
+            TypeErasedStorage& storage = storage_for(component);
+            storage.template emplace_or_replace<T>(entity_index(singleton));
+            storage.clear_added(entity_index(singleton));
         }
         return component;
     }
@@ -893,6 +896,18 @@ public:
         dirty_each(component, std::forward<Fn>(fn));
     }
 
+    template <typename T, typename Fn, typename std::enable_if<!is_singleton_component<T>::value, int>::type = 0>
+    void each_added(Fn&& fn) const {
+        require_runtime_registry_access_allowed("each_added");
+        dirty_each_added<T>(std::forward<Fn>(fn));
+    }
+
+    template <typename Fn>
+    void each_added(Entity component, Fn&& fn) const {
+        require_runtime_registry_access_allowed("each_added");
+        dirty_each_added(component, std::forward<Fn>(fn));
+    }
+
     template <typename T, typename Fn>
     void each_removed(Fn&& fn) const {
         require_runtime_registry_access_allowed("each_removed");
@@ -943,6 +958,20 @@ public:
         void each_dirty(Entity component, Fn&& fn) const {
             if (registry_ != nullptr) {
                 registry_->dirty_each(component, std::forward<Fn>(fn));
+            }
+        }
+
+        template <typename T, typename Fn, typename std::enable_if<!is_singleton_component<T>::value, int>::type = 0>
+        void each_added(Fn&& fn) const {
+            if (registry_ != nullptr) {
+                registry_->dirty_each_added<T>(std::forward<Fn>(fn));
+            }
+        }
+
+        template <typename Fn>
+        void each_added(Entity component, Fn&& fn) const {
+            if (registry_ != nullptr) {
+                registry_->dirty_each_added(component, std::forward<Fn>(fn));
             }
         }
 
@@ -1127,6 +1156,30 @@ private:
         });
     }
 
+    template <typename T, typename Fn, typename std::enable_if<!is_singleton_component<T>::value, int>::type = 0>
+    void dirty_each_added(Fn&& fn) const {
+        const Entity component = registered_component<T>();
+        dirty_each_added(component, std::forward<Fn>(fn));
+    }
+
+    template <typename Fn>
+    void dirty_each_added(Entity component, Fn&& fn) const {
+        const ComponentRecord& record = require_component_record(component);
+        if (record.singleton) {
+            throw std::logic_error("ashiato singleton components do not track additions");
+        }
+
+        const auto* found = find_storage(component);
+        if (found == nullptr) {
+            return;
+        }
+
+        Fn& callback = fn;
+        found->each_added([&](std::uint32_t index, const void* value) {
+            callback(Entity{entity_store_.slots[index]}, value);
+        });
+    }
+
     template <typename T, typename Fn>
     void dirty_each_removed(Fn&& fn) const {
         const Entity component = registered_component<T>();
@@ -1226,7 +1279,9 @@ private:
             const std::uint32_t dense = static_cast<std::uint32_t>(size_);
             dense_indices_.push_back(index);
             dirty_.push_back(1);
+            added_.push_back(1);
             ++dirty_count_;
+            ++added_count_;
             sparse_[index] = dense;
             void* target = data_ + size_ * info_.size;
             new (target) T(std::forward<Args>(args)...);
@@ -1248,6 +1303,7 @@ private:
         const void* get_unchecked(std::uint32_t index) const;
         void* write_unchecked(std::uint32_t index);
         bool clear_dirty(std::uint32_t index);
+        bool clear_added(std::uint32_t index);
         bool is_dirty(std::uint32_t index) const;
         void clear_all_dirty();
         void mark_dirty(std::uint32_t index);
@@ -1262,6 +1318,17 @@ private:
             Fn& callback = fn;
             for (std::size_t dense = 0; dense < size_; ++dense) {
                 if (dirty_[dense] == 0) {
+                    continue;
+                }
+                callback(dense_indices_[dense], info_.tag ? nullptr : get_dense(dense));
+            }
+        }
+
+        template <typename Fn>
+        void each_added(Fn&& fn) const {
+            Fn& callback = fn;
+            for (std::size_t dense = 0; dense < size_; ++dense) {
+                if (added_[dense] == 0) {
                     continue;
                 }
                 callback(dense_indices_[dense], info_.tag ? nullptr : get_dense(dense));
@@ -1353,6 +1420,7 @@ private:
         bool has_tombstone(std::uint32_t index) const;
         void mark_dirty_dense(std::uint32_t dense);
         void clear_dirty_dense(std::uint32_t dense);
+        void clear_added_dense(std::uint32_t dense);
         void mark_dirty_or_defer(std::uint32_t index, std::uint32_t dense);
         void erase_tombstone_index(std::uint32_t index);
         std::unique_ptr<TypeErasedStorage> clone_compact_filtered(
@@ -1368,12 +1436,14 @@ private:
         std::vector<std::uint32_t> dense_indices_;
         std::vector<std::uint32_t> sparse_;
         std::vector<unsigned char> dirty_;
+        std::vector<unsigned char> added_;
         std::vector<unsigned char> tombstones_;
         std::vector<std::uint32_t> tombstone_indices_;
         unsigned char* data_ = nullptr;
         std::size_t size_ = 0;
         std::size_t capacity_ = 0;
         std::size_t dirty_count_ = 0;
+        std::size_t added_count_ = 0;
         std::size_t tombstone_count_ = 0;
         bool compact_lookup_ = false;
         ComponentInfo info_;
@@ -1679,7 +1749,6 @@ private:
     const ComponentRecord& require_component_record(Entity component) const;
     bool valid_component_field(const ComponentRecord& component, const ComponentField& field) const;
     bool valid_component_fields(const ComponentRecord& component, const std::vector<ComponentField>& fields) const;
-
     TypeErasedStorage& storage_for(Entity component) {
         const ComponentRecord& record = require_component_record(component);
         const std::uint32_t component_index = entity_index(component);

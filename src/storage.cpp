@@ -13,9 +13,11 @@ Registry::TypeErasedStorage::TypeErasedStorage(const TypeErasedStorage& other)
     : dense_indices_(other.dense_indices_),
       sparse_(other.sparse_),
       dirty_(other.dirty_),
+      added_(other.added_),
       tombstones_(other.tombstone_count_ == 0 ? std::vector<unsigned char>{} : other.tombstones_),
       tombstone_indices_(other.tombstone_count_ == 0 ? std::vector<std::uint32_t>{} : other.tombstone_indices_),
       dirty_count_(other.dirty_count_),
+      added_count_(other.added_count_),
       tombstone_count_(other.tombstone_count_),
       compact_lookup_(other.compact_lookup_),
       info_(other.info_),
@@ -36,12 +38,14 @@ Registry::TypeErasedStorage::TypeErasedStorage(TypeErasedStorage&& other) noexce
     : dense_indices_(std::move(other.dense_indices_)),
       sparse_(std::move(other.sparse_)),
       dirty_(std::move(other.dirty_)),
+      added_(std::move(other.added_)),
       tombstones_(std::move(other.tombstones_)),
       tombstone_indices_(std::move(other.tombstone_indices_)),
       data_(other.data_),
       size_(other.size_),
       capacity_(other.capacity_),
       dirty_count_(other.dirty_count_),
+      added_count_(other.added_count_),
       tombstone_count_(other.tombstone_count_),
       compact_lookup_(other.compact_lookup_),
       info_(other.info_),
@@ -51,6 +55,7 @@ Registry::TypeErasedStorage::TypeErasedStorage(TypeErasedStorage&& other) noexce
     other.size_ = 0;
     other.capacity_ = 0;
     other.dirty_count_ = 0;
+    other.added_count_ = 0;
     other.tombstone_count_ = 0;
     other.compact_lookup_ = false;
 }
@@ -62,12 +67,14 @@ Registry::TypeErasedStorage& Registry::TypeErasedStorage::operator=(TypeErasedSt
         dense_indices_ = std::move(other.dense_indices_);
         sparse_ = std::move(other.sparse_);
         dirty_ = std::move(other.dirty_);
+        added_ = std::move(other.added_);
         tombstones_ = std::move(other.tombstones_);
         tombstone_indices_ = std::move(other.tombstone_indices_);
         data_ = other.data_;
         size_ = other.size_;
         capacity_ = other.capacity_;
         dirty_count_ = other.dirty_count_;
+        added_count_ = other.added_count_;
         tombstone_count_ = other.tombstone_count_;
         compact_lookup_ = other.compact_lookup_;
         info_ = other.info_;
@@ -77,6 +84,7 @@ Registry::TypeErasedStorage& Registry::TypeErasedStorage::operator=(TypeErasedSt
         other.size_ = 0;
         other.capacity_ = 0;
         other.dirty_count_ = 0;
+        other.added_count_ = 0;
         other.tombstone_count_ = 0;
         other.compact_lookup_ = false;
     }
@@ -105,7 +113,9 @@ void Registry::TypeErasedStorage::emplace_or_replace_tag(std::uint32_t index) {
     const std::uint32_t dense = static_cast<std::uint32_t>(size_);
     dense_indices_.push_back(index);
     dirty_.push_back(1);
+    added_.push_back(1);
     ++dirty_count_;
+    ++added_count_;
     sparse_[index] = dense;
     ++size_;
 }
@@ -131,7 +141,9 @@ void* Registry::TypeErasedStorage::emplace_or_replace_bytes(std::uint32_t index,
     const std::uint32_t dense = static_cast<std::uint32_t>(size_);
     dense_indices_.push_back(index);
     dirty_.push_back(1);
+    added_.push_back(1);
     ++dirty_count_;
+    ++added_count_;
     sparse_[index] = dense;
     void* target = data_ + size_ * info_.size;
     assign_bytes(target, value);
@@ -157,7 +169,9 @@ void Registry::TypeErasedStorage::emplace_or_replace_copy(std::uint32_t index, c
     const std::uint32_t dense = static_cast<std::uint32_t>(size_);
     dense_indices_.push_back(index);
     dirty_.push_back(1);
+    added_.push_back(1);
     ++dirty_count_;
+    ++added_count_;
     sparse_[index] = dense;
     construct_copy(data_ + size_ * info_.size, value);
     ++size_;
@@ -262,6 +276,16 @@ bool Registry::TypeErasedStorage::clear_dirty(std::uint32_t index) {
     }
 
     clear_dirty_dense(sparse_[index]);
+    clear_added_dense(sparse_[index]);
+    return true;
+}
+
+bool Registry::TypeErasedStorage::clear_added(std::uint32_t index) {
+    if (!contains(index)) {
+        return false;
+    }
+
+    clear_added_dense(sparse_[index]);
     return true;
 }
 
@@ -275,9 +299,11 @@ bool Registry::TypeErasedStorage::is_dirty(std::uint32_t index) const {
 
 void Registry::TypeErasedStorage::clear_all_dirty() {
     std::fill(dirty_.begin(), dirty_.end(), std::uint8_t{0});
+    std::fill(added_.begin(), added_.end(), std::uint8_t{0});
     std::fill(tombstones_.begin(), tombstones_.end(), no_tombstone);
     tombstone_indices_.clear();
     dirty_count_ = 0;
+    added_count_ = 0;
     tombstone_count_ = 0;
 }
 
@@ -305,7 +331,7 @@ bool Registry::TypeErasedStorage::contains_index(std::uint32_t index) const {
 }
 
 bool Registry::TypeErasedStorage::has_dirty_entries() const {
-    return dirty_count_ != 0 || tombstone_count_ != 0;
+    return dirty_count_ != 0 || added_count_ != 0 || tombstone_count_ != 0;
 }
 
 bool Registry::TypeErasedStorage::has_destroy_tombstone(std::uint32_t index) const {
@@ -399,6 +425,9 @@ void Registry::TypeErasedStorage::swap_dense(std::uint32_t lhs, std::uint32_t rh
     const unsigned char lhs_dirty = dirty_[lhs];
     dirty_[lhs] = dirty_[rhs];
     dirty_[rhs] = lhs_dirty;
+    const unsigned char lhs_added = added_[lhs];
+    added_[lhs] = added_[rhs];
+    added_[rhs] = lhs_added;
 }
 
 void Registry::TypeErasedStorage::move_index_to_dense(std::uint32_t index, std::uint32_t dense) {
@@ -576,6 +605,7 @@ void Registry::TypeErasedStorage::erase_at(std::uint32_t dense) {
     const std::uint32_t removed_index = dense_indices_[dense];
     const std::uint32_t last_dense = static_cast<std::uint32_t>(size_ - 1);
     clear_dirty_dense(dense);
+    clear_added_dense(dense);
 
     if (dense != last_dense) {
         const std::uint32_t moved_index = dense_indices_[last_dense];
@@ -595,6 +625,7 @@ void Registry::TypeErasedStorage::erase_at(std::uint32_t dense) {
 
         dense_indices_[dense] = moved_index;
         dirty_[dense] = dirty_[last_dense];
+        added_[dense] = added_[last_dense];
         sparse_[moved_index] = dense;
     } else if (!info_.tag && !info_.trivially_copyable) {
         unsigned char* target = data_ + dense * info_.size;
@@ -604,6 +635,7 @@ void Registry::TypeErasedStorage::erase_at(std::uint32_t dense) {
     sparse_[removed_index] = npos;
     dense_indices_.pop_back();
     dirty_.pop_back();
+    added_.pop_back();
     --size_;
 }
 
@@ -617,10 +649,12 @@ void Registry::TypeErasedStorage::clear() noexcept {
     size_ = 0;
     dense_indices_.clear();
     dirty_.clear();
+    added_.clear();
     std::fill(sparse_.begin(), sparse_.end(), npos);
     std::fill(tombstones_.begin(), tombstones_.end(), no_tombstone);
     tombstone_indices_.clear();
     dirty_count_ = 0;
+    added_count_ = 0;
     tombstone_count_ = 0;
 }
 
@@ -680,6 +714,13 @@ void Registry::TypeErasedStorage::clear_dirty_dense(std::uint32_t dense) {
     }
 }
 
+void Registry::TypeErasedStorage::clear_added_dense(std::uint32_t dense) {
+    if (added_[dense] != 0) {
+        added_[dense] = 0;
+        --added_count_;
+    }
+}
+
 void Registry::TypeErasedStorage::mark_dirty_or_defer(std::uint32_t index, std::uint32_t dense) {
     if (deferred_dirty_writes_ != nullptr) {
         deferred_dirty_writes_->push_back(DeferredDirtyWrite{this, index});
@@ -704,8 +745,10 @@ std::unique_ptr<Registry::TypeErasedStorage> Registry::TypeErasedStorage::clone_
     if (!dirty_only && !has_excluded_storage_entries(excluded)) {
         copy->dense_indices_ = dense_indices_;
         copy->dirty_ = dirty_;
+        copy->added_ = added_;
         copy->capacity_ = size_;
         copy->dirty_count_ = dirty_count_;
+        copy->added_count_ = added_count_;
         if (info_.tag) {
             copy->size_ = size_;
         } else if (copy->capacity_ != 0) {
@@ -731,6 +774,7 @@ std::unique_ptr<Registry::TypeErasedStorage> Registry::TypeErasedStorage::clone_
     const std::size_t capacity_hint = dirty_only ? dirty_count_ : size_;
     copy->dense_indices_.reserve(capacity_hint);
     copy->dirty_.reserve(capacity_hint);
+    copy->added_.reserve(capacity_hint);
     if (!info_.tag && capacity_hint != 0) {
         copy->capacity_ = capacity_hint;
         copy->data_ = allocate(copy->capacity_, info_);
@@ -750,8 +794,12 @@ std::unique_ptr<Registry::TypeErasedStorage> Registry::TypeErasedStorage::clone_
 
         copy->dense_indices_.push_back(index);
         copy->dirty_.push_back(dirty_[dense]);
+        copy->added_.push_back(added_[dense]);
         if (dirty_[dense] != 0) {
             ++copy->dirty_count_;
+        }
+        if (added_[dense] != 0) {
+            ++copy->added_count_;
         }
         ++copy->size_;
     }

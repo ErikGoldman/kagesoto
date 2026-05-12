@@ -217,6 +217,7 @@ void write_storage(std::ostream& out, const Registry::TypeErasedStorage& storage
     for (std::size_t dense = 0; dense < storage.dense_size(); ++dense) {
         detail::write_pod<std::uint32_t>(out, storage.dense_index_at(dense));
         detail::write_pod<std::uint8_t>(out, storage.dirty_[dense]);
+        detail::write_pod<std::uint8_t>(out, storage.added_[dense]);
         if (!storage.info_.tag) {
             detail::write_exact(out, storage.get_dense(dense), storage.info_.size);
         }
@@ -236,6 +237,7 @@ std::unique_ptr<Registry::TypeErasedStorage> read_storage(
     for (std::uint64_t dense = 0; dense < dense_count; ++dense) {
         const auto entity_index = detail::read_pod<std::uint32_t>(in);
         const auto dirty = detail::read_pod<std::uint8_t>(in);
+        const auto added = detail::read_pod<std::uint8_t>(in);
         if (record.info.tag) {
             storage->emplace_or_replace_tag(entity_index);
         } else {
@@ -247,6 +249,8 @@ std::unique_ptr<Registry::TypeErasedStorage> read_storage(
         }
         if (dirty == 0U) {
             storage->clear_dirty(entity_index);
+        } else if (added == 0U) {
+            storage->clear_added_dense(storage->dense_position(entity_index));
         }
     }
     const auto tombstone_count = detail::read_pod<std::uint64_t>(in);

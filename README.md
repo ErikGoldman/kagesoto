@@ -332,6 +332,12 @@ std::string text = registry.debug_print(entity, position_type);
 - `void Registry::clear_all_dirty<T>()`
 - `void Registry::clear_all_dirty(Entity component)`
 - `Entity Registry::system_tag() const`
+- `void Registry::each_dirty<T>(Fn&& fn) const`
+- `void Registry::each_dirty(Entity component, Fn&& fn) const`
+- `void Registry::each_added<T>(Fn&& fn) const`
+- `void Registry::each_added(Entity component, Fn&& fn) const`
+- `void Registry::each_removed<T>(Fn&& fn) const`
+- `void Registry::each_removed(Entity component, Fn&& fn) const`
 - `Registry::Snapshot Registry::create_snapshot() const`
 - `Registry::DeltaSnapshot Registry::create_delta_snapshot(const Registry::Snapshot& baseline) const`
 - `Registry::DeltaSnapshot Registry::create_delta_snapshot(const Registry::DeltaSnapshot& baseline) const`
