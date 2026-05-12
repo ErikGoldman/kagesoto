@@ -1217,6 +1217,12 @@ void Registry::restore_snapshot(const Snapshot& snapshot) {
     entity_store_.free_head = free_head;
     component_catalog_.records = snapshot.components_;
     component_catalog_.names = snapshot.component_names_;
+    component_catalog_.type_keys.clear();
+    for (const auto& component : component_catalog_.records) {
+        if (!component.second.type_key.empty()) {
+            component_catalog_.type_keys[component.second.type_key] = component.first;
+        }
+    }
     storage_registry_.storages = std::move(storages);
     rebind_typed_components_by_registered_names();
     group_index_.groups = std::move(groups);

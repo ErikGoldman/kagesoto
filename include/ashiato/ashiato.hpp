@@ -24,6 +24,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 #include <typeinfo>
@@ -48,6 +49,11 @@ namespace ashiato {
 template <typename T>
 struct is_singleton_component : std::false_type {};
 
+template <typename T>
+struct component_type_key {
+    inline static constexpr std::string_view value{};
+};
+
 class ComponentSerializationRegistry;
 class PersistentSnapshotAccess;
 
@@ -66,6 +72,33 @@ struct type_list_concat<type_list<Left...>, type_list<Right...>> {
 
 template <typename T>
 using component_query_t = typename std::remove_cv<typename std::remove_reference<T>::type>::type;
+
+template <typename T>
+inline std::string_view compiler_component_type_key() noexcept {
+#if defined(_MSC_VER)
+    return __FUNCSIG__;
+#elif defined(__clang__) || defined(__GNUC__)
+    return __PRETTY_FUNCTION__;
+#else
+    return typeid(T).name();
+#endif
+}
+
+template <typename T>
+inline std::string_view component_type_key_value() noexcept {
+    using Component = component_query_t<T>;
+    if constexpr (!ashiato::component_type_key<Component>::value.empty()) {
+        return ashiato::component_type_key<Component>::value;
+    } else {
+        return compiler_component_type_key<Component>();
+    }
+}
+
+template <typename T>
+const void* component_type_token() noexcept {
+    static const char token = 0;
+    return &token;
+}
 
 template <typename T>
 struct is_singleton_query : is_singleton_component<component_query_t<T>> {};
@@ -604,9 +637,9 @@ public:
             std::is_trivially_copyable<T>::value || std::is_nothrow_move_constructible<T>::value,
             "ashiato non-trivially-copyable components must be nothrow move constructible");
 
-        const std::size_t id = type_id<T>();
-        if (id < component_catalog_.typed_components.size() && component_catalog_.typed_components[id]) {
-            const Entity component = component_catalog_.typed_components[id];
+        const void* token = type_token<T>();
+        if (const TypedComponentBinding* binding = find_typed_binding(token)) {
+            const Entity component = binding->component;
             if constexpr (is_singleton_component<T>::value) {
                 TypeErasedStorage& storage = storage_for(component);
                 const std::uint32_t singleton_index = entity_index(singleton_entity());
@@ -642,10 +675,11 @@ public:
             std::is_trivially_copyable<T>::value,
             is_singleton_component<T>::value,
             detail::is_tag_query<T>::value,
-            id);
+            std::string(type_key<T>()));
 
         record_typed_component_binding(
-            id,
+            token,
+            std::string(type_key<T>()),
             component_catalog_.records.at(entity_index(component)).name,
             ComponentInfo{
                 detail::is_tag_query<T>::value ? 0 : sizeof(T),
@@ -653,8 +687,17 @@ public:
                 std::is_trivially_copyable<T>::value,
                 detail::is_tag_query<T>::value},
             is_singleton_component<T>::value);
-        ensure_typed_capacity(id);
-        component_catalog_.typed_components[id] = component;
+        bind_typed_component(
+            token,
+            std::string(type_key<T>()),
+            component_catalog_.records.at(entity_index(component)).name,
+            ComponentInfo{
+                detail::is_tag_query<T>::value ? 0 : sizeof(T),
+                alignof(T),
+                std::is_trivially_copyable<T>::value,
+                detail::is_tag_query<T>::value},
+            is_singleton_component<T>::value,
+            component);
         if constexpr (is_singleton_component<T>::value) {
             TypeErasedStorage& storage = storage_for(component);
             const std::uint32_t singleton_index = entity_index(singleton_entity());
@@ -1242,6 +1285,7 @@ private:
     struct ComponentRecord {
         Entity entity;
         std::string name;
+        std::string type_key;
         ComponentInfo info;
         std::vector<ComponentField> fields;
         ComponentLifecycle lifecycle;
@@ -1708,12 +1752,15 @@ private:
         static_cast<T*>(value)->~T();
     }
 
-    static std::size_t next_type_id();
     static std::uint64_t next_state_token();
 
     struct TypedComponentBinding {
+        const void* token = nullptr;
+        std::string type_key;
         std::string name;
         ComponentInfo info;
+        Entity component;
+        TypeErasedStorage* storage = nullptr;
         bool singleton = false;
         bool registered = false;
     };
@@ -1722,28 +1769,87 @@ private:
     static std::mutex& typed_component_bindings_mutex();
 
     template <typename T>
-    static std::size_t type_id() {
-        static const std::size_t id = next_type_id();
-        return id;
+    static const void* type_token() {
+        return detail::component_type_token<detail::component_query_t<T>>();
+    }
+
+    template <typename T>
+    static std::string_view type_key() {
+        return detail::component_type_key_value<detail::component_query_t<T>>();
     }
 
     static void record_typed_component_binding(
-        std::size_t id,
+        const void* token,
+        std::string type_key,
         std::string name,
         ComponentInfo info,
         bool singleton);
 
     void rebind_typed_components_by_registered_names();
-    void ensure_typed_capacity(std::size_t id);
+    const TypedComponentBinding* find_typed_binding(const void* token) const;
+    TypedComponentBinding* find_typed_binding(const void* token);
+    std::size_t bind_typed_component(
+        const void* token,
+        std::string type_key,
+        std::string name,
+        ComponentInfo info,
+        bool singleton,
+        Entity component) const;
+    void refresh_typed_storage_bindings(Entity component, TypeErasedStorage* storage) const;
 
     template <typename T>
     Entity registered_component() const {
-        const std::size_t id = type_id<T>();
-        if (id >= component_catalog_.typed_components.size() || !component_catalog_.typed_components[id]) {
-            throw std::logic_error("ashiato component type is not registered");
+        const void* token = type_token<T>();
+        if (const TypedComponentBinding* binding = find_typed_binding(token)) {
+            return binding->component;
         }
 
-        return component_catalog_.typed_components[id];
+        const std::string key(type_key<T>());
+        const auto found = component_catalog_.typed_bindings_by_type_key.find(key);
+        if (found == component_catalog_.typed_bindings_by_type_key.end()) {
+            const auto found_component = component_catalog_.type_keys.find(key);
+            if (found_component == component_catalog_.type_keys.end()) {
+                throw std::logic_error("ashiato component type is not registered");
+            }
+
+            const auto found_record = component_catalog_.records.find(found_component->second);
+            if (found_record == component_catalog_.records.end()) {
+                throw std::logic_error("ashiato component type is not registered");
+            }
+
+            const ComponentInfo requested_info{
+                detail::is_tag_query<T>::value ? 0 : sizeof(T),
+                alignof(T),
+                std::is_trivially_copyable<T>::value,
+                detail::is_tag_query<T>::value};
+            const ComponentRecord& record = found_record->second;
+            if (record.info.size != requested_info.size ||
+                record.info.alignment != requested_info.alignment ||
+                record.info.trivially_copyable != requested_info.trivially_copyable ||
+                record.info.tag != requested_info.tag ||
+                record.singleton != is_singleton_component<T>::value) {
+                throw std::logic_error("registered component metadata does not match T");
+            }
+
+            bind_typed_component(
+                token,
+                key,
+                record.name,
+                requested_info,
+                is_singleton_component<T>::value,
+                record.entity);
+            return record.entity;
+        }
+
+        const TypedComponentBinding& existing = component_catalog_.typed_bindings[found->second];
+        bind_typed_component(
+            token,
+            std::string(type_key<T>()),
+            existing.name,
+            existing.info,
+            existing.singleton,
+            existing.component);
+        return existing.component;
     }
 
     Entity singleton_entity();
@@ -1753,7 +1859,7 @@ private:
         bool trivially_copyable,
         bool singleton,
         bool tag,
-        std::size_t typed_id);
+        std::string type_key);
     ComponentRecord* find_component_record(Entity component);
     const ComponentRecord* find_component_record(Entity component) const;
     ComponentRecord& require_component_record(Entity component);
@@ -1771,10 +1877,7 @@ private:
             bump_view_topology_token();
         }
 
-        if (record.type_id != npos_type_id) {
-            ensure_typed_capacity(record.type_id);
-            storage_registry_.typed_storages[record.type_id] = found->second.get();
-        }
+        refresh_typed_storage_bindings(component, found->second.get());
 
         return *found->second;
     }
@@ -1788,14 +1891,24 @@ private:
 
     template <typename T>
     TypeErasedStorage* typed_storage() {
-        const std::size_t id = type_id<T>();
-        return id < storage_registry_.typed_storages.size() ? storage_registry_.typed_storages[id] : nullptr;
+        const void* token = type_token<T>();
+        if (TypedComponentBinding* binding = find_typed_binding(token)) {
+            return binding->storage;
+        }
+        registered_component<T>();
+        TypedComponentBinding* binding = find_typed_binding(token);
+        return binding != nullptr ? binding->storage : nullptr;
     }
 
     template <typename T>
     const TypeErasedStorage* typed_storage() const {
-        const std::size_t id = type_id<T>();
-        return id < storage_registry_.typed_storages.size() ? storage_registry_.typed_storages[id] : nullptr;
+        const void* token = type_token<T>();
+        if (const TypedComponentBinding* binding = find_typed_binding(token)) {
+            return binding->storage;
+        }
+        registered_component<T>();
+        const TypedComponentBinding* binding = find_typed_binding(token);
+        return binding != nullptr ? binding->storage : nullptr;
     }
 
     void rebuild_typed_storages();
@@ -1871,7 +1984,11 @@ private:
     struct ComponentCatalog {
         std::unordered_map<std::uint32_t, ComponentRecord> records;
         std::unordered_map<std::string, std::uint32_t> names;
-        std::vector<Entity> typed_components;
+        std::unordered_map<std::string, std::uint32_t> type_keys;
+        mutable std::vector<Entity> typed_components;
+        mutable std::unordered_map<const void*, std::size_t> typed_bindings_by_token;
+        mutable std::unordered_map<std::string, std::size_t> typed_bindings_by_type_key;
+        mutable std::vector<TypedComponentBinding> typed_bindings;
         Entity singleton_entity;
         Entity primitive_types[8]{};
         Entity system_tag;
@@ -1880,7 +1997,6 @@ private:
 
     struct StorageRegistry {
         std::unordered_map<std::uint32_t, std::unique_ptr<TypeErasedStorage>> storages;
-        std::vector<TypeErasedStorage*> typed_storages;
         std::uint64_t view_topology_token = 1;
     };
 

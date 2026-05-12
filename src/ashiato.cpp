@@ -12,7 +12,7 @@ Entity Registry::register_component(ComponentDesc desc) {
     require_runtime_registry_access_allowed("register_component");
     ComponentLifecycle lifecycle;
     lifecycle.trivially_copyable = true;
-    return register_component_impl(std::move(desc), lifecycle, true, false, false, npos_type_id);
+    return register_component_impl(std::move(desc), lifecycle, true, false, false, {});
 }
 
 Entity Registry::register_tag(std::string name) {
@@ -24,7 +24,7 @@ Entity Registry::register_tag(std::string name) {
 
     ComponentLifecycle lifecycle;
     lifecycle.trivially_copyable = true;
-    return register_component_impl(std::move(desc), lifecycle, true, false, true, npos_type_id);
+    return register_component_impl(std::move(desc), lifecycle, true, false, true, {});
 }
 
 Entity Registry::primitive_type(PrimitiveType type) const {
@@ -355,11 +355,6 @@ std::vector<Entity> Registry::job_matching_entities(Entity job) const {
     return result;
 }
 
-std::size_t Registry::next_type_id() {
-    static std::atomic<std::size_t> next{0};
-    return next++;
-}
-
 std::uint64_t Registry::next_state_token() {
     static std::atomic<std::uint64_t> next{1};
     return next++;
@@ -376,16 +371,33 @@ std::mutex& Registry::typed_component_bindings_mutex() {
 }
 
 void Registry::record_typed_component_binding(
-    std::size_t id,
+    const void* token,
+    std::string type_key,
     std::string name,
     ComponentInfo info,
     bool singleton) {
     std::lock_guard<std::mutex> lock(typed_component_bindings_mutex());
     auto& bindings = typed_component_bindings();
-    if (id >= bindings.size()) {
-        bindings.resize(id + 1);
+    const auto found = std::find_if(bindings.begin(), bindings.end(), [&](const TypedComponentBinding& binding) {
+        return binding.type_key == type_key;
+    });
+    if (found != bindings.end()) {
+        found->token = token;
+        found->name = std::move(name);
+        found->info = info;
+        found->singleton = singleton;
+        found->registered = true;
+        return;
     }
-    bindings[id] = TypedComponentBinding{std::move(name), info, singleton, true};
+
+    TypedComponentBinding binding;
+    binding.token = token;
+    binding.type_key = std::move(type_key);
+    binding.name = std::move(name);
+    binding.info = info;
+    binding.singleton = singleton;
+    binding.registered = true;
+    bindings.push_back(std::move(binding));
 }
 
 void Registry::rebind_typed_components_by_registered_names() {
@@ -395,20 +407,23 @@ void Registry::rebind_typed_components_by_registered_names() {
         bindings = typed_component_bindings();
     }
 
-    component_catalog_.typed_components.assign(bindings.size(), Entity{});
-    storage_registry_.typed_storages.assign(bindings.size(), nullptr);
-    for (std::size_t id = 0; id < bindings.size(); ++id) {
-        const TypedComponentBinding& binding = bindings[id];
-        if (!binding.registered || binding.name.empty()) {
+    component_catalog_.typed_components.clear();
+    component_catalog_.typed_bindings.clear();
+    component_catalog_.typed_bindings_by_token.clear();
+    component_catalog_.typed_bindings_by_type_key.clear();
+    for (const TypedComponentBinding& binding : bindings) {
+        if (!binding.registered || binding.type_key.empty()) {
             continue;
         }
 
-        const auto found_name = component_catalog_.names.find(binding.name);
-        if (found_name == component_catalog_.names.end()) {
+        auto found_type = component_catalog_.type_keys.find(binding.type_key);
+        if (found_type == component_catalog_.type_keys.end() && !binding.name.empty()) {
+            found_type = component_catalog_.names.find(binding.name);
+        }
+        if (found_type == component_catalog_.type_keys.end()) {
             continue;
         }
-
-        const auto found_record = component_catalog_.records.find(found_name->second);
+        const auto found_record = component_catalog_.records.find(found_type->second);
         if (found_record == component_catalog_.records.end()) {
             continue;
         }
@@ -422,17 +437,89 @@ void Registry::rebind_typed_components_by_registered_names() {
             throw std::logic_error("restored component metadata does not match registered component type");
         }
 
-        component_catalog_.typed_components[id] = record.entity;
-        const auto found_storage = storage_registry_.storages.find(found_record->first);
-        storage_registry_.typed_storages[id] =
-            found_storage != storage_registry_.storages.end() ? found_storage->second.get() : nullptr;
+        bind_typed_component(
+            binding.token,
+            binding.type_key,
+            record.name,
+            binding.info,
+            binding.singleton,
+            record.entity);
     }
 }
 
-void Registry::ensure_typed_capacity(std::size_t id) {
-    if (id >= component_catalog_.typed_components.size()) {
-        component_catalog_.typed_components.resize(id + 1);
-        storage_registry_.typed_storages.resize(id + 1);
+const Registry::TypedComponentBinding* Registry::find_typed_binding(const void* token) const {
+    const auto found = component_catalog_.typed_bindings_by_token.find(token);
+    if (found == component_catalog_.typed_bindings_by_token.end()) {
+        return nullptr;
+    }
+
+    const std::size_t index = found->second;
+    if (index >= component_catalog_.typed_bindings.size()) {
+        return nullptr;
+    }
+
+    const TypedComponentBinding& binding = component_catalog_.typed_bindings[index];
+    return binding.registered && binding.component ? &binding : nullptr;
+}
+
+Registry::TypedComponentBinding* Registry::find_typed_binding(const void* token) {
+    return const_cast<TypedComponentBinding*>(static_cast<const Registry*>(this)->find_typed_binding(token));
+}
+
+std::size_t Registry::bind_typed_component(
+    const void* token,
+    std::string type_key,
+    std::string name,
+    ComponentInfo info,
+    bool singleton,
+    Entity component) const {
+    const auto found_by_key = component_catalog_.typed_bindings_by_type_key.find(type_key);
+    std::size_t index = 0;
+    if (found_by_key != component_catalog_.typed_bindings_by_type_key.end()) {
+        index = found_by_key->second;
+        TypedComponentBinding& binding = component_catalog_.typed_bindings[index];
+        if (binding.info.size != info.size ||
+            binding.info.alignment != info.alignment ||
+            binding.info.trivially_copyable != info.trivially_copyable ||
+            binding.info.tag != info.tag ||
+            binding.singleton != singleton ||
+            binding.component != component) {
+            throw std::logic_error("component type key is already registered with different metadata");
+        }
+        if (token != nullptr) {
+            component_catalog_.typed_bindings_by_token[token] = index;
+        }
+        return index;
+    }
+
+    TypedComponentBinding binding;
+    binding.token = token;
+    binding.type_key = std::move(type_key);
+    binding.name = std::move(name);
+    binding.info = info;
+    binding.component = component;
+    binding.storage = const_cast<TypeErasedStorage*>(find_storage(component));
+    binding.singleton = singleton;
+    binding.registered = true;
+
+    index = component_catalog_.typed_bindings.size();
+    component_catalog_.typed_bindings_by_type_key[binding.type_key] = index;
+    if (token != nullptr) {
+        component_catalog_.typed_bindings_by_token[token] = index;
+    }
+    component_catalog_.typed_bindings.push_back(std::move(binding));
+    if (component_catalog_.typed_components.size() <= index) {
+        component_catalog_.typed_components.resize(index + 1);
+    }
+    component_catalog_.typed_components[index] = component;
+    return index;
+}
+
+void Registry::refresh_typed_storage_bindings(Entity component, TypeErasedStorage* storage) const {
+    for (TypedComponentBinding& binding : component_catalog_.typed_bindings) {
+        if (binding.component == component) {
+            binding.storage = storage;
+        }
     }
 }
 
@@ -449,7 +536,7 @@ Entity Registry::register_component_impl(
     bool trivially_copyable,
     bool singleton,
     bool tag,
-    std::size_t typed_id) {
+    std::string type_key) {
     if (desc.size == 0 && !tag) {
         throw std::invalid_argument("component size must be greater than zero");
     }
@@ -470,17 +557,32 @@ Entity Registry::register_component_impl(
                 throw std::logic_error("component name is already registered with different metadata");
             }
 
-            if (typed_id != npos_type_id) {
-                if (record.type_id != npos_type_id && record.type_id != typed_id) {
+            if (!type_key.empty()) {
+                if (!record.type_key.empty() && record.type_key != type_key) {
                     throw std::logic_error("component name is already registered for a different component type");
                 }
-                ensure_typed_capacity(typed_id);
-                component_catalog_.typed_components[typed_id] = existing;
-                storage_registry_.typed_storages[typed_id] = find_storage(existing);
-                record.type_id = typed_id;
+                record.type_key = std::move(type_key);
+                component_catalog_.type_keys[record.type_key] = by_name->second;
                 record.lifecycle = lifecycle;
             }
 
+            return existing;
+        }
+    }
+
+    if (!type_key.empty()) {
+        const auto by_type = component_catalog_.type_keys.find(type_key);
+        if (by_type != component_catalog_.type_keys.end()) {
+            const Entity existing = component_catalog_.records.at(by_type->second).entity;
+            ComponentRecord& record = component_catalog_.records.at(by_type->second);
+            if (record.info.size != desc.size ||
+                record.info.alignment != desc.alignment ||
+                record.info.trivially_copyable != trivially_copyable ||
+                record.info.tag != tag ||
+                record.singleton != singleton) {
+                throw std::logic_error("component type key is already registered with different metadata");
+            }
+            record.lifecycle = lifecycle;
             return existing;
         }
     }
@@ -489,18 +591,22 @@ Entity Registry::register_component_impl(
     ComponentRecord record;
     record.entity = component;
     record.name = std::move(desc.name);
+    record.type_key = std::move(type_key);
     record.info = ComponentInfo{desc.size, desc.alignment, trivially_copyable, tag};
     if (!valid_component_fields(record, desc.fields)) {
         throw std::invalid_argument("component field metadata is invalid");
     }
     record.fields = std::move(desc.fields);
     record.lifecycle = lifecycle;
-    record.type_id = typed_id;
+    record.type_id = npos_type_id;
     record.singleton = singleton;
 
     const std::uint32_t index = entity_index(component);
     if (!record.name.empty()) {
         component_catalog_.names[record.name] = index;
+    }
+    if (!record.type_key.empty()) {
+        component_catalog_.type_keys[record.type_key] = index;
     }
     component_catalog_.records[index] = std::move(record);
     return component;
@@ -579,14 +685,14 @@ bool Registry::valid_component_fields(
 }
 
 void Registry::rebuild_typed_storages() {
-    storage_registry_.typed_storages.assign(component_catalog_.typed_components.size(), nullptr);
-    for (const auto& component : component_catalog_.records) {
-        const ComponentRecord& record = component.second;
-        if (record.type_id != npos_type_id && record.type_id < storage_registry_.typed_storages.size()) {
-            const auto found = storage_registry_.storages.find(component.first);
-            storage_registry_.typed_storages[record.type_id] =
-                found != storage_registry_.storages.end() ? found->second.get() : nullptr;
+    for (TypedComponentBinding& binding : component_catalog_.typed_bindings) {
+        binding.storage = nullptr;
+        if (!binding.component) {
+            continue;
         }
+
+        const auto found = storage_registry_.storages.find(entity_index(binding.component));
+        binding.storage = found != storage_registry_.storages.end() ? found->second.get() : nullptr;
     }
 }
 
@@ -615,16 +721,26 @@ void Registry::unregister_component_entity(Entity component) {
     if (!record->name.empty()) {
         component_catalog_.names.erase(record->name);
     }
-
-    if (record->type_id != npos_type_id && record->type_id < component_catalog_.typed_components.size()) {
-        component_catalog_.typed_components[record->type_id] = Entity{};
-        storage_registry_.typed_storages[record->type_id] = nullptr;
+    if (!record->type_key.empty()) {
+        component_catalog_.type_keys.erase(record->type_key);
     }
 
     for (std::size_t index = 0; index < component_catalog_.typed_components.size(); ++index) {
         if (component_catalog_.typed_components[index] == component) {
             component_catalog_.typed_components[index] = Entity{};
-            storage_registry_.typed_storages[index] = nullptr;
+        }
+    }
+
+    for (std::size_t index = 0; index < component_catalog_.typed_bindings.size(); ++index) {
+        TypedComponentBinding& binding = component_catalog_.typed_bindings[index];
+        if (binding.component == component) {
+            if (binding.token != nullptr) {
+                component_catalog_.typed_bindings_by_token.erase(binding.token);
+            }
+            if (!binding.type_key.empty()) {
+                component_catalog_.typed_bindings_by_type_key.erase(binding.type_key);
+            }
+            binding = TypedComponentBinding{};
         }
     }
 
@@ -668,7 +784,7 @@ Entity Registry::register_primitive(std::string name, std::size_t size, std::siz
     ComponentLifecycle lifecycle;
     lifecycle.trivially_copyable = true;
 
-    const Entity type = register_component_impl(std::move(desc), lifecycle, true, false, false, npos_type_id);
+    const Entity type = register_component_impl(std::move(desc), lifecycle, true, false, false, {});
     component_catalog_.records[entity_index(type)].primitive = kind;
     add_system_tag(type);
     return type;
@@ -683,7 +799,7 @@ void Registry::register_system_tag() {
     ComponentLifecycle lifecycle;
     lifecycle.trivially_copyable = true;
 
-    component_catalog_.system_tag = register_component_impl(std::move(desc), lifecycle, true, false, true, npos_type_id);
+    component_catalog_.system_tag = register_component_impl(std::move(desc), lifecycle, true, false, true, {});
     add_system_tag(component_catalog_.system_tag);
 }
 
@@ -696,7 +812,7 @@ void Registry::register_job_tag() {
     ComponentLifecycle lifecycle;
     lifecycle.trivially_copyable = true;
 
-    component_catalog_.job_tag = register_component_impl(std::move(desc), lifecycle, true, false, true, npos_type_id);
+    component_catalog_.job_tag = register_component_impl(std::move(desc), lifecycle, true, false, true, {});
     add_system_tag(component_catalog_.job_tag);
 }
 

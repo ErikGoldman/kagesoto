@@ -19,7 +19,26 @@ struct ThrowingMoveComponent {
     }
 };
 
+struct PositionAlias {
+    int x = 0;
+    int y = 0;
+};
+
 }  // namespace
+
+namespace ashiato {
+
+template <>
+struct component_type_key<Position> {
+    inline static constexpr std::string_view value = "ashiato.tests.Position";
+};
+
+template <>
+struct component_type_key<PositionAlias> {
+    inline static constexpr std::string_view value = "ashiato.tests.Position";
+};
+
+}  // namespace ashiato
 
 TEST_CASE("entities are created, destroyed, and recycled with versions") {
     ashiato::Registry registry;
@@ -113,6 +132,55 @@ TEST_CASE("typed components require explicit registration") {
     REQUIRE(registry.component<Position>() == position_component);
     REQUIRE(registry.component_info(position_component)->size == sizeof(Position));
     REQUIRE(registry.component_info(position_component)->alignment == alignof(Position));
+}
+
+TEST_CASE("template component ids are registry local") {
+    ashiato::Registry first;
+    ashiato::Registry second;
+
+    const ashiato::Entity first_position = first.register_component<Position>("Position");
+    const ashiato::Entity second_velocity = second.register_component<Velocity>("Velocity");
+
+    REQUIRE(first.component<Position>() == first_position);
+    REQUIRE(second.component<Velocity>() == second_velocity);
+    REQUIRE_THROWS_AS(first.component<Velocity>(), std::logic_error);
+    REQUIRE_THROWS_AS(second.component<Position>(), std::logic_error);
+
+    REQUIRE(first_position == second_velocity);
+    REQUIRE(first.component_name(first_position) == "Position");
+    REQUIRE(second.component_name(second_velocity) == "Velocity");
+    REQUIRE(first.component_info(first_position)->size == sizeof(Position));
+    REQUIRE(second.component_info(second_velocity)->size == sizeof(Velocity));
+
+    const ashiato::Entity first_health = first.register_component<Health>("Health");
+    const ashiato::Entity second_position = second.register_component<Position>("Position");
+
+    REQUIRE(first.component<Health>() == first_health);
+    REQUIRE(second.component<Position>() == second_position);
+    REQUIRE_THROWS_AS(second.component<Health>(), std::logic_error);
+    REQUIRE(first_health == second_position);
+    REQUIRE(first.component_name(first_health) == "Health");
+    REQUIRE(second.component_name(second_position) == "Position");
+}
+
+TEST_CASE("typed components with the same type key resolve to the same component") {
+    ashiato::Registry registry;
+
+    const ashiato::Entity position = registry.register_component<Position>("Position");
+    const ashiato::Entity alias = registry.register_component<PositionAlias>("PositionAlias");
+    const ashiato::Entity entity = registry.create();
+
+    REQUIRE(alias == position);
+    REQUIRE(registry.component<Position>() == position);
+    REQUIRE(registry.component<PositionAlias>() == position);
+
+    registry.add<Position>(entity, Position{1, 2});
+    REQUIRE(registry.contains<PositionAlias>(entity));
+    REQUIRE(registry.get<PositionAlias>(entity).x == 1);
+    REQUIRE(registry.get<PositionAlias>(entity).y == 2);
+
+    registry.write<PositionAlias>(entity).x = 9;
+    REQUIRE(registry.get<Position>(entity).x == 9);
 }
 
 TEST_CASE("component registration validates descriptors and duplicate names") {
