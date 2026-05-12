@@ -606,7 +606,16 @@ public:
 
         const std::size_t id = type_id<T>();
         if (id < component_catalog_.typed_components.size() && component_catalog_.typed_components[id]) {
-            return component_catalog_.typed_components[id];
+            const Entity component = component_catalog_.typed_components[id];
+            if constexpr (is_singleton_component<T>::value) {
+                TypeErasedStorage& storage = storage_for(component);
+                const std::uint32_t singleton_index = entity_index(singleton_entity());
+                if (!storage.contains_index(singleton_index)) {
+                    storage.template emplace_or_replace<T>(singleton_index);
+                    storage.clear_added(singleton_index);
+                }
+            }
+            return component;
         }
 
         if (name.empty()) {
@@ -647,10 +656,12 @@ public:
         ensure_typed_capacity(id);
         component_catalog_.typed_components[id] = component;
         if constexpr (is_singleton_component<T>::value) {
-            const Entity singleton = singleton_entity();
             TypeErasedStorage& storage = storage_for(component);
-            storage.template emplace_or_replace<T>(entity_index(singleton));
-            storage.clear_added(entity_index(singleton));
+            const std::uint32_t singleton_index = entity_index(singleton_entity());
+            if (!storage.contains_index(singleton_index)) {
+                storage.template emplace_or_replace<T>(singleton_index);
+                storage.clear_added(singleton_index);
+            }
         }
         return component;
     }

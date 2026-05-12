@@ -289,6 +289,18 @@ TEST_CASE("singleton components are created at registration and expose no-entity
     REQUIRE_FALSE(registry.remove(entity, game_time_component));
 }
 
+TEST_CASE("re-registering singleton components preserves the existing value") {
+    ashiato::Registry registry;
+    const ashiato::Entity first_component = registry.register_component<GameTime>("GameTime");
+
+    registry.write<GameTime>().tick = 37;
+
+    const ashiato::Entity second_component = registry.register_component<GameTime>("GameTime");
+
+    REQUIRE(second_component == first_component);
+    REQUIRE(registry.get<GameTime>().tick == 37);
+}
+
 TEST_CASE("const iterated components can be explicitly written through access") {
     ashiato::Registry registry;
     registry.register_component<Position>("Position");
