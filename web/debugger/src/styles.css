@@ -131,30 +131,37 @@ button {
 }
 
 .server-chip {
-  min-width: 156px;
-  max-width: 280px;
-  height: 42px;
+  min-width: 220px;
+  max-width: 380px;
+  height: 48px;
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 7px 10px;
+  padding: 7px 12px;
 }
 
-.server-chip svg,
-.server-chip small {
+.server-chip svg {
   flex: 0 0 auto;
 }
 
-.server-chip span {
+.server-chip-text {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: grid;
+  gap: 2px;
+  text-align: left;
+}
+
+.server-chip-text span,
+.server-chip-text small {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.server-chip small {
+.server-chip-text small {
   color: #60707b;
-  white-space: nowrap;
 }
 
 .server-chip.ok svg {

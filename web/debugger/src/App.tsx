@@ -179,14 +179,17 @@ export function App() {
                   reconcileSelection({ ...previous, selectedPort: server.port }, previous.servers)
                 )
               }
+              title={server.snapshot?.name || `:${server.port}`}
             >
               <CheckCircle2 size={16} />
-              <span>{server.snapshot?.name || `:${server.port}`}</span>
-              {server.snapshot && (
-                <small>
-                  :{server.port} - {server.snapshot.entities.length} entities, {server.snapshot.jobs.length} jobs
-                </small>
-              )}
+              <span className="server-chip-text">
+                <span>{server.snapshot?.name || `:${server.port}`}</span>
+                {server.snapshot && (
+                  <small>
+                    :{server.port} - {server.snapshot.entities.length} entities, {server.snapshot.jobs.length} jobs
+                  </small>
+                )}
+              </span>
             </button>
           ))
         )}

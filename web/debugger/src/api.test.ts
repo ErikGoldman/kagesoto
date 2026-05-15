@@ -10,8 +10,10 @@ function jsonResponse(body: unknown, ok = true, status = 200): Response {
 }
 
 describe("candidatePorts", () => {
-  it("returns the base port and next three ports", () => {
-    expect(candidatePorts(9000)).toEqual([9000, 9001, 9002, 9003]);
+  it("returns the base port and next fifteen ports", () => {
+    expect(candidatePorts(9000)).toEqual([
+      9000, 9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9010, 9011, 9012, 9013, 9014, 9015
+    ]);
   });
 });
 
@@ -73,10 +75,13 @@ describe("discoverServers", () => {
 
     const servers = await discoverServers(9000, fetchImpl);
 
-    expect(servers.map((server) => server.port)).toEqual([9000, 9001, 9002, 9003]);
+    expect(servers.map((server) => server.port)).toEqual([
+      9000, 9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9010, 9011, 9012, 9013, 9014, 9015
+    ]);
     expect(servers.filter((server) => server.ok).map((server) => server.port)).toEqual([9001]);
-    expect(servers[1].snapshot?.name).toBe("client 1");
-    expect(servers[1].snapshot?.entities).toHaveLength(1);
-    expect(servers[1].snapshot?.singletons).toHaveLength(0);
+    const discovered = servers.find((server) => server.port === 9001);
+    expect(discovered?.snapshot?.name).toBe("client 1");
+    expect(discovered?.snapshot?.entities).toHaveLength(1);
+    expect(discovered?.snapshot?.singletons).toHaveLength(0);
   });
 });

@@ -17,7 +17,7 @@ export type Fetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<
 const browserFetch: Fetcher = (input, init) => globalThis.fetch(input, init);
 
 export function candidatePorts(basePort: number): number[] {
-  return [basePort, basePort + 1, basePort + 2, basePort + 3];
+  return Array.from({ length: 16 }, (_, index) => basePort + index);
 }
 
 export function serverUrl(port: number): string {
